@@ -21,6 +21,8 @@ Route::prefix('wp-sync')->group(function () {
     Route::post('link/status', [WpSyncController::class, 'linkStatus']);
     Route::post('link/disconnect', [WpSyncController::class, 'disconnectLink']);
 
+    Route::post('customer-loyalty/events', [WpSyncController::class, 'customerLoyaltyEvents']);
+
     // Wallet
     Route::post('wallet/balance', [WpSyncController::class, 'walletBalance']);
     Route::post('wallet/transactions', [WpSyncController::class, 'walletTransactions']);

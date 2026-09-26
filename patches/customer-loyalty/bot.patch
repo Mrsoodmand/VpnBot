@@ -1,0 +1,1015 @@
+diff --git a/.env.example b/.env.example
+--- a/.env.example
++++ b/.env.example
+@@ -63,3 +63,7 @@
+ AWS_USE_PATH_STYLE_ENDPOINT=false
+ 
+ VITE_APP_NAME="${APP_NAME}"
++
++# Customer loyalty: enable only after the WordPress companion and shared service IDs are verified.
++CUSTOMER_LOYALTY_ENABLED=false
++CUSTOMER_LOYALTY_SHARED_SERVICE_IDS=
+diff --git a/phpunit.xml b/phpunit.xml
+--- a/phpunit.xml
++++ b/phpunit.xml
+@@ -18,14 +18,15 @@
+         </include>
+     </source>
+     <php>
+-        <env name="APP_ENV" value="testing"/>
++        <env name="APP_ENV" value="testing" force="true"/>
++        <env name="APP_KEY" value="base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" force="true"/>
+         <env name="APP_MAINTENANCE_DRIVER" value="file"/>
+         <env name="BCRYPT_ROUNDS" value="4"/>
+         <env name="BROADCAST_CONNECTION" value="null"/>
+         <env name="CACHE_STORE" value="array"/>
+-        <env name="DB_CONNECTION" value="sqlite"/>
+-        <env name="DB_DATABASE" value=":memory:"/>
+-        <env name="DB_URL" value=""/>
++        <env name="DB_CONNECTION" value="sqlite" force="true"/>
++        <env name="DB_DATABASE" value=":memory:" force="true"/>
++        <env name="DB_URL" value="" force="true"/>
+         <env name="MAIL_MAILER" value="array"/>
+         <env name="QUEUE_CONNECTION" value="sync"/>
+         <env name="SESSION_DRIVER" value="array"/>
+diff --git a/app/Providers/AppServiceProvider.php b/app/Providers/AppServiceProvider.php
+--- a/app/Providers/AppServiceProvider.php
++++ b/app/Providers/AppServiceProvider.php
+@@ -11,6 +11,7 @@
+      */
+     public function register(): void
+     {
++        $this->app->scoped(\App\Services\CustomerLoyaltyService::class);
+         //
+     }
+ 
+diff --git a/app/Http/Controllers/Api/TelegramBotController.php b/app/Http/Controllers/Api/TelegramBotController.php
+--- a/app/Http/Controllers/Api/TelegramBotController.php
++++ b/app/Http/Controllers/Api/TelegramBotController.php
+@@ -25,6 +25,7 @@
+ use App\Services\OrderLifecycleService;
+ use App\Services\Telegram;
+ use App\Services\WpSyncService;
++use App\Services\CustomerLoyaltyService;
+ use Carbon\Carbon;
+ use Illuminate\Http\Request;
+ use Illuminate\Support\Facades\DB;
+@@ -184,6 +185,9 @@
+         $telData->types = json_encode($type);
+         $telData->save();
+         switch ($type['type']) {
++            case 'adminCustomerLoyalty': return $this->adminCustomerLoyalty($type);
++            case 'adminCustomerDiscount': return $this->adminCustomerDiscount($type);
++            case 'adminCustomerDiscountClear': return $this->adminCustomerDiscountSave($type);
+             // all access
+             case 'home':
+                 return $this->home($type);
+@@ -641,6 +645,8 @@
+         $user = $this->user;
+ 
+         switch ($user->path) {
++            case 'adminCustomerLoyaltySave': return $this->adminCustomerLoyaltySave();
++            case 'adminCustomerDiscountSave': return $this->adminCustomerDiscountSave();
+             case 'adminUpdatePanel':
+                 return $this->adminUpdatePanel();
+                 break;
+@@ -2101,6 +2107,11 @@
+                 if ($item->discount > 0) {
+                     $discount = "| تخفیف: {$item->discount}%";
+                 }
++                try {
++                    $price = number_format(app(CustomerLoyaltyService::class)->quote($this->user, (int) $service->id, $planPrice)['amount']);
++                } catch (\RuntimeException $e) {
++                    return $this->sendTemporaryMessage($e->getMessage());
++                }
+                 $keyboard[] = [
+                     [
+                         'text' => "{$name} | $price T $discount",
+@@ -2328,7 +2339,16 @@
+         } else {
+             $planPrice = calculatePlanDiscount($plan)['price'];
+         }
+-        $total = $planPrice * $count;
++        try {
++            $loyaltyQuote = app(CustomerLoyaltyService::class)->quote($user, (int) $service->id, $planPrice);
++        } catch (\RuntimeException $e) {
++            return $this->sendTemporaryMessage($e->getMessage());
++        }
++        $total = $loyaltyQuote['amount'] * $count;
++        $loyaltyQuote['unit_amount'] = $loyaltyQuote['amount'];
++        $loyaltyQuote['quantity'] = (int) $count;
++        $loyaltyQuote['base_amount'] *= $count;
++        $loyaltyQuote['amount'] = $total;
+         $preOrderData = [
+             'service-id' => $service_id,
+             'country-id' => $country_id,
+@@ -2353,6 +2373,7 @@
+         $payment->user_id = $user->id;
+         $payment->order_id = $preOrder->id;
+         $payment->price = $total;
++        $payment->detail = ['customer_loyalty_quote' => $loyaltyQuote];
+         $payment->status = 0;
+         $payment->type = 1;
+         $payment->expired_at = Carbon::now();
+@@ -3099,6 +3120,7 @@
+                 ->update([
+                     'status' => 1,
+                     'admin_id' => $this->user->id,
++                    'detail' => json_encode(array_merge($payment->detail ?? [], ['loyalty_approved_at' => ($payment->detail['loyalty_approved_at'] ?? now()->toIso8601String())])),
+                     'updated_at' => now(),
+                 ]);
+             if ($updated === 1) {
+@@ -4515,6 +4537,11 @@
+                     $price = number_format($planPrice);
+                 }
+                 $name = !is_null($item->name) ? $item->name : 'بدون نام';
++                try {
++                    $price = number_format(app(CustomerLoyaltyService::class)->quote($this->user, (int) $panel->panel_type, $planPrice)['amount']);
++                } catch (\RuntimeException $e) {
++                    return $this->sendTemporaryMessage($e->getMessage());
++                }
+                 $keyboard[] = [
+ 
+                     [
+@@ -4591,6 +4618,15 @@
+             $planPrice = calculatePlanDiscount($plan)['price'];
+             $price = number_format($planPrice);
+         }
++
++        try {
++            $loyaltyQuote = app(CustomerLoyaltyService::class)->quote($user, (int) $panel->panel_type, $planPrice);
++        } catch (\RuntimeException $e) {
++            return $this->sendTemporaryMessage($e->getMessage());
++        }
++        $planPrice = $loyaltyQuote['amount'];
++        $price = number_format($planPrice);
++        $detail['customer_loyalty_quote'] = $loyaltyQuote;
+ 
+         $detail['plan-id'] = $plan->id;
+         $detail['remark'] = (string) $order->remark;
+@@ -5112,9 +5148,15 @@
+                     $price = number_format($planPrice);
+                 } else {
+                     $price = calculateExtraDiscount($item, $perGbPrice);
+-                    $price = number_format($price['price']);
++                    $planPrice = $price['price'];
++                    $price = number_format($planPrice);
+                 }
+ 
++                try {
++                    $price = number_format(app(CustomerLoyaltyService::class)->quote($this->user, (int) $service->id, $planPrice)['amount']);
++                } catch (\RuntimeException $e) {
++                    return $this->sendTemporaryMessage($e->getMessage());
++                }
+                 $keyboard[] = [
+                     [
+                         'text' => "{$name} GB | {$price} تومان",
+@@ -5186,6 +5228,15 @@
+             $extraPrice = $price['price'];
+             $price = number_format($price['price']);
+         }
++
++        try {
++            $loyaltyQuote = app(CustomerLoyaltyService::class)->quote($user, (int) $service->id, $extraPrice);
++        } catch (\RuntimeException $e) {
++            return $this->sendTemporaryMessage($e->getMessage());
++        }
++        $extraPrice = $loyaltyQuote['amount'];
++        $price = number_format($extraPrice);
++        $detail['customer_loyalty_quote'] = $loyaltyQuote;
+ 
+         $detail['extra-id'] = $extra->id;
+         $detail['remark'] = (string) $order->remark;
+@@ -5647,6 +5698,7 @@
+         $balance = number_format($user->balance);
+         $text = headTitle("حساب کاربری");
+         $text .= "🆔 آیدی تلگرام: `{$user->tel_id}`";
++        $text .= app(CustomerLoyaltyService::class)->profileText($user);
+         $data = [
+             'chat_id' => $this->chatId,
+             'text' => trim($text),
+@@ -6119,6 +6171,10 @@
+         |--------------------------------------------------------------------------
+         */
+ 
++        if ((int) $user->is_seller !== 1) {
++            $text .= app(CustomerLoyaltyService::class)->profileText($user);
++            array_unshift($keyboard, [['text' => 'تخفیف ثابت حساب', 'callback_data' => 'type=adminCustomerDiscount|id='.$user->id]]);
++        }
+         $data = [
+             'chat_id' => $this->chatId,
+             'text' => trim($text),
+@@ -8238,11 +8294,98 @@
+ 
+     // Start Setting
+ 
++    protected function adminCustomerLoyalty($type = [])
++    {
++        if (!$this->isAdmin) return $this->denyAdminAccess();
++        try {
++            $data = app(CustomerLoyaltyService::class)->request('settings');
++        } catch (\RuntimeException $e) {
++            return $this->sendTemporaryMessage($e->getMessage());
++        }
++        $lines = array_map(fn ($t) => ($t['min'] + $t['strict']).':'.$t['percent'], $data['customer']);
++        $this->updatePath('adminCustomerLoyaltySave');
++        $text = "تخفیف پلکانی کاربران عادی\nمرجع مشترک: سایت | واحد: تومان\n\n".implode("\n", $lines);
++        $text .= "\n\nچهار خط به شکل مبلغ:درصد ارسال کنید. خط اول از صفر شروع شود؛ مرزها صعودی و درصدها غیرکاهشی باشند. مرز هر پله متعلق به همان پله است.";
++        return $this->sendMessage(['chat_id' => $this->chatId, 'text' => $text,
++            'reply_markup' => json_encode(['inline_keyboard' => [[['text' => 'بازگشت', 'callback_data' => 'type=adminSetting']]]])], 'message');
++    }
++
++    protected function adminCustomerLoyaltySave()
++    {
++        if (!$this->isAdmin) return $this->denyAdminAccess();
++        $rows = preg_split('/\R/u', trim($this->text));
++        $tiers = [];
++        if (count($rows) !== 4) return $this->sendTemporaryMessage('دقیقاً چهار خط مبلغ:درصد وارد کنید.');
++        foreach ($rows as $row) {
++            if (!preg_match('/^\s*(0|[1-9][0-9]{0,11})\s*:\s*(100(?:\.0{1,2})?|[0-9]{1,2}(?:\.[0-9]{1,2})?)\s*$/D', $row, $m)) {
++                return $this->sendTemporaryMessage('مبلغ صحیح نامنفی و درصد صفر تا صد وارد کنید.');
++            }
++            $tiers[] = ['min' => (int) $m[1], 'percent' => (float) $m[2], 'strict' => 0];
++        }
++        $last = -1; $percent = -1;
++        foreach ($tiers as $i => $tier) {
++            if (($i === 0 && $tier['min'] !== 0) || $tier['min'] <= $last || $tier['percent'] < $percent) {
++                return $this->sendTemporaryMessage('پله پایه از صفر؛ مرزها صعودی و درصدها غیرکاهشی باشند.');
++            }
++            $last = $tier['min']; $percent = $tier['percent'];
++        }
++        try {
++            app(CustomerLoyaltyService::class)->request('settings', ['customer' => $tiers]);
++        } catch (\RuntimeException $e) {
++            return $this->sendTemporaryMessage($e->getMessage());
++        }
++        $this->updatePath('adminSetting');
++        return $this->sendTemporaryMessage('تنظیمات مشترک سایت و ربات ذخیره شد.');
++    }
++
++    protected function adminCustomerDiscount($type = [])
++    {
++        if (!$this->isAdmin) return $this->denyAdminAccess();
++        $target = User::find((int) ($type['id'] ?? 0));
++        if (!$target || (int) $target->is_seller === 1) return $this->sendTemporaryMessage('این بخش فقط برای کاربر عادی است.');
++        try {
++            $profile = app(CustomerLoyaltyService::class)->profile($target);
++        } catch (\RuntimeException $e) {
++            return $this->sendTemporaryMessage($e->getMessage());
++        }
++        $detail = $this->user->tel_detail ?? [];
++        $detail['customer-discount-user-id'] = $target->id;
++        $this->user->tel_detail = $detail;
++        $this->user->save();
++        $this->updatePath('adminCustomerDiscountSave');
++        $value = ($profile['manual_value'] ?? '') === '' ? 'خالی (پلکانی)' : $profile['manual_value'].'٪';
++        return $this->sendMessage(['chat_id' => $this->chatId,
++            'text' => "تخفیف ثابت حساب: {$value}\nدرصد صفر تا صد را ارسال کنید. صفر یعنی بدون تخفیف. برای خالی‌کردن و بازگشت به پلکان، دکمه زیر را بزنید.",
++            'reply_markup' => json_encode(['inline_keyboard' => [
++                [['text' => 'پاک‌کردن تخفیف ثابت', 'callback_data' => 'type=adminCustomerDiscountClear|id='.$target->id]],
++                [['text' => 'بازگشت', 'callback_data' => 'type=adminUserDetail|id='.$target->id]],
++            ]])], 'message');
++    }
++
++    protected function adminCustomerDiscountSave($type = null)
++    {
++        if (!$this->isAdmin) return $this->denyAdminAccess();
++        $clear = ($type['type'] ?? '') === 'adminCustomerDiscountClear';
++        $target = User::find((int) ($clear ? ($type['id'] ?? 0) : ($this->user->tel_detail['customer-discount-user-id'] ?? 0)));
++        if (!$target || (int) $target->is_seller === 1) return $this->sendTemporaryMessage('کاربر عادی پیدا نشد.');
++        $value = $clear ? '' : trim($this->text);
++        if (!$clear && !preg_match('/^(100(?:\.0{1,2})?|[0-9]{1,2}(?:\.[0-9]{1,2})?)$/D', $value)) {
++            return $this->sendTemporaryMessage('درصد صفر تا صد با حداکثر دو رقم اعشار وارد کنید.');
++        }
++        try {
++            app(CustomerLoyaltyService::class)->request('override', ['tel_id' => (string) $target->tel_id, 'value' => $value]);
++        } catch (\RuntimeException $e) {
++            return $this->sendTemporaryMessage($e->getMessage());
++        }
++        $this->updatePath('adminUserDetail');
++        return $this->sendTemporaryMessage('تخفیف ثابت حساب ذخیره شد.');
++    }
++
+     protected function adminSetting($type)
+     {
+         $keys = ['join-bot', 'join-with-referral', 'channel-join'];
+         $settings = Setting::whereIn('key', $keys)->get();
+-        $buttons = [];
++        $buttons = [[['text' => 'تخفیف پلکانی کاربران عادی', 'callback_data' => 'type=adminCustomerLoyalty']]];
+ 
+         foreach ($settings as $setting) {
+             $buttons[] = [
+diff --git a/app/Http/Controllers/Api/WpSyncController.php b/app/Http/Controllers/Api/WpSyncController.php
+--- a/app/Http/Controllers/Api/WpSyncController.php
++++ b/app/Http/Controllers/Api/WpSyncController.php
+@@ -48,6 +48,15 @@
+         return $this->json(['ok' => true, 'deleted' => $result]);
+     }
+ 
++    public function customerLoyaltyEvents(Request $request, WpSyncService $sync)
++    {
++        if ($g = $this->guard($request, $sync)) return $g;
++        $user = $sync->resolveUser($request->all());
++        if (!$user) return $this->json(['ok' => false, 'message' => 'user_not_found'], 404);
++        if ((int) $user->is_seller === 1) return $this->json(['ok' => false, 'message' => 'customer_only'], 422);
++        return $this->json(['ok' => true, 'events' => app(\App\Services\CustomerLoyaltyService::class)->events($user)]);
++    }
++
+     /* Wallet */
+ 
+     public function walletBalance(Request $request, WpSyncService $sync)
+diff --git a/app/Services/CustomerLoyaltyService.php b/app/Services/CustomerLoyaltyService.php
+new file mode 100644
+--- /dev/null
++++ b/app/Services/CustomerLoyaltyService.php
+@@ -0,0 +1,118 @@
++<?php
++
++namespace App\Services;
++
++use App\Models\Orders;
++use App\Models\Payment;
++use App\Models\User;
++use Carbon\CarbonImmutable;
++use Illuminate\Support\Facades\Http;
++use RuntimeException;
++
++/** WordPress owns policy, overrides and calculation. This adapter never writes money. */
++class CustomerLoyaltyService
++{
++    private array $profiles = [];
++    public function enabled(): bool
++    {
++        return (bool) config('loyalty.enabled');
++    }
++
++    public function request(string $action, array $payload = []): array
++    {
++        $sync = app(WpSyncService::class);
++        try {
++            $response = Http::timeout(15)->acceptJson()->asJson()
++                ->withHeaders(['X-IPSABET-API-KEY' => $sync->secret()])
++                ->post($sync->wpBaseUrl().'/wp-json/ipsvp/v1/sync/customer-loyalty/'.$action, $payload);
++            $data = $response->json();
++            if (!$response->successful() || !is_array($data) || ($data['ok'] ?? false) !== true) {
++                throw new RuntimeException('invalid_loyalty_response');
++            }
++            return $data;
++        } catch (\Throwable $e) {
++            throw new RuntimeException('استعلام یا ذخیره تخفیف سایت انجام نشد؛ دوباره تلاش کنید.', 0, $e);
++        }
++    }
++
++    public function profile(User $user): array
++    {
++        if (isset($this->profiles[$user->id])) return $this->profiles[$user->id];
++        $data = $this->request('profile', ['tel_id' => (string) $user->tel_id, 'events' => $this->events($user)]);
++        $p = $data['profile'] ?? [];
++        if (!is_array($p) || ($p['kind'] ?? '') !== 'customer' || !is_numeric($p['percent'] ?? null)
++            || $p['percent'] < 0 || $p['percent'] > 100 || ($data['currency'] ?? '') !== 'IRT'
++            || !in_array($p['source'] ?? null, ['manual', 'automatic'], true)
++            || !is_int($p['stars'] ?? null) || $p['stars'] < 0 || $p['stars'] > 4
++            || !is_int($p['total'] ?? null) || $p['total'] < 0
++            || (isset($p['expires_at']) && !is_int($p['expires_at']))
++            || (isset($p['next_amount']) && (!is_int($p['next_amount']) || $p['next_amount'] < 0))) {
++            throw new RuntimeException('پاسخ تخفیف حساب معتبر نیست.');
++        }
++        return $this->profiles[$user->id] = $p;
++    }
++
++    public function quote(User $user, int $serviceId, int|float $amount): array
++    {
++        $quote = ['amount' => $amount, 'base_amount' => $amount, 'percent' => 0, 'source' => 'none', 'currency' => 'IRT'];
++        if (!$this->enabled() || (int) $user->is_seller === 1
++            || !in_array($serviceId, config('loyalty.shared_service_ids', []), true)) {
++            return $quote;
++        }
++        $p = $this->profile($user);
++        $base = max(0, (int) $amount);
++        $bps = (int) round($p['percent'] * 100);
++        return ['amount' => (int) ceil($base * (10000 - $bps) / 10000), 'base_amount' => $base,
++            'percent' => $p['percent'], 'source' => $p['source'], 'currency' => 'IRT', 'quoted_at' => now()->toIso8601String()];
++    }
++
++    /** Only original bot events; site-origin entries are read from the site's receipts. */
++    public function events(User $user): array
++    {
++        $rows = [];
++        $seen = [];
++        foreach (Payment::where('user_id', $user->id)->where('status', 1)
++            ->whereIn('method', ['cart-be-cart', 'admin_credit', 'admin_debit'])->orderBy('id')->cursor() as $p) {
++            $d = $p->detail ?? [];
++            if (!empty($d['receipt_id']) || str_starts_with((string) ($d['source'] ?? ''), 'wordpress')
++                || !empty($d['refunded_at']) || !empty($d['refund_applied']) || !empty($d['wallet_refunded']) || empty($d['loyalty_approved_at'])) {
++                continue;
++            }
++            $type = match ((string) $p->type) {
++                '1' => 'new', '2' => 'renewal', '3' => 'extra_volume', '4' => 'wallet',
++                'admin_credit' => 'wallet_admin_credit', 'admin_debit' => 'wallet_admin_debit', default => null,
++            };
++            if (!$type || (int) $p->price <= 0) continue;
++            if (!is_string($d['loyalty_approved_at']) || !preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/D', $d['loyalty_approved_at'])) continue;
++            try {
++                $at = CarbonImmutable::parse($d['loyalty_approved_at'])->utc()->timestamp;
++            } catch (\Throwable $e) {
++                continue;
++            }
++            $key = $p->ref_id ? $p->method.':'.$p->ref_id : 'id:'.$p->id;
++            if (isset($seen[$key])) continue;
++            $seen[$key] = true;
++            // Keep 60 days: a recent correction can consume an older, now expired charge first.
++            if ($at <= now()->subDays(60)->timestamp) continue;
++            $rows[] = ['id' => (int) $p->id, 'type' => $type, 'amount' => (int) $p->price,
++                'approved_at' => $at, 'key' => 'bot:'.$p->id];
++        }
++        return ['rows' => $rows, 'first_purchase' => Orders::where('user_id', $user->id)->whereIn('status', ['1','0','2','active','data_exhausted','suspended','inactive'])->exists(), 'currency' => 'IRT'];
++    }
++
++    public function profileText(User $user): string
++    {
++        if (!$this->enabled() || (int) $user->is_seller === 1) return '';
++        try {
++            $p = $this->profile($user);
++            $source = $p['source'] === 'manual' ? 'دستی' : 'پلکانی';
++            $text = "\n⭐ تعداد ستاره‌ها: {$p['stars']} | تخفیف فعال: {$p['percent']}٪ ({$source})";
++            $text .= "\nپرداخت معتبر ۳۰ روز: ".number_format($p['total']).' تومان';
++            if ($p['source'] !== 'manual' && isset($p['next_amount'])) $text .= "\nتا پله بعدی: ".number_format($p['next_amount']).' تومان';
++            if (!empty($p['expires_at'])) $text .= "\nافت سطح فعلی: ".CarbonImmutable::createFromTimestamp($p['expires_at'])->setTimezone('Asia/Tehran')->format('Y/m/d H:i').' (تهران)';
++            return $text;
++        } catch (RuntimeException $e) {
++            return "\nاطلاعات تخفیف موقتاً در دسترس نیست.";
++        }
++    }
++}
+diff --git a/app/Services/WpSyncService.php b/app/Services/WpSyncService.php
+--- a/app/Services/WpSyncService.php
++++ b/app/Services/WpSyncService.php
+@@ -495,6 +495,9 @@
+             $before = (int) $target->balance;
+             $target->balance = $before + $amount;
+             $target->save();
++            if (in_array($method, ['admin_credit', 'admin_debit'], true)) {
++                $meta['loyalty_approved_at'] = now()->toIso8601String();
++            }
+             $meta['wallet_balance_before'] = $before;
+             $meta['wallet_balance_after'] = (int) $target->balance;
+             Payment::create([
+@@ -533,6 +536,9 @@
+             $before = (int) $target->balance;
+             $target->balance = $before - $amount;
+             $target->save();
++            if (in_array($method, ['admin_credit', 'admin_debit'], true)) {
++                $meta['loyalty_approved_at'] = now()->toIso8601String();
++            }
+             $meta['wallet_balance_before'] = $before;
+             $meta['wallet_balance_after'] = (int) $target->balance;
+             Payment::create([
+@@ -803,7 +809,10 @@
+ 
+         return DB::transaction(function () use ($payment, $payload) {
+             $payment = Payment::where('id', $payment->id)->lockForUpdate()->first();
++            if ((string) $payment->status === '1') return ['ok' => true, 'payment' => $this->formatPayment($payment, true), 'already_approved' => true];
++            if ((string) $payment->status !== '0') return ['ok' => false, 'message' => 'payment_not_pending'];
+             $detail = is_array($payment->detail) ? $payment->detail : (json_decode((string) $payment->detail, true) ?: []);
++            $detail['loyalty_approved_at'] = $detail['loyalty_approved_at'] ?? now()->toIso8601String();
+             $detail['approved_from_wp_api'] = true;
+             $detail['approved_note'] = $payload['note'] ?? '';
+             $payment->status = 1;
+diff --git a/app/Console/Commands/CustomerLoyaltyApprovalTimes.php b/app/Console/Commands/CustomerLoyaltyApprovalTimes.php
+new file mode 100644
+--- /dev/null
++++ b/app/Console/Commands/CustomerLoyaltyApprovalTimes.php
+@@ -0,0 +1,73 @@
++<?php
++
++namespace App\Console\Commands;
++
++use App\Models\Payment;
++use Carbon\CarbonImmutable;
++use Illuminate\Console\Command;
++use Illuminate\Support\Facades\DB;
++use RuntimeException;
++
++/** Import only independently verified review timestamps; never infer them from updated_at. */
++class CustomerLoyaltyApprovalTimes extends Command
++{
++    protected $signature = 'loyalty:approval-times {file? : Reviewed CSV: payment_id,user_id,amount,approved_at,evidence} {--apply : Write metadata after validating the entire file}';
++    protected $description = 'Audit missing approval times or preview/import verified timestamps (no balance/amount/status writes)';
++
++    public function handle(): int
++    {
++        if (!$this->argument('file')) {
++            $missing = 0;
++            foreach (Payment::where('status', 1)->whereIn('method', ['cart-be-cart','admin_credit','admin_debit'])->cursor() as $p) {
++                if (empty($p->detail['loyalty_approved_at'])) $missing++;
++            }
++            $this->info('Approved original payments without a verified approval time: '.$missing);
++            return self::SUCCESS;
++        }
++        try {
++            $file = fopen($this->argument('file'), 'r');
++            if (!$file) throw new RuntimeException('Cannot open CSV.');
++            $header = fgetcsv($file);
++            if ($header !== ['payment_id','user_id','amount','approved_at','evidence']) throw new RuntimeException('Invalid CSV header.');
++            $rows = []; $ids = [];
++            while (($values = fgetcsv($file)) !== false) {
++                if (count($values) !== 5) throw new RuntimeException('Invalid CSV row.');
++                $r = array_combine($header, $values);
++                foreach (['payment_id','user_id','amount'] as $key) if (!ctype_digit($r[$key]) || (int) $r[$key] <= 0) throw new RuntimeException('Invalid '.$key);
++                if (isset($ids[$r['payment_id']])) throw new RuntimeException('Duplicate payment ID.');
++                $ids[$r['payment_id']] = true;
++                if (!preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/D', $r['approved_at'])) throw new RuntimeException('Use an ISO timestamp with timezone.');
++                $at = CarbonImmutable::parse($r['approved_at']);
++                if ($at->isFuture() || trim($r['evidence']) === '') throw new RuntimeException('Future time or missing evidence.');
++                $r['approved_at'] = $at->toIso8601String(); $rows[] = $r;
++            }
++            fclose($file);
++            DB::transaction(function () use ($rows) {
++                foreach ($rows as $row) {
++                    $p = Payment::whereKey($row['payment_id'])->lockForUpdate()->first();
++                    if (!$p || (int) $p->status !== 1 || (int) $p->user_id !== (int) $row['user_id'] || (int) $p->price !== (int) $row['amount']
++                        || !in_array($p->method, ['cart-be-cart','admin_credit','admin_debit'], true)
++                        || !empty($p->detail['receipt_id']) || ($p->created_at && CarbonImmutable::parse($row['approved_at'])->lt($p->created_at))) {
++                        throw new RuntimeException('Payment does not match verified evidence: '.$row['payment_id']);
++                    }
++                    $detail = $p->detail ?? [];
++                    if (!empty($detail['loyalty_approved_at'])) {
++                        if (CarbonImmutable::parse($detail['loyalty_approved_at'])->equalTo(CarbonImmutable::parse($row['approved_at']))) continue;
++                        throw new RuntimeException('Refusing to replace existing approval time: '.$p->id);
++                    }
++                    if ($this->option('apply')) {
++                        $detail['loyalty_approved_at'] = $row['approved_at'];
++                        $detail['loyalty_approval_evidence'] = $row['evidence'];
++                        // Avoid touching updated_at, wallet balances or financial fields.
++                        DB::table('payments')->where('id', $p->id)->update(['detail' => json_encode($detail)]);
++                    }
++                }
++            });
++            $this->info(count($rows).' rows validated'.($this->option('apply') ? ' and applied.' : '; dry run only.'));
++            return self::SUCCESS;
++        } catch (\Throwable $e) {
++            $this->error($e->getMessage());
++            return self::FAILURE;
++        }
++    }
++}
+diff --git a/config/loyalty.php b/config/loyalty.php
+new file mode 100644
+--- /dev/null
++++ b/config/loyalty.php
+@@ -0,0 +1,7 @@
++<?php
++
++return [
++    'enabled' => env('CUSTOMER_LOYALTY_ENABLED', false),
++    // Explicit allowlist: services has no shared/dedicated discriminator. Never infer from a name.
++    'shared_service_ids' => array_values(array_filter(array_map('intval', explode(',', env('CUSTOMER_LOYALTY_SHARED_SERVICE_IDS', ''))), fn ($id) => $id > 0)),
++];
+diff --git a/tests/Feature/CustomerLoyaltyTest.php b/tests/Feature/CustomerLoyaltyTest.php
+new file mode 100644
+--- /dev/null
++++ b/tests/Feature/CustomerLoyaltyTest.php
+@@ -0,0 +1,277 @@
++<?php
++
++namespace Tests\Feature;
++
++use App\Http\Controllers\Api\TelegramBotController;
++use App\Models\Payment;
++use App\Models\User;
++use App\Services\CustomerLoyaltyService;
++use App\Services\Telegram;
++use App\Services\WpSyncService;
++use Carbon\Carbon;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Http;
++use Illuminate\Support\Facades\Schema;
++use Tests\TestCase;
++
++class CustomerLoyaltyTest extends TestCase
++{
++    protected function setUp(): void
++    {
++        parent::setUp();
++        Http::preventStrayRequests();
++        config(['loyalty.enabled' => true, 'loyalty.shared_service_ids' => [1]]);
++        Carbon::setTestNow('2026-09-26 12:00:00');
++        foreach (['0001_01_01_000000_create_users_table.php', '2026_05_21_173105_create_payments_table.php',
++            '2026_05_17_112220_create_settings_table.php', '2026_05_20_145319_create_pre_orders_table.php',
++            '2026_05_19_100650_create_services_table.php', '2026_05_17_112153_create_plans_table.php',
++            '2026_05_18_155104_create_countries_table.php', '2026_05_17_113131_create_panels_table.php',
++            '2026_05_18_093434_create_extra_bandwidths_table.php', '2026_05_20_104904_add_price_column_to_services_table.php'] as $migration) {
++            (require database_path('migrations/'.$migration))->up();
++        }
++        Schema::create('orders', function (Blueprint $t) {
++            $t->id(); $t->integer('user_id'); $t->integer('panel_id')->nullable(); $t->integer('inbound_id')->default(1);
++            $t->string('remark')->default('test'); $t->string('status')->default('active'); $t->json('detail')->nullable();
++            $t->timestamp('expire_at')->nullable(); $t->timestamps();
++        });
++        DB::table('users')->insert(['id' => 1, 'tel_id' => '1001', 'status' => 1, 'balance' => 1000000]);
++    }
++
++    protected function tearDown(): void
++    {
++        Carbon::setTestNow();
++        parent::tearDown();
++    }
++
++    private function fakeProfile(float $percent = 10): void
++    {
++        Http::fake(['*/sync/customer-loyalty/*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => [
++            'kind' => 'customer', 'percent' => $percent, 'source' => 'automatic', 'stars' => 3, 'total' => 5000000,
++            'expires_at' => null, 'next_amount' => 5000000, 'manual_value' => '',
++        ]])]);
++    }
++
++    private function payment(array $changes = []): Payment
++    {
++        return Payment::create(array_replace(['user_id' => 1, 'method' => 'cart-be-cart', 'type' => '4', 'price' => 1000000,
++            'status' => 1, 'detail' => ['loyalty_approved_at' => now()->toIso8601String()]], $changes));
++    }
++
++    public function test_only_original_approved_events_are_exported_without_financial_writes(): void
++    {
++        foreach ([1,2,3,4] as $type) $this->payment(['type' => (string) $type]);
++        foreach (['wallet','wordpress_wallet_receipt','ramzino','referral','admin_refund'] as $method) $this->payment(['method' => $method]);
++        foreach ([0,-1,-2] as $status) $this->payment(['status' => $status]);
++        $this->payment(['detail' => ['loyalty_approved_at' => now()->toIso8601String(), 'receipt_id' => 5]]);
++        $this->payment(['detail' => []]); // Unknown historical approval must never use upload/update time.
++        $this->payment(['detail' => ['loyalty_approved_at' => now()->subDays(61)->toIso8601String()]]);
++        $this->payment(['user_id' => 2]);
++        $count = Payment::count();
++        $events = app(CustomerLoyaltyService::class)->events(User::find(1));
++        $this->assertSame(['new','renewal','extra_volume','wallet'], array_column($events['rows'], 'type'));
++        $this->assertFalse($events['first_purchase']);
++        $this->assertSame(1000000, (int) User::find(1)->balance);
++        $this->assertSame($count, Payment::count());
++    }
++
++    public function test_approval_timestamp_is_immutable_and_rejected_payment_cannot_be_approved(): void
++    {
++        $p = $this->payment(['status' => 0, 'detail' => ['customer_loyalty_quote' => ['amount' => 90000]]]);
++        $sync = app(WpSyncService::class);
++        $first = $sync->approvePayment($p->id, ['apply_wallet' => true]);
++        $at = $p->fresh()->detail['loyalty_approved_at'];
++        $this->travel(10)->days();
++        $again = $sync->approvePayment($p->id, ['apply_wallet' => true]);
++        $this->assertTrue($first['ok']); $this->assertTrue($again['already_approved']);
++        $this->assertSame($at, $p->fresh()->detail['loyalty_approved_at']);
++        $this->assertSame(2000000, (int) User::find(1)->balance);
++        $this->assertSame(['amount' => 90000], $p->fresh()->detail['customer_loyalty_quote']);
++        $bad = $this->payment(['status' => -1]);
++        $this->assertFalse($sync->approvePayment($bad->id)['ok']);
++    }
++
++    public function test_admin_corrections_have_original_timestamp_but_wallet_spending_does_not(): void
++    {
++        $sync = app(WpSyncService::class); $user = User::find(1);
++        $sync->adminWalletAdjust($user, 'credit', 500000);
++        $sync->adminWalletAdjust($user, 'debit', 200000);
++        $sync->debitWallet($user, 100000);
++        $events = app(CustomerLoyaltyService::class)->events($user);
++        $this->assertSame(['wallet_admin_credit','wallet_admin_debit'], array_column($events['rows'], 'type'));
++        $this->assertSame([500000,200000], array_column($events['rows'], 'amount'));
++    }
++
++    public function test_quote_is_scoped_rounded_like_site_and_applied_after_product_discount(): void
++    {
++        $this->fakeProfile(15);
++        $user = User::find(1); $service = app(CustomerLoyaltyService::class);
++        $this->assertSame(76500, $service->quote($user, 1, 90000)['amount']);
++        $this->assertSame(86, $service->quote($user, 1, 101)['amount']);
++        $this->assertSame(90000, $service->quote($user, 2, 90000)['amount']);
++        $user->is_seller = 1;
++        $this->assertSame(90000, $service->quote($user, 1, 90000)['amount']);
++        Http::assertSentCount(1);
++        $this->assertSame(0, Payment::count());
++    }
++
++    public function test_unavailable_authority_blocks_new_discounted_quote(): void
++    {
++        Http::fake(['*' => Http::response([], 503)]);
++        $this->expectException(\RuntimeException::class);
++        app(CustomerLoyaltyService::class)->quote(User::find(1), 1, 100000);
++    }
++
++    public function test_malformed_authority_profile_cannot_create_a_quote(): void
++    {
++        Http::fake(['*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => ['kind' => 'customer', 'percent' => 10]])]);
++        $this->expectException(\RuntimeException::class);
++        app(CustomerLoyaltyService::class)->quote(User::find(1), 1, 100000);
++    }
++
++    private function setupCatalog(): void
++    {
++        DB::table('services')->insert(['id' => 1, 'name' => 'shared', 'price_per_gb' => 10000]);
++        DB::table('plans')->insert(['id' => 1, 'name' => 'plan', 'price' => 100000, 'discount' => 10, 'type' => 1, 'status' => 1]);
++        DB::table('countries')->insert(['id' => 1, 'name' => 'test']);
++        DB::table('panels')->insert(['id' => 1, 'name' => 'test', 'panel_type' => 1]);
++        DB::table('orders')->insert(['id' => 1, 'user_id' => 1, 'panel_id' => 1, 'expire_at' => now()->addMonth()]);
++        DB::table('extra_bandwidths')->insert(['id' => 1, 'name' => '10', 'discount' => 10, 'type' => 1, 'status' => 1]);
++    }
++
++    public function test_all_three_checkout_paths_snapshot_final_price_and_wallet_replay_keeps_it(): void
++    {
++        $this->fakeProfile(); $this->setupCatalog();
++        $user = User::find(1);
++        $user->tel_detail = ['order-service-id' => 1, 'order-country-id' => 1, 'order-plan-id' => 1, 'order-count' => 1];
++        $user->save();
++        $controller = new LoyaltyTestController($user);
++        $controller->call('clientFinalStep', ['name' => 'Example', 'price' => 1, 'discount' => 100]);
++        $controller->call('clientSubmitRenew', ['o_id' => 1, 'pl_id' => 1, 'price' => 1]);
++        $controller->call('clientSubmitExtra', ['o_id' => 1, 'ex_id' => 1, 'percent' => 100]);
++        $this->assertSame([81000,81000,81000], Payment::orderBy('id')->pluck('price')->all());
++        foreach (Payment::all() as $p) $this->assertSame(81000, $p->detail['customer_loyalty_quote']['amount']);
++        foreach ($controller->messages as $message) $this->assertStringContainsString('81,000', $message['text']);
++        $this->fakeProfile(20);
++        $controller->call('paymentWallet', ['id' => 1]);
++        $controller->call('paymentWallet', ['id' => 1]);
++        $this->assertSame(81000, (int) Payment::find(1)->price);
++        $this->assertSame(919000, (int) $user->fresh()->balance);
++        $this->assertSame(1, $controller->fulfilled);
++        $this->assertSame([], app(CustomerLoyaltyService::class)->events($user)['rows']);
++    }
++
++    public function test_quantity_uses_the_same_rounded_unit_price_as_the_catalog(): void
++    {
++        $this->fakeProfile(15); $this->setupCatalog();
++        DB::table('plans')->where('id', 1)->update(['price' => 103, 'discount' => 0]);
++        $user = User::find(1);
++        $user->tel_detail = ['order-service-id' => 1, 'order-country-id' => 1, 'order-plan-id' => 1, 'order-count' => 3];
++        $user->save();
++        $controller = new LoyaltyTestController($user);
++        $controller->call('clientFinalStep', ['name' => 'Example']);
++        $p = Payment::first();
++        $this->assertSame(264, (int) $p->price);
++        $this->assertSame(88, $p->detail['customer_loyalty_quote']['unit_amount']);
++        $this->assertSame(3, $p->detail['customer_loyalty_quote']['quantity']);
++    }
++
++    public function test_bot_admin_approval_is_idempotent_and_records_review_time(): void
++    {
++        $user = User::find(1); $user->is_admin = 1;
++        $controller = new LoyaltyTestController($user);
++        $p = $this->payment(['status' => 0, 'type' => 1, 'detail' => []]);
++        $controller->call('adminConfirmCartReceipt', ['p_id' => $p->id]);
++        $at = $p->fresh()->detail['loyalty_approved_at'];
++        $this->travel(1)->days();
++        $controller->call('adminConfirmCartReceipt', ['p_id' => $p->id]);
++        $this->assertSame($at, $p->fresh()->detail['loyalty_approved_at']);
++        $this->assertSame(1, $controller->fulfilled);
++    }
++
++    public function test_authenticated_event_endpoint_and_duplicate_reference(): void
++    {
++        putenv('WP_SYNC_SECRET=test-secret'); $_ENV['WP_SYNC_SECRET'] = $_SERVER['WP_SYNC_SECRET'] = 'test-secret';
++        $this->payment(['ref_id' => 'bank-1']); $this->payment(['ref_id' => 'bank-1']);
++        $this->postJson('/api/wp-sync/customer-loyalty/events', ['tel_id' => '1001'])->assertForbidden();
++        $response = $this->withHeader('X-IPSABET-API-KEY', 'test-secret')->postJson('/api/wp-sync/customer-loyalty/events', ['tel_id' => '1001']);
++        $response->assertOk()->assertJsonCount(1, 'events.rows')->assertJsonPath('events.currency', 'IRT');
++    }
++
++    public function test_admin_settings_validate_before_write_and_manual_clear_differs_from_zero(): void
++    {
++        Http::fake(['*' => Http::response(['ok' => true])]);
++        $user = User::find(1); $user->is_admin = 1; $user->tel_detail = ['customer-discount-user-id' => 1];
++        $user->save();
++        $controller = new LoyaltyTestController($user);
++        foreach (["0:0\n5000000:5\n2000000:10\n10000000:20", "0:0\n2000000:15\n5000000:10\n10000000:20", "0:0\n-1:5\n5000000:10\n10000000:20"] as $text) {
++            $controller->input($text); $controller->call('adminCustomerLoyaltySave', []);
++        }
++        Http::assertNothingSent();
++        $controller->input("0:0\n2000000:5\n5000000:10\n10000000:20");
++        $controller->call('adminCustomerLoyaltySave', []);
++        Http::assertSent(fn ($r) => $r['customer'][1]['min'] === 2000000 && $r['customer'][1]['strict'] === 0);
++        $controller->input('0'); $controller->call('adminCustomerDiscountSave', []);
++        $controller->call('adminCustomerDiscountSave', ['type' => 'adminCustomerDiscountClear', 'id' => 1]);
++        Http::assertSent(fn ($r) => ($r['value'] ?? null) === '0');
++        Http::assertSent(fn ($r) => ($r['value'] ?? null) === '');
++    }
++
++    public function test_verified_approval_import_is_dry_run_by_default_and_never_rewrites_money(): void
++    {
++        $p = $this->payment(['detail' => []]);
++        $file = tempnam(sys_get_temp_dir(), 'loyalty-approval-');
++        file_put_contents($file, "payment_id,user_id,amount,approved_at,evidence\n{$p->id},1,1000000,".now()->toIso8601String().",admin-audit-42\n");
++        try {
++            $this->artisan('loyalty:approval-times', ['file' => $file])->assertSuccessful();
++            $this->assertSame([], $p->fresh()->detail);
++            $this->artisan('loyalty:approval-times', ['file' => $file, '--apply' => true])->assertSuccessful();
++            $this->assertSame(now()->toIso8601String(), $p->fresh()->detail['loyalty_approved_at']);
++            $this->artisan('loyalty:approval-times', ['file' => $file, '--apply' => true])->assertSuccessful();
++            $this->assertSame(1000000, (int) $p->fresh()->price);
++            $this->assertSame(1000000, (int) User::find(1)->balance);
++            $this->assertSame(1, Payment::count());
++        } finally { unlink($file); }
++    }
++
++    public function test_bad_approval_import_rolls_back_entire_batch(): void
++    {
++        $p = $this->payment(['detail' => []]);
++        $other = $this->payment(['detail' => []]);
++        $file = tempnam(sys_get_temp_dir(), 'loyalty-approval-');
++        $at = now()->toIso8601String();
++        file_put_contents($file, "payment_id,user_id,amount,approved_at,evidence\n{$p->id},1,1000000,{$at},proof-1\n{$other->id},1,999,{$at},wrong-amount\n");
++        try {
++            $this->artisan('loyalty:approval-times', ['file' => $file, '--apply' => true])->assertFailed();
++            $this->assertSame([], $p->fresh()->detail);
++            $this->assertSame([], $other->fresh()->detail);
++        } finally { unlink($file); }
++    }
++
++    public function test_non_admin_cannot_write_settings_or_override(): void
++    {
++        $controller = new LoyaltyTestController(User::find(1));
++        $controller->call('adminCustomerLoyaltySave', []);
++        $controller->call('adminCustomerDiscountSave', []);
++        Http::assertNothingSent();
++    }
++}
++
++class LoyaltyTestController extends TelegramBotController
++{
++    public array $messages = [];
++    public int $fulfilled = 0;
++
++    public function __construct(User $user)
++    {
++        $this->user = $user; $this->isAdmin = (bool) $user->is_admin; $this->chatId = $user->tel_id;
++        $this->method = 'toUser'; $this->type = 'text'; $this->text = '10';
++        $sdk = \Mockery::mock(Telegram::class);
++        $sdk->shouldReceive('sendMessage')->andReturnUsing(function ($data) { $this->messages[] = $data; return ['ok' => false]; });
++        $sdk->shouldReceive('answerCallback')->andReturn([]);
++        $this->telegramSdk = $sdk;
++    }
++    public function input(string $text) { $this->text = $text; }
++    public function call($method, $data) { return $this->$method($data); }
++    protected function finalPaymentStep($payment) { $this->fulfilled++; return true; }
++}
+diff --git a/routes/api.php b/routes/api.php
+--- a/routes/api.php
++++ b/routes/api.php
+@@ -20,6 +20,8 @@
+     // Account link
+     Route::post('link/status', [WpSyncController::class, 'linkStatus']);
+     Route::post('link/disconnect', [WpSyncController::class, 'disconnectLink']);
++
++    Route::post('customer-loyalty/events', [WpSyncController::class, 'customerLoyaltyEvents']);
+ 
+     // Wallet
+     Route::post('wallet/balance', [WpSyncController::class, 'walletBalance']);
+diff --git a/docs/customer-loyalty.md b/docs/customer-loyalty.md
+new file mode 100644
+--- /dev/null
++++ b/docs/customer-loyalty.md
+@@ -0,0 +1,149 @@
++# تخفیف پلکانی کاربران عادی — راهنمای بازبینی و انتشار
++
++این تغییر در `/private/tmp/bot-customer-loyalty` و کپی مستقل افزونهٔ سایت در `/private/tmp/bot-loyalty-wordpress` پیاده‌سازی و با دیتابیس SQLite حافظه‌ای و HTTP ساختگی آزموده شده است. هیچ API عملیاتی سایت/ربات، سرویس تلگرام، دیتابیس واقعی، restart یا انتشار اجرا نشده است.
++
++## مرجع داده و دامنه
++
++- مرجع تنظیمات: گزینهٔ موجود `ipsvp_loyalty_settings.customer` در وردپرس. تنظیمات نمایندگی تغییر نمی‌کند؛ نصب وصله تنظیمات ذخیره‌شده را بازنویسی نمی‌کند.
++- مرجع تخفیف ثابت حساب متصل: ستون موجود `manual_discount_percent` سایت. صفر مستقل از NULL/خالی است.
++- حساب هنوز متصل‌نشده: مقدار ثابت در گزینهٔ سایت `ipsvp_bot_customer_discount_{tel_id}` نگهداری می‌شود. هنگام اتصال یک بار به حساب سایت منتقل می‌شود؛ اگر سایت از قبل مقدار ثابت، حتی صفر، داشته باشد همان مقدار سایت مقدم است. پس از انتقال موفق، گزینهٔ موقت حذف می‌شود.
++- مرجع پرداخت: هر تراکنش از محل اصلی ثبت آن خوانده می‌شود؛ هیچ دفتر مالی، تراکنش مالی، جدول موجودی یا شارژ جدیدی ساخته نمی‌شود.
++- مبلغ‌ها تومان (`IRT`) هستند. تبدیل ×۱۰ یا ÷۱۰ انجام نمی‌شود.
++- تخفیف حساب مانند سایت، یک بار **پس از** تخفیف محصول/تعرفه و قیمت‌گذاری موجود اعمال می‌شود. گردکردن نهایی مطابق سایت رو به بالا به تومان کامل است. خرید چندتایی، قیمت نهایی هر واحد را در تعداد ضرب می‌کند؛ مبلغ با قیمت واحدِ نمایش‌داده‌شده سازگار می‌ماند.
++- خرید، تمدید و حجم اضافه فقط برای شناسه‌های سرویس اشتراکی که در تنظیمات محیطی صریحاً مجاز شده‌اند. برای نمایندهٔ ربات یا سرویس خارج از این فهرست، قیمت فعلی حفظ می‌شود.
++
++| رویداد | محل اصلی محاسبه |
++|---|---|
++| رسید کارت‌به‌کارت ربات، نوع ۱/۲/۳/۴ و وضعیت ۱ | جدول موجود payments ربات |
++| افزایش/کاهش اصلاحی مدیریت ربات | admin_credit / admin_debit موجود ربات |
++| رسید و اصلاح مدیریت سایت | receipts موجود سایت |
++| کپی شارژ سایت در ربات، دارای receipt_id یا منبع wordpress | از ربات حذف؛ اصل سایت محاسبه می‌شود |
++| bot_wallet_mirror و bot_wallet_sync | از ادغام حذف می‌شوند |
++| خرج کیف پول، انتقال، ارجاع، بازپرداخت، رمزارز، وضعیت غیرتأیید | پرداخت واجد شرایط جدید نیستند |
++
++برای تطبیق شناسه، رویداد ربات کلید `bot:{payment_id}` دارد. رویداد تکراری حذف می‌شود؛ ردیف‌های ربات با روش و ref_id یکسان نیز یک بار صادر می‌شوند. پاسخ سایت به ربات و محاسبهٔ خود سایت از **همان محاسبه‌گر موجود سایت** استفاده می‌کنند. API خواندنی ربات هیچ درخواست بازگشتی به سایت ندارد؛ حلقهٔ HTTP تشکیل نمی‌شود.
++
++پنجره معتبر `(اکنون - ۳۰ روز، اکنون]` است. رویدادها به ترتیب زمان تأیید پردازش می‌شوند. کسر اصلاحی فقط آخرین شارژهای معتبرِ قبل از اصلاح را مصرف می‌کند؛ به رسید مستقیم و شارژ بعدی سرایت نمی‌کند. خروجی ربات تا ۶۰ روز سابقه را می‌فرستد تا اصلاحات اخیر که ابتدا شارژ اکنون‌منقضی‌شده را مصرف کرده‌اند درست بازسازی شوند. تایم‌زون انتقال، epoch است؛ نمایش زمان افت سطح در ربات به وقت تهران است. برای زمان‌های برابر در دقت یک ثانیه، ترتیب منبع و سپس شناسه ثابت است.
++
++## تغییرات ذخیره‌سازی
++
++**مهاجرت ساختار دیتابیس لازم نیست.**
++
++در JSON فعلی `payments.detail` این کلیدها اضافه می‌شوند:
++
++- `loyalty_approved_at`: زمان اولین تأیید؛ تأیید دوباره یا ویرایش بعدی آن را تغییر نمی‌دهد.
++- `customer_loyalty_quote`: مبلغ مبنا، مبلغ نهایی، درصد، منبع و زمان قیمت‌گذاری. `payments.price` و `pre_orders.data.price` از همین مبلغ نهایی استفاده می‌کنند. مسیر تحویل/پرداخت مجدد، قیمت جدید محاسبه نمی‌کند.
++- در بازیابی اختیاری زمان‌های قدیمی: `loyalty_approval_evidence`، شناسهٔ مدرک ممیزی.
++
++هیچ تغییری در مبلغ پرداخت‌های گذشته یا موجودی توسط قابلیت تخفیف انجام نمی‌شود. محافظ بازپخش تأیید API سایت داخل قفل تراکنش نیز بررسی می‌شود تا تأیید تکراری شارژ را دوباره اعمال نکند.
++
++## داده‌های تاریخی — پیش‌نیاز دقت روز اول
++
++ربات قبلاً ستون/فیلد زمان تأیید مستقل نداشت. `created_at` زمان ساخت پرداخت است و `updated_at` ممکن است بعداً تغییر کند؛ هیچ‌کدام به‌عنوان زمان تأیید فرض نشده‌اند. رسید قدیمی فاقد زمان تأیید قابل استناد، خودکار واجد شرایط نمی‌شود. در سایت هم برای مشتری عادی، `reviewed_at` لازم است و زمان ارسال جایگزین نمی‌شود.
++
++فرمان جدید، بدون فایل، فقط تعداد زمان‌های نامشخص ربات را گزارش می‌کند:
++
++```sh
++php artisan loyalty:approval-times
++```
++
++برای بازیابی از لاگ معتبر یا خروجی تأییدشدهٔ ممیزی، CSV زیر تهیه شود؛ رویدادهای ۶۰ روز اخیر برای بازسازی اصلاحات اهمیت دارند:
++
++```csv
++payment_id,user_id,amount,approved_at,evidence
++123,45,2000000,2026-09-20T12:00:00+03:30,approval-audit-123
++```
++
++پیش‌نمایش بدون نوشتن:
++
++```sh
++php artisan loyalty:approval-times reviewed-approvals.csv
++```
++
++**فقط پس از تأیید جداگانهٔ انتشار/بازیابی دادهٔ واقعی**:
++
++```sh
++php artisan loyalty:approval-times reviewed-approvals.csv --apply
++```
++
++کل فایل اعتبارسنجی می‌شود؛ شناسه، کاربر، مبلغ، وضعیت و روش پرداخت باید تطبیق داشته باشند. زمان موجود بازنویسی نمی‌شود. خطای هر ردیف کل عملیات را rollback می‌کند. تنها JSON مربوط به مدرک/زمان تأیید تغییر می‌کند؛ حتی `updated_at` هم عوض نمی‌شود. این فرمان روی دیتابیس واقعی اجرا نشده است.
++
++## رابط مدیریت و کاربر
++
++در مدیریت ربات: تنظیمات ← «تخفیف پلکانی کاربران عادی». چهار خط `مبلغ:درصد` برای پایه و سه پله؛ پایه از صفر، مرزها صعودی، درصدها ۰ تا ۱۰۰ و غیرکاهشی. مثال پیش‌فرض:
++
++```text
++0:0
++2000000:5
++5000000:10
++10000000:20
++```
++
++در جزئیات کاربر عادی: «تخفیف ثابت حساب». عدد صفر غیرفعال‌کردن تخفیف حساب است؛ دکمهٔ پاک‌کردن، حالت پلکانی را برمی‌گرداند. هر دو مسیر callback و پیام متنی دسترسی ادمین را بررسی می‌کنند. این تنظیمات در سایت ذخیره می‌شوند.
++
++حساب کاربری: ستاره‌ها، درصد و نوع فعال، جمع معتبر ۳۰ روز، باقی‌ماندهٔ پله بعدی و زمان افت سطح فعلی در صورت وجود. زمان افت با فرض نبود رویداد مالی/تغییر تنظیمات جدید محاسبه می‌شود. دستی انقضا ندارد.
++
++## اتصال‌ها
++
++همه با کلید مشترک موجود `X-IPSABET-API-KEY`:
++
++- ربات: `POST /api/wp-sync/customer-loyalty/events`، ورودی `tel_id`، فقط خواندن رویدادهای اصلی.
++- سایت: `POST /wp-json/ipsvp/v1/sync/customer-loyalty/profile`، `tel_id` و در درخواست ربات snapshot رویدادها.
++- سایت: `POST .../settings`، بدون customer خواندن؛ با customer نوشتن تنظیمات کاربران عادی.
++- سایت: `POST .../override`، `tel_id` و `value`؛ رشتهٔ خالی پاک‌کردن، رشتهٔ `0` صفر صریح.
++
++این API برای سرور مورد اعتماد دارای کلید است، نه مرورگر مشتری. ربات هیچ قیمت یا درصد ارسالی کاربر را برای تخفیف حساب نمی‌پذیرد. پاسخ ناموفق سایت، سفارش تخفیف‌دار جدید نمی‌سازد؛ پروفایل پیام عدم دسترسی نشان می‌دهد. پرداخت‌های از قبل قیمت‌گذاری‌شده از مبلغ ذخیره‌شده استفاده می‌کنند. فعال‌سازی اتصال، دسترس‌پذیری متقابل دو سرور را برای قیمت‌گذاری جدید ضروری می‌کند؛ در اختلال، از قیمت/تخفیف حدسی استفاده نمی‌شود.
++
++## نتیجه آزمون‌ها
++
++PHP 8.3.12؛ Laravel/PHPUnit از composer.lock موجود، بدون اجرای Composer scripts:
++
++- ربات: **۳۱ آزمون، ۱۵۷ assertion موفق**؛ شامل آزمون‌های قبلی، هر سه مسیر واقعی ساخت پرداخت، نمایش مبلغ، بازپخش کیف پول، تأیید مجدد، احراز هویت، مدیریت و بازیابی زمان‌های قدیمی.
++- سایت: `loyalty-test.php`: **۱۱۳ assertion موفق**.
++- سایت: `loyalty-integration-test.php`: **۲۵۷ assertion موفق** (۲۰۰ assertion نمایندگی موجود در همین شمارش است؛ تغییر رفتار نمایندگی درخواست نشده).
++- اتصال جدید: `customer-loyalty-sync-test.php`: **۵۳ assertion موفق**؛ مرزها، جمع، انقضا، اصلاح، منبع واحد، کپی‌ها، صفر/خالی، تنظیمات سفارشی، یکسانی سایت/ربات و انتقال مقدار ثابت هنگام اتصال.
++- بررسی syntax تمام PHPهای جدید/تغییریافته موفق؛ route جدید ثبت شده است.
++
++جمع: **۵۸۰ assertion**. آزمون شبکهٔ زنده، دیتابیس MySQL واقعی یا بار هم‌زمان چند worker اجرا نشده است. بازپخش ترتیبی و منطق قفل بررسی شده‌اند؛ تست استیج واقعی پیش از انتشار همچنان ضروری است.
++
++تکرار آزمون در کپی مستقل:
++
++```sh
++composer install --no-scripts --no-interaction --prefer-dist
++php vendor/bin/phpunit
++# در کپی افزونهٔ سایت پس از اعمال وصله:
++php tests/loyalty-test.php
++php tests/loyalty-integration-test.php
++php tests/customer-loyalty-sync-test.php
++```
++
++phpunit.xml دیتابیس `:memory:` را اجبار می‌کند و کلید رمزگذاری صرفاً آزمایشی دارد. برای آزمون از کپی بدون `.env` واقعی استفاده شود.
++
++## ترتیب انتشار پیشنهادی — اجرا نشده
++
++۱. قبل از هر انتشار، تأیید صریح مالک؛ ذخیرهٔ نسخهٔ کد فعلی، تنظیمات و backup دیتابیس‌ها. کد ربات برای بازبینی در همین مخزن است؛ وصلهٔ سایت در `patches/customer-loyalty/wordpress.patch` همراه manifest نسخهٔ مبنا قرار دارد. ابتدا در **کپی سایت** اجرا شود:
++
++```sh
++git apply --check /path/to/wordpress.patch
++git apply /path/to/wordpress.patch
++```
++
++۲. در استیج، افزونهٔ سایت و ربات جدید را با flag غیرفعال نصب کنید. migration عمومی یا `composer setup` اجرا نشود؛ این قابلیت migration ساختاری ندارد.
++
++۳. **شناسه‌های واقعی سرویس اشتراکی باید مشخص شوند.** جدول services در نسخه فعلی ستون نوع اشتراکی/اختصاصی ندارد. فعلاً فهرست خالی است تا به پروکسی، اختصاصی یا سرور تخفیف داده نشود. در ربات:
++
++```dotenv
++CUSTOMER_LOYALTY_ENABLED=false
++CUSTOMER_LOYALTY_SHARED_SERVICE_IDS=شناسه‌های_تأییدشده_با_کاما
++```
++
++۴. کلید مشترک و URLهای فعلی را بدون تغییر دادن مرجع تنظیمات بررسی کنید؛ ساعت هر دو سرور هماهنگ باشد. API رویدادهای ربات باید قبل از فعال‌شدن اتصال سایت در دسترس باشد. زمان‌های تاریخی نامشخص ممیزی و در صورت وجود مدرک بازیابی شوند.
++
++۵. در پیکربندی **استیج** سایت `define('IPSVP_CUSTOMER_LOYALTY_BOT', true);` و در ربات `CUSTOMER_LOYALTY_ENABLED=true` تنظیم شود. یک حساب متصل، یک حساب مستقل، درصد ثابت صفر/پاک‌شده، هر سه خرید و بازپخش شناسه آزمایش شوند. مبلغ قبل/بعد، موجودی و شمار پرداخت‌ها ثبت و مقایسه شوند. سپس با تأیید مالک همین ترتیب برای محیط عملیاتی انجام شود. هیچ secret نمونه‌ای جای secret فعلی قرار نگیرد.
++
++## بازگشت امن
++
++- برای توقف قیمت‌گذاری جدید: flag ربات false و ثابت سایت false. تنظیم cache محیط مطابق رویه فعلی استقرار همان سرویس و فقط با مجوز انجام شود؛ این راهنما restart خودکار ندارد.
++- در صورت بازگشت کد، نسخهٔ قبلی هر دو سمت برگردد. فیلدهای JSON افزوده و قیمت‌های ثبت‌شده باقی بمانند؛ موجودی، رسید و پرداخت‌های پس از انتشار به backup قبلی برگردانده نشوند.
++- تنظیمات مشترک فقط در صورت نیاز و با حفظ تغییرات ادمین به snapshot بازبینی‌شده برگردند. اجرای معکوس migration لازم نیست.
++- برای اشتباه در backfill، فقط کلیدهای مربوط به ردیف‌های ممیزی‌شده با تطبیق evidence و snapshot پیش از تغییر بازگردانی شوند؛ حذف عمومی JSON یا دستکاری مبالغ ممنوع است.

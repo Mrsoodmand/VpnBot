@@ -25,6 +25,7 @@ use App\Services\OrderCountryResolver;
 use App\Services\OrderLifecycleService;
 use App\Services\Telegram;
 use App\Services\WpSyncService;
+use App\Services\CustomerLoyaltyService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -184,6 +185,9 @@ class TelegramBotController extends Controller
         $telData->types = json_encode($type);
         $telData->save();
         switch ($type['type']) {
+            case 'adminCustomerLoyalty': return $this->adminCustomerLoyalty($type);
+            case 'adminCustomerDiscount': return $this->adminCustomerDiscount($type);
+            case 'adminCustomerDiscountClear': return $this->adminCustomerDiscountSave($type);
             // all access
             case 'home':
                 return $this->home($type);
@@ -641,6 +645,8 @@ class TelegramBotController extends Controller
         $user = $this->user;
 
         switch ($user->path) {
+            case 'adminCustomerLoyaltySave': return $this->adminCustomerLoyaltySave();
+            case 'adminCustomerDiscountSave': return $this->adminCustomerDiscountSave();
             case 'adminUpdatePanel':
                 return $this->adminUpdatePanel();
                 break;
@@ -2101,6 +2107,11 @@ class TelegramBotController extends Controller
                 if ($item->discount > 0) {
                     $discount = "| تخفیف: {$item->discount}%";
                 }
+                try {
+                    $price = number_format(app(CustomerLoyaltyService::class)->quote($this->user, (int) $service->id, $planPrice)['amount']);
+                } catch (\RuntimeException $e) {
+                    return $this->sendTemporaryMessage($e->getMessage());
+                }
                 $keyboard[] = [
                     [
                         'text' => "{$name} | $price T $discount",
@@ -2328,7 +2339,16 @@ class TelegramBotController extends Controller
         } else {
             $planPrice = calculatePlanDiscount($plan)['price'];
         }
-        $total = $planPrice * $count;
+        try {
+            $loyaltyQuote = app(CustomerLoyaltyService::class)->quote($user, (int) $service->id, $planPrice);
+        } catch (\RuntimeException $e) {
+            return $this->sendTemporaryMessage($e->getMessage());
+        }
+        $total = $loyaltyQuote['amount'] * $count;
+        $loyaltyQuote['unit_amount'] = $loyaltyQuote['amount'];
+        $loyaltyQuote['quantity'] = (int) $count;
+        $loyaltyQuote['base_amount'] *= $count;
+        $loyaltyQuote['amount'] = $total;
         $preOrderData = [
             'service-id' => $service_id,
             'country-id' => $country_id,
@@ -2353,6 +2373,7 @@ class TelegramBotController extends Controller
         $payment->user_id = $user->id;
         $payment->order_id = $preOrder->id;
         $payment->price = $total;
+        $payment->detail = ['customer_loyalty_quote' => $loyaltyQuote];
         $payment->status = 0;
         $payment->type = 1;
         $payment->expired_at = Carbon::now();
@@ -3099,6 +3120,7 @@ class TelegramBotController extends Controller
                 ->update([
                     'status' => 1,
                     'admin_id' => $this->user->id,
+                    'detail' => json_encode(array_merge($payment->detail ?? [], ['loyalty_approved_at' => ($payment->detail['loyalty_approved_at'] ?? now()->toIso8601String())])),
                     'updated_at' => now(),
                 ]);
             if ($updated === 1) {
@@ -4515,6 +4537,11 @@ $codeText
                     $price = number_format($planPrice);
                 }
                 $name = !is_null($item->name) ? $item->name : 'بدون نام';
+                try {
+                    $price = number_format(app(CustomerLoyaltyService::class)->quote($this->user, (int) $panel->panel_type, $planPrice)['amount']);
+                } catch (\RuntimeException $e) {
+                    return $this->sendTemporaryMessage($e->getMessage());
+                }
                 $keyboard[] = [
 
                     [
@@ -4591,6 +4618,15 @@ $codeText
             $planPrice = calculatePlanDiscount($plan)['price'];
             $price = number_format($planPrice);
         }
+
+        try {
+            $loyaltyQuote = app(CustomerLoyaltyService::class)->quote($user, (int) $panel->panel_type, $planPrice);
+        } catch (\RuntimeException $e) {
+            return $this->sendTemporaryMessage($e->getMessage());
+        }
+        $planPrice = $loyaltyQuote['amount'];
+        $price = number_format($planPrice);
+        $detail['customer_loyalty_quote'] = $loyaltyQuote;
 
         $detail['plan-id'] = $plan->id;
         $detail['remark'] = (string) $order->remark;
@@ -5112,9 +5148,15 @@ $codeText
                     $price = number_format($planPrice);
                 } else {
                     $price = calculateExtraDiscount($item, $perGbPrice);
-                    $price = number_format($price['price']);
+                    $planPrice = $price['price'];
+                    $price = number_format($planPrice);
                 }
 
+                try {
+                    $price = number_format(app(CustomerLoyaltyService::class)->quote($this->user, (int) $service->id, $planPrice)['amount']);
+                } catch (\RuntimeException $e) {
+                    return $this->sendTemporaryMessage($e->getMessage());
+                }
                 $keyboard[] = [
                     [
                         'text' => "{$name} GB | {$price} تومان",
@@ -5186,6 +5228,15 @@ $codeText
             $extraPrice = $price['price'];
             $price = number_format($price['price']);
         }
+
+        try {
+            $loyaltyQuote = app(CustomerLoyaltyService::class)->quote($user, (int) $service->id, $extraPrice);
+        } catch (\RuntimeException $e) {
+            return $this->sendTemporaryMessage($e->getMessage());
+        }
+        $extraPrice = $loyaltyQuote['amount'];
+        $price = number_format($extraPrice);
+        $detail['customer_loyalty_quote'] = $loyaltyQuote;
 
         $detail['extra-id'] = $extra->id;
         $detail['remark'] = (string) $order->remark;
@@ -5647,6 +5698,7 @@ $codeText
         $balance = number_format($user->balance);
         $text = headTitle("حساب کاربری");
         $text .= "🆔 آیدی تلگرام: `{$user->tel_id}`";
+        $text .= app(CustomerLoyaltyService::class)->profileText($user);
         $data = [
             'chat_id' => $this->chatId,
             'text' => trim($text),
@@ -6119,6 +6171,10 @@ $codeText
         |--------------------------------------------------------------------------
         */
 
+        if ((int) $user->is_seller !== 1) {
+            $text .= app(CustomerLoyaltyService::class)->profileText($user);
+            array_unshift($keyboard, [['text' => 'تخفیف ثابت حساب', 'callback_data' => 'type=adminCustomerDiscount|id='.$user->id]]);
+        }
         $data = [
             'chat_id' => $this->chatId,
             'text' => trim($text),
@@ -8238,11 +8294,98 @@ $codeText
 
     // Start Setting
 
+    protected function adminCustomerLoyalty($type = [])
+    {
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        try {
+            $data = app(CustomerLoyaltyService::class)->request('settings');
+        } catch (\RuntimeException $e) {
+            return $this->sendTemporaryMessage($e->getMessage());
+        }
+        $lines = array_map(fn ($t) => ($t['min'] + $t['strict']).':'.$t['percent'], $data['customer']);
+        $this->updatePath('adminCustomerLoyaltySave');
+        $text = "تخفیف پلکانی کاربران عادی\nمرجع مشترک: سایت | واحد: تومان\n\n".implode("\n", $lines);
+        $text .= "\n\nچهار خط به شکل مبلغ:درصد ارسال کنید. خط اول از صفر شروع شود؛ مرزها صعودی و درصدها غیرکاهشی باشند. مرز هر پله متعلق به همان پله است.";
+        return $this->sendMessage(['chat_id' => $this->chatId, 'text' => $text,
+            'reply_markup' => json_encode(['inline_keyboard' => [[['text' => 'بازگشت', 'callback_data' => 'type=adminSetting']]]])], 'message');
+    }
+
+    protected function adminCustomerLoyaltySave()
+    {
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        $rows = preg_split('/\R/u', trim($this->text));
+        $tiers = [];
+        if (count($rows) !== 4) return $this->sendTemporaryMessage('دقیقاً چهار خط مبلغ:درصد وارد کنید.');
+        foreach ($rows as $row) {
+            if (!preg_match('/^\s*(0|[1-9][0-9]{0,11})\s*:\s*(100(?:\.0{1,2})?|[0-9]{1,2}(?:\.[0-9]{1,2})?)\s*$/D', $row, $m)) {
+                return $this->sendTemporaryMessage('مبلغ صحیح نامنفی و درصد صفر تا صد وارد کنید.');
+            }
+            $tiers[] = ['min' => (int) $m[1], 'percent' => (float) $m[2], 'strict' => 0];
+        }
+        $last = -1; $percent = -1;
+        foreach ($tiers as $i => $tier) {
+            if (($i === 0 && $tier['min'] !== 0) || $tier['min'] <= $last || $tier['percent'] < $percent) {
+                return $this->sendTemporaryMessage('پله پایه از صفر؛ مرزها صعودی و درصدها غیرکاهشی باشند.');
+            }
+            $last = $tier['min']; $percent = $tier['percent'];
+        }
+        try {
+            app(CustomerLoyaltyService::class)->request('settings', ['customer' => $tiers]);
+        } catch (\RuntimeException $e) {
+            return $this->sendTemporaryMessage($e->getMessage());
+        }
+        $this->updatePath('adminSetting');
+        return $this->sendTemporaryMessage('تنظیمات مشترک سایت و ربات ذخیره شد.');
+    }
+
+    protected function adminCustomerDiscount($type = [])
+    {
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        $target = User::find((int) ($type['id'] ?? 0));
+        if (!$target || (int) $target->is_seller === 1) return $this->sendTemporaryMessage('این بخش فقط برای کاربر عادی است.');
+        try {
+            $profile = app(CustomerLoyaltyService::class)->profile($target);
+        } catch (\RuntimeException $e) {
+            return $this->sendTemporaryMessage($e->getMessage());
+        }
+        $detail = $this->user->tel_detail ?? [];
+        $detail['customer-discount-user-id'] = $target->id;
+        $this->user->tel_detail = $detail;
+        $this->user->save();
+        $this->updatePath('adminCustomerDiscountSave');
+        $value = ($profile['manual_value'] ?? '') === '' ? 'خالی (پلکانی)' : $profile['manual_value'].'٪';
+        return $this->sendMessage(['chat_id' => $this->chatId,
+            'text' => "تخفیف ثابت حساب: {$value}\nدرصد صفر تا صد را ارسال کنید. صفر یعنی بدون تخفیف. برای خالی‌کردن و بازگشت به پلکان، دکمه زیر را بزنید.",
+            'reply_markup' => json_encode(['inline_keyboard' => [
+                [['text' => 'پاک‌کردن تخفیف ثابت', 'callback_data' => 'type=adminCustomerDiscountClear|id='.$target->id]],
+                [['text' => 'بازگشت', 'callback_data' => 'type=adminUserDetail|id='.$target->id]],
+            ]])], 'message');
+    }
+
+    protected function adminCustomerDiscountSave($type = null)
+    {
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        $clear = ($type['type'] ?? '') === 'adminCustomerDiscountClear';
+        $target = User::find((int) ($clear ? ($type['id'] ?? 0) : ($this->user->tel_detail['customer-discount-user-id'] ?? 0)));
+        if (!$target || (int) $target->is_seller === 1) return $this->sendTemporaryMessage('کاربر عادی پیدا نشد.');
+        $value = $clear ? '' : trim($this->text);
+        if (!$clear && !preg_match('/^(100(?:\.0{1,2})?|[0-9]{1,2}(?:\.[0-9]{1,2})?)$/D', $value)) {
+            return $this->sendTemporaryMessage('درصد صفر تا صد با حداکثر دو رقم اعشار وارد کنید.');
+        }
+        try {
+            app(CustomerLoyaltyService::class)->request('override', ['tel_id' => (string) $target->tel_id, 'value' => $value]);
+        } catch (\RuntimeException $e) {
+            return $this->sendTemporaryMessage($e->getMessage());
+        }
+        $this->updatePath('adminUserDetail');
+        return $this->sendTemporaryMessage('تخفیف ثابت حساب ذخیره شد.');
+    }
+
     protected function adminSetting($type)
     {
         $keys = ['join-bot', 'join-with-referral', 'channel-join'];
         $settings = Setting::whereIn('key', $keys)->get();
-        $buttons = [];
+        $buttons = [[['text' => 'تخفیف پلکانی کاربران عادی', 'callback_data' => 'type=adminCustomerLoyalty']]];
 
         foreach ($settings as $setting) {
             $buttons[] = [

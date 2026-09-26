@@ -48,6 +48,15 @@ class WpSyncController extends Controller
         return $this->json(['ok' => true, 'deleted' => $result]);
     }
 
+    public function customerLoyaltyEvents(Request $request, WpSyncService $sync)
+    {
+        if ($g = $this->guard($request, $sync)) return $g;
+        $user = $sync->resolveUser($request->all());
+        if (!$user) return $this->json(['ok' => false, 'message' => 'user_not_found'], 404);
+        if ((int) $user->is_seller === 1) return $this->json(['ok' => false, 'message' => 'customer_only'], 422);
+        return $this->json(['ok' => true, 'events' => app(\App\Services\CustomerLoyaltyService::class)->events($user)]);
+    }
+
     /* Wallet */
 
     public function walletBalance(Request $request, WpSyncService $sync)

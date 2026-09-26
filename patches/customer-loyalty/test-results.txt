@@ -1,0 +1,34 @@
+Customer loyalty — isolated verification
+Runtime: PHP 8.3.12; PHPUnit 11.5.55; dependencies installed from existing composer.lock, --no-scripts.
+Bot directory: /private/tmp/bot-customer-loyalty
+WordPress directory: /private/tmp/bot-loyalty-wordpress
+Database: SQLite :memory: (forced in phpunit.xml). HTTP: faked / stray requests prohibited in new tests.
+
+php vendor/bin/phpunit
+OK (31 tests, 157 assertions)
+
+php tests/loyalty-test.php
+PASS: 113 loyalty policy assertions.
+
+php tests/loyalty-integration-test.php
+OK: 200 reseller assertions passed.
+PASS: 257 total reseller and loyalty integration assertions.
+(The 200 reseller assertions are INCLUDED in 257.)
+
+php tests/customer-loyalty-sync-test.php
+PASS: 53 customer synchronization assertions.
+
+Total: 580 assertions passed.
+Syntax: all 9 new/changed bot PHP files and all 5 new/changed WordPress PHP files passed php -l.
+Route discovery: POST api/wp-sync/customer-loyalty/events registered.
+Patch checks: bot.patch and wordpress.patch passed git apply --check against their local source baselines.
+Whitespace: git diff --check passed.
+
+Coverage: exact tiers/intermediate amounts; cumulative deposits; direct purchase/renewal/extra receipts;
+wallet-spend exclusion; unapproved/crypto/referral/refund/sync exclusions; duplicate IDs/references;
+30-day expiry; LIFO corrections and no future carry; manual/zero/empty; custom policy preservation;
+site/bot profile agreement; admin authorization; all three checkout price snapshots; replayed approval
+and wallet payment; multi-unit rounding; malformed authority response; preview-only approval backfill and all-or-nothing rollback on mismatched evidence.
+
+No production DB migrations, API traffic, Telegram messages, restarts or deployment were performed.
+No real MySQL concurrent-worker/load test was performed. Shared service IDs remain a release prerequisite.

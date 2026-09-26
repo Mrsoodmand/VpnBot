@@ -1,0 +1,367 @@
+diff --git a/ip-sabet-pasarguard-shop.php b/ip-sabet-pasarguard-shop.php
+--- a/ip-sabet-pasarguard-shop.php
++++ b/ip-sabet-pasarguard-shop.php
+@@ -28,6 +28,7 @@
+ require_once IPSVP_PLUGIN_DIR . 'includes/class-ipsvp-receipt-manager.php';
+ require_once IPSVP_PLUGIN_DIR . 'includes/class-ipsvp-telegram-service.php';
+ require_once IPSVP_PLUGIN_DIR . 'includes/class-ipsvp-loyalty.php';
++require_once IPSVP_PLUGIN_DIR . 'includes/class-ipsvp-customer-loyalty-sync.php';
+ require_once IPSVP_PLUGIN_DIR . 'includes/class-ipsvp-reseller-store.php';
+ require_once IPSVP_PLUGIN_DIR . 'includes/class-ipsvp-reseller-service.php';
+ require_once IPSVP_PLUGIN_DIR . 'includes/class-ipsvp-reseller-api.php';
+diff --git a/includes/class-ipsvp-db.php b/includes/class-ipsvp-db.php
+--- a/includes/class-ipsvp-db.php
++++ b/includes/class-ipsvp-db.php
+@@ -647,6 +647,9 @@
+             'bot_linked_at' => $linked_at,
+             'last_seen_at' => $now,
+         ), array('id' => (int) $user->id));
++        if (class_exists('IPSVP_Customer_Loyalty_Sync')) {
++            IPSVP_Customer_Loyalty_Sync::adopt_override($this->get_user_by_id($user->id));
++        }
+         return $this->get_user_by_id($user->id);
+     }
+ 
+diff --git a/includes/class-ipsvp-loyalty.php b/includes/class-ipsvp-loyalty.php
+--- a/includes/class-ipsvp-loyalty.php
++++ b/includes/class-ipsvp-loyalty.php
+@@ -130,12 +130,13 @@
+         $events = array();
+         foreach ($rows as $row) {
+             $row = (object) $row;
+-            $at = self::timestamp($row->reviewed_at ?? '') ?: self::timestamp($row->created_at ?? '');
++            $at = self::timestamp($row->reviewed_at ?? '');
++            if ($reseller && !$at) { $at = self::timestamp($row->created_at ?? ''); }
+             if (!self::qualifies($row, $reseller) || $at <= 0 || $at > $now || (int) ($row->amount ?? 0) <= 0) { continue; }
+             if (!in_array($row->type ?? '', array('wallet', 'wallet_admin_credit', 'wallet_admin_debit', 'new', 'renewal', 'bot_renewal', 'extra_volume'), true)) { continue; }
+-            $events[] = array('id' => (int) $row->id, 'at' => $at, 'amount' => (int) $row->amount, 'debit' => $row->type === 'wallet_admin_debit', 'correctable' => in_array($row->type, array('wallet','wallet_admin_credit'), true));
+-        }
+-        usort($events, static function ($a, $b) { return ($a['at'] <=> $b['at']) ?: ($a['id'] <=> $b['id']); });
++            $events[] = array('id' => (int) $row->id, 'at' => $at, 'amount' => (int) $row->amount, 'debit' => $row->type === 'wallet_admin_debit', 'origin' => strpos((string) ($row->submission_key ?? ''), 'bot:') === 0 ? 1 : 0, 'correctable' => in_array($row->type, array('wallet','wallet_admin_credit'), true));
++        }
++        usort($events, static function ($a, $b) { return ($a['at'] <=> $b['at']) ?: ($a['origin'] <=> $b['origin']) ?: ($a['id'] <=> $b['id']); });
+         $credits = array();
+         foreach ($events as $event) {
+             if (!$event['debit']) { $credits[] = $event; continue; }
+@@ -179,7 +180,7 @@
+         if ($has_manual) {
+             $stars = $reseller || $first_purchase || $effective > 0 ? 1 : 0;
+             foreach ($tiers as $i => $tier) {
+-                if ($i > 0 && $effective > 0 && $effective >= (float) $tier['percent']) { $stars = $i + 1; }
++                if ($i > 0 && (!$reseller || $effective > 0) && $effective >= (float) $tier['percent']) { $stars = $i + 1; }
+             }
+         }
+         return array('kind' => $reseller ? 'reseller' : 'customer', 'level' => $level,
+@@ -217,6 +218,9 @@
+         list($rows, $first) = self::$ledger[$user_id];
+         $reseller = $account && $account->status === 'approved';
+         $user = $reseller ? null : $db->get_user_by_id((int) $user_id);
++        if (!$reseller && class_exists('IPSVP_Customer_Loyalty_Sync')) {
++            list($rows, $first) = IPSVP_Customer_Loyalty_Sync::merge($user, $rows, $first);
++        }
+         $manual = $reseller ? (property_exists($account, 'manual_discount_percent') ? $account->manual_discount_percent : $account->discount_percent) : ($user->manual_discount_percent ?? null);
+         return self::calculate($rows, $reseller, $manual, $first, self::settings(), time());
+     }
+diff --git a/includes/class-ipsvp-customer-loyalty-sync.php b/includes/class-ipsvp-customer-loyalty-sync.php
+new file mode 100644
+--- /dev/null
++++ b/includes/class-ipsvp-customer-loyalty-sync.php
+@@ -0,0 +1,168 @@
++<?php
++/** Read-only financial federation. Existing receipts/payments remain the only ledgers. */
++defined('ABSPATH') || exit;
++
++final class IPSVP_Customer_Loyalty_Sync
++{
++    private static $events = array();
++
++    public static function enabled()
++    {
++        return defined('IPSVP_CUSTOMER_LOYALTY_BOT') && IPSVP_CUSTOMER_LOYALTY_BOT;
++    }
++
++    public static function register()
++    {
++        foreach (array('profile', 'settings', 'override') as $action) {
++            register_rest_route('ipsvp/v1', '/sync/customer-loyalty/' . $action, array(
++                'methods' => 'POST', 'permission_callback' => array(__CLASS__, 'authorize'),
++                'callback' => static function ($request) use ($action) { return self::dispatch($action, $request); },
++            ));
++        }
++    }
++
++    public static function authorize($request)
++    {
++        $settings = IPSVP_Settings::get();
++        $key = (string) ($settings['wp_sync_secret'] ?? '');
++        return $key !== '' && hash_equals($key, (string) $request->get_header('x-ipsabet-api-key'))
++            ? true : new WP_Error('forbidden', 'دسترسی مجاز نیست.', array('status' => 403));
++    }
++
++    public static function events($tel_id)
++    {
++        if (!isset(self::$events[$tel_id])) {
++            $response = IPSVP_Bot_API::request('POST', '/api/wp-sync/customer-loyalty/events', array('tel_id' => (string) $tel_id));
++            if (is_wp_error($response) || empty($response['ok'])) {
++                // Never quote a silently lower discount when the authoritative source is unavailable.
++                throw new RuntimeException('استعلام تخفیف ربات انجام نشد؛ دوباره تلاش کنید.');
++            }
++            self::$events[$tel_id] = self::validate_events($response['events'] ?? null);
++        }
++        return self::$events[$tel_id];
++    }
++
++    public static function validate_events($events)
++    {
++        if (!is_array($events) || ($events['currency'] ?? '') !== 'IRT' || !is_array($events['rows'] ?? null)
++            || !is_bool($events['first_purchase'] ?? null)) throw new InvalidArgumentException('invalid_events');
++        $seen = array(); $rows = array();
++        foreach ($events['rows'] as $row) {
++            if (!is_array($row) || !is_int($row['id'] ?? null) || $row['id'] < 1
++                || !is_int($row['amount'] ?? null) || $row['amount'] < 1 || !is_int($row['approved_at'] ?? null)
++                || !in_array($row['type'] ?? '', array('wallet','wallet_admin_credit','wallet_admin_debit','new','renewal','extra_volume'), true)
++                || ($row['key'] ?? '') !== 'bot:' . $row['id']) throw new InvalidArgumentException('invalid_event');
++            if (isset($seen[$row['key']])) continue;
++            $seen[$row['key']] = true;
++            $admin = in_array($row['type'], array('wallet_admin_credit','wallet_admin_debit'), true);
++            $rows[] = (object) array('id' => $row['id'], 'type' => $row['type'], 'amount' => $row['amount'],
++                'status' => 'approved', 'reviewed_at' => wp_date('Y-m-d H:i:s', $row['approved_at'], wp_timezone()),
++                'remote_source' => $admin ? 'admin_wallet_adjustment' : '', 'remote_payload' => '{"payment_method":"card"}',
++                'submission_key' => $row['key']);
++        }
++        return array('rows' => $rows, 'first_purchase' => $events['first_purchase']);
++    }
++
++    public static function merge($user, array $rows, $first)
++    {
++        if (!self::enabled() || empty($user->bot_tel_id)) return array($rows, $first);
++        $events = self::events((string) $user->bot_tel_id);
++        // Mirrors and balance-sync are not independent payments. Site-origin bot credits
++        // are excluded by the bot endpoint; their originals remain in $rows.
++        $rows = array_values(array_filter($rows, static function ($r) {
++            return !in_array($r->remote_source ?? '', array('bot_wallet_mirror','bot_wallet_sync'), true);
++        }));
++        return array(array_merge($rows, $events['rows']), $first || $events['first_purchase']);
++    }
++
++    private static function user($tel_id)
++    {
++        global $wpdb;
++        $db = new IPSVP_DB(); $tables = $db->tables();
++        return $wpdb->get_row($wpdb->prepare("SELECT * FROM {$tables['users']} WHERE bot_tel_id=%s", $tel_id));
++    }
++
++    /** Move the unlinked override once; an existing site override (including zero) wins. */
++    public static function adopt_override($user)
++    {
++        if (!$user || empty($user->bot_tel_id) || IPSVP_Reseller_Store::approved($user->id)) return;
++        $key = 'ipsvp_bot_customer_discount_' . $user->bot_tel_id;
++        $value = get_option($key, null);
++        if ($value === null) return;
++        if (($user->manual_discount_percent ?? null) === null && $value !== '') {
++            $result = IPSVP_Loyalty::save_override($user->id, $value);
++            if (is_wp_error($result)) return;
++        }
++        delete_option($key);
++    }
++
++    public static function dispatch($action, $request)
++    {
++        try {
++            if ($action === 'settings') {
++                $settings = IPSVP_Loyalty::settings();
++                if ($request->has_param('customer')) {
++                    $customer = $request->get_param('customer');
++                    // This endpoint changes customers only; preserve the actual saved reseller policy.
++                    $saved = get_option(IPSVP_Loyalty::OPTION, IPSVP_Loyalty::defaults());
++                    if (!is_array($saved)) throw new InvalidArgumentException('invalid_saved_settings');
++                    if (!is_array($customer)) throw new InvalidArgumentException('invalid_customer_settings');
++                    foreach ($customer as $tier) {
++                        if (!is_array($tier) || (int) ($tier['strict'] ?? 0) !== 0) throw new InvalidArgumentException('inclusive_threshold_required');
++                    }
++                    $saved['customer'] = $customer;
++                    $checked = IPSVP_Loyalty::validate_settings($saved);
++                    if (is_wp_error($checked)) return $checked;
++                    $saved['customer'] = $checked['customer'];
++                    update_option(IPSVP_Loyalty::OPTION, $saved, false);
++                    $settings = $saved;
++                }
++                return array('ok' => true, 'customer' => $settings['customer'], 'currency' => 'IRT');
++            }
++            $tel = (string) $request->get_param('tel_id');
++            if (!preg_match('/^[1-9][0-9]{0,19}$/D', $tel)) throw new InvalidArgumentException('invalid_tel_id');
++            $user = self::user($tel);
++            if ($user && IPSVP_Reseller_Store::approved($user->id)) {
++                return new WP_Error('customer_only', 'این بخش فقط برای کاربران عادی است.', array('status' => 422));
++            }
++            $option = 'ipsvp_bot_customer_discount_' . $tel;
++            if ($action === 'override') {
++                if (!$request->has_param('value')) throw new InvalidArgumentException('value_required');
++                $value = $request->get_param('value');
++                if (!is_string($value) || ($value !== '' && !preg_match('/^(?:100(?:\.0{1,2})?|[0-9]{1,2}(?:\.[0-9]{1,2})?)$/D', $value))) throw new InvalidArgumentException('invalid_discount');
++                if ($user) {
++                    $result = IPSVP_Loyalty::save_override($user->id, $value);
++                    if (is_wp_error($result)) return $result;
++                } else {
++                    // Unlinked bot users still use the same site authority. No wallet row is created.
++                    update_option($option, $value, false);
++                }
++                return array('ok' => true);
++            }
++            if ($request->has_param('events')) self::$events[$tel] = self::validate_events($request->get_param('events'));
++            if ($user) {
++                if (!self::enabled()) throw new RuntimeException('customer_loyalty_bridge_disabled');
++                $profile = IPSVP_Loyalty::profile($user->id, false);
++                $manual = $user->manual_discount_percent ?? null;
++            } else {
++                $events = self::events($tel);
++                $manual = get_option($option, '');
++                $profile = IPSVP_Loyalty::calculate($events['rows'], false, $manual, $events['first_purchase'], IPSVP_Loyalty::settings(), time());
++            }
++            $profile['manual_value'] = $manual === null ? '' : (string) $manual;
++            $profile['next_amount'] = null;
++            if ($profile['source'] === 'automatic') {
++                foreach (IPSVP_Loyalty::settings()['customer'] as $tier) {
++                    $floor = $tier['min'] + $tier['strict'];
++                    if ($floor > $profile['total']) { $profile['next_amount'] = $floor - $profile['total']; break; }
++                }
++            }
++            return array('ok' => true, 'profile' => $profile, 'currency' => 'IRT');
++        } catch (InvalidArgumentException $e) {
++            return new WP_Error('invalid_loyalty_input', $e->getMessage(), array('status' => 422));
++        } catch (RuntimeException $e) {
++            return new WP_Error('loyalty_unavailable', $e->getMessage(), array('status' => 503));
++        }
++    }
++}
++add_action('rest_api_init', array('IPSVP_Customer_Loyalty_Sync', 'register'));
+diff --git a/tests/customer-loyalty-sync-test.php b/tests/customer-loyalty-sync-test.php
+new file mode 100644
+--- /dev/null
++++ b/tests/customer-loyalty-sync-test.php
+@@ -0,0 +1,125 @@
++<?php
++/** Offline contract tests for the actual shared WordPress authority. */
++if (PHP_SAPI !== 'cli') exit;
++define('ABSPATH', '/');
++define('IPSVP_CUSTOMER_LOYALTY_BOT', true);
++class WP_Error { public function __construct(public $code, public $message, public $data = []) {} }
++function is_wp_error($v) { return $v instanceof WP_Error; }
++function add_action(...$args) {}
++function add_filter(...$args) {}
++function wp_timezone() { return new DateTimeZone('Asia/Tehran'); }
++function wp_date($format, $at, $tz = null) { return (new DateTimeImmutable('@'.$at))->setTimezone($tz ?: wp_timezone())->format($format); }
++function get_option($key, $default = false) { return $GLOBALS['options'][$key] ?? $default; }
++function update_option($key, $value, $autoload = false) { $GLOBALS['options'][$key] = $value; }
++function delete_option($key) { unset($GLOBALS['options'][$key]); }
++class IPSVP_Settings { static function get() { return ['wp_sync_secret' => 'test-secret']; } }
++class IPSVP_Reseller_Store {
++    static function approved($id) { return false; }
++    static function account($id) { return false; }
++    static function lock($id) { return true; }
++    static function audit(...$args) {}
++}
++class IPSVP_DB {
++    function tables() { return ['users'=>'users','receipts'=>'receipts','orders'=>'orders']; }
++    function get_user_by_id($id) { return $GLOBALS['wpdb']->user; }
++}
++class FakeSql {
++    public $user = null; public array $receipts = []; public bool $first = false;
++    function prepare($sql, ...$params) { return $sql; }
++    function get_row($sql) { return $this->user; }
++    function get_results($sql) { return $this->receipts; }
++    function get_var($sql) { return $this->first ? 1 : 0; }
++    function update($table, $data, $where) { foreach ($data as $k=>$v) $this->user->$k = $v; return 1; }
++}
++class IPSVP_Bot_API {
++    public static int $calls = 0;
++    static function request(...$args) { self::$calls++; return new WP_Error('offline','offline'); }
++}
++class Request {
++    function __construct(public array $data = [], public string $secret = 'test-secret') {}
++    function has_param($key) { return array_key_exists($key,$this->data); }
++    function get_param($key) { return $this->data[$key] ?? null; }
++    function get_header($key) { return $this->secret; }
++}
++require __DIR__.'/../includes/class-ipsvp-loyalty.php';
++require __DIR__.'/../includes/class-ipsvp-customer-loyalty-sync.php';
++IPSVP_Loyalty::init(new IPSVP_DB());
++$GLOBALS['wpdb'] = new FakeSql(); $GLOBALS['options'] = [];
++$n = 0;
++function check($actual, $expected, $label) { global $n; $n++; if ($actual !== $expected) throw new RuntimeException($label.': '.json_encode([$actual,$expected])); }
++function endpoint($action, $data) { return IPSVP_Customer_Loyalty_Sync::dispatch($action,new Request($data)); }
++$now = time();
++function bot_event($id,$amount,$age=0,$type='wallet') { global $now; return ['id'=>$id,'amount'=>$amount,'approved_at'=>$now-$age*86400,'type'=>$type,'key'=>'bot:'.$id]; }
++function event_payload($rows,$first=false) { return ['rows'=>$rows,'first_purchase'=>$first,'currency'=>'IRT']; }
++function bot_profile($rows,$tel='1001',$first=false) { return endpoint('profile',['tel_id'=>$tel,'events'=>event_payload($rows,$first)])['profile']; }
++check(is_wp_error(IPSVP_Customer_Loyalty_Sync::authorize(new Request([], 'wrong'))),true,'Unauthorized rejected');
++check(IPSVP_Customer_Loyalty_Sync::authorize(new Request()),true,'Same shared key');
++foreach ([0=>0,1999999=>0,2000000=>5,3000000=>5,4999999=>5,5000000=>10,6000000=>10,9999999=>10,10000000=>20,12000000=>20] as $amount=>$rate) {
++    check(bot_profile($amount ? [bot_event(1,$amount)] : [])['percent'],(float)$rate,'Exact customer boundary '.$amount);
++}
++check(bot_profile([bot_event(1,1000000),bot_event(2,1000000)])['percent'],5.0,'Small payments sum');
++check(bot_profile([bot_event(1,2000000),bot_event(1,2000000)])['total'],2000000,'Repeated event deduplicated');
++$mix = [bot_event(1,500000),bot_event(2,500000,0,'new'),bot_event(3,500000,0,'renewal'),bot_event(4,500000,0,'extra_volume')];
++check(bot_profile($mix)['total'],2000000,'Topup purchase renewal extra combined');
++check(bot_profile([bot_event(1,5000000,30)])['total'],0,'Exact 30 day expiration');
++check(bot_profile([bot_event(1,5000000,29),bot_event(2,1000)])['expires_at'],$now+86400,'New deposit cannot extend old tier');
++check(bot_profile([bot_event(1,3000000,25),bot_event(2,3000000,5),bot_event(3,2000000,1,'wallet_admin_debit')])['expires_at'],$now+5*86400,'Correction consumes newest first');
++check(bot_profile([bot_event(1,5000000,31),bot_event(2,6000000,0,'wallet_admin_debit'),bot_event(3,2000000)])['total'],2000000,'Expired credits cannot consume correction; excess cannot carry forward');
++check(bot_profile([bot_event(1,2000000,2),bot_event(2,3000000,1,'new'),bot_event(3,9000000,0,'wallet_admin_debit')])['total'],3000000,'Direct receipt cannot be corrected');
++check(bot_profile([])['stars'],0,'No purchase zero stars');
++check(bot_profile([],'1001',true)['stars'],1,'First successful purchase one star');
++foreach (['15'=>[15.0,3],'0'=>[0.0,0],''=>[20.0,4]] as $value=>$expect) {
++    endpoint('override',['tel_id'=>'1001','value'=>(string)$value]);
++    $p = bot_profile([bot_event(1,10000000)]);
++    check([$p['percent'],$p['stars']],$expect,'Override zero versus empty '.$value);
++    if ($value !== '') check($p['expires_at'],null,'Manual never expires');
++}
++check(endpoint('override',['tel_id'=>'1001','value'=>'101'])->code,'invalid_loyalty_input','Bad fixed rate');
++$original=IPSVP_Loyalty::defaults();$original['reseller'][0]['percent']=3;
++$GLOBALS['options'][IPSVP_Loyalty::OPTION]=$original;
++$custom=$original['customer'];$custom[1]['min']=3000000;$custom[1]['percent']=7;
++$r=endpoint('settings',['customer'=>$custom]);check($r['ok'],true,'Custom settings saved');
++check(get_option(IPSVP_Loyalty::OPTION)['reseller'],$original['reseller'],'Reseller settings preserved byte for byte');
++check(bot_profile([bot_event(1,3000000)])['percent'],7.0,'Custom threshold shared');
++foreach ([['min',-1],['percent',101],['min',5000000],['percent',11],['strict',1]] as [$field,$value]) {
++    $bad=$custom;$bad[1][$field]=$value;
++    check(is_wp_error(endpoint('settings',['customer'=>$bad])),true,'Invalid threshold/rate rejected');
++}
++$GLOBALS['options'][IPSVP_Loyalty::OPTION]=IPSVP_Loyalty::defaults();
++// Linked site original + bot original, with a mirror and balance sync present.
++$GLOBALS['wpdb']->user=(object)['id'=>1,'bot_tel_id'=>'2002','manual_discount_percent'=>null];
++$site=(object)['id'=>1,'type'=>'wallet','status'=>'approved','amount'=>3000000,'reviewed_at'=>wp_date('Y-m-d H:i:s',$now),'remote_source'=>''];
++$mirror=clone $site;$mirror->id=2;$mirror->remote_source='bot_wallet_mirror';
++$sync=clone $site;$sync->id=3;$sync->remote_source='bot_wallet_sync';
++$GLOBALS['wpdb']->receipts=[$site,$mirror,$sync];
++IPSVP_Loyalty::clear_cache();
++$bot=bot_profile([bot_event(9,2000000)],'2002');
++$web=IPSVP_Loyalty::profile(1);
++check($bot['total'],5000000,'Linked union counts each original once');
++check($bot['percent'],$web['percent'],'Site and bot same percentage');
++check($bot['total'],$web['total'],'Site and bot same total');
++check($bot['stars'],$web['stars'],'Site and bot same stars');
++check(IPSVP_Bot_API::$calls,0,'Bot profile supplies events; no recursive HTTP request');
++endpoint('override',['tel_id'=>'2002','value'=>'0']);
++check($GLOBALS['wpdb']->user->manual_discount_percent,'0','Shared SQL override stores explicit zero');
++check(bot_profile([bot_event(9,10000000)],'2002')['percent'],0.0,'Shared zero has priority');
++endpoint('override',['tel_id'=>'2002','value'=>'']);
++check($GLOBALS['wpdb']->user->manual_discount_percent,null,'Clear stores null');
++// No guessing of approval dates for old customer receipts.
++$unknown=clone $site;$unknown->reviewed_at=null;$unknown->created_at=wp_date('Y-m-d H:i:s',$now);
++check(IPSVP_Loyalty::calculate([$unknown],false,null,false,IPSVP_Loyalty::defaults(),$now)['total'],0,'Upload date not approval');
++// An unlinked fixed override is adopted exactly once on linking.
++$GLOBALS['options']['ipsvp_bot_customer_discount_2002']='15';
++IPSVP_Customer_Loyalty_Sync::adopt_override($GLOBALS['wpdb']->user);
++check($GLOBALS['wpdb']->user->manual_discount_percent,'15','Override survives link');
++check(get_option('ipsvp_bot_customer_discount_2002',null),null,'No second authority after linking');
++// Custom zero-percent tiers use the highest configured percentage not above the manual rate.
++$custom = IPSVP_Loyalty::defaults();
++$custom['customer'][1]['percent'] = 0;
++check(IPSVP_Loyalty::calculate([], false, '0', false, $custom, $now)['stars'], 2, 'Manual stars follow customized percentages');
++// Crypto/referral/refund/ordinary wallet spend are excluded by the real customer calculator.
++foreach (['ramzino','bot_wallet_sync','service_refund','service_payment','referral'] as $source) {
++    $excluded = clone $site; $excluded->remote_source = $source;
++    check(IPSVP_Loyalty::calculate([$excluded], false, null, false, IPSVP_Loyalty::defaults(), $now)['total'], 0, 'Excluded financial source '.$source);
++}
++echo "PASS: $n customer synchronization assertions.\n";

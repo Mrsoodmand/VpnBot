@@ -1,0 +1,73 @@
+{
+  "bot_base_commit": "c2e03b844a945b00ccca2fe94bd84524dac26fc9",
+  "files": {
+    "wordpress/ip-sabet-pasarguard-shop.php": {
+      "before": "d7fa987f98564f2b96ffe0e8678fd470a8ef0a1c8047846945da1ea2ed571f22",
+      "after": "ad71b95162f53d8201077fdf6a428bdddfba6c7feba546aaf963119beac494dd"
+    },
+    "wordpress/includes/class-ipsvp-db.php": {
+      "before": "c05c881af6e3e7c52ea6c335f8c5338d09f42cfa758be5c5752cee0f2c8d6ede",
+      "after": "333b050a70cfa866fe5dfe72e13ca7ba74f404772d806931b5e056a741de5397"
+    },
+    "wordpress/includes/class-ipsvp-loyalty.php": {
+      "before": "0700b6477eb664cb965b68bfe4213c25366c9e2820a3f6e35d30fc1b0e323a79",
+      "after": "c302d277ee0cae2b367e5558738c34bae7a7c88ad5ef9eba2a46e89e712b0e08"
+    },
+    "wordpress/includes/class-ipsvp-customer-loyalty-sync.php": {
+      "before": null,
+      "after": "d267e7662adef9f5b6175a8b7944ff18d9e1953d3e5d6b8222f5b16aa8ccecd6"
+    },
+    "wordpress/tests/customer-loyalty-sync-test.php": {
+      "before": null,
+      "after": "26219b7108a379fe33deaccd131bb186357cef3b40f65d278c6612f356024fa4"
+    },
+    "bot/.env.example": {
+      "before": "a527dd22cebd532f74bdca8352dc2e624bdf0655a8c85be88edd35ac44bd13c3",
+      "after": "364072c7b9beb848b5bf87ed55ea9597f2dc10a70a649e7358e861ba2a1413c4"
+    },
+    "bot/phpunit.xml": {
+      "before": "493369cfb7feea104da4bec214c2cc6526ca2f1b9d937c50a2961fc59cb61aaf",
+      "after": "5074bece79a0edeb244969df09442a800ed9fc603b74f218ce5216c5cd3a7f12"
+    },
+    "bot/app/Providers/AppServiceProvider.php": {
+      "before": "caf306ef6a25a547bbb7edd5508a39b51c365083eb6dd58378cf2242018e94c7",
+      "after": "c753ac4ceff01b2dd9467d58b8f7d84ad7e7ae716c579688949fdd8ae6387df6"
+    },
+    "bot/app/Http/Controllers/Api/TelegramBotController.php": {
+      "before": "a955dd2503050ab0a675b04d92f50a2f887c1bdeec84740d92d8a6c8772c7121",
+      "after": "f92fa653c4425f44c734badedeb8a96f8308aed9dc9fe826780258f9c75bf6d1"
+    },
+    "bot/app/Http/Controllers/Api/WpSyncController.php": {
+      "before": "80e889d88cf0c3c22b56d78aaeca73b16a50724490e9a26341fcbbb043cf42ae",
+      "after": "9ed14759125f5a77934ad249f92be22c327e3bfa6d1b5199f9d1082b454725dc"
+    },
+    "bot/app/Services/CustomerLoyaltyService.php": {
+      "before": null,
+      "after": "c97804dc6be5dbd9d5368a31c4a921c98a1ea233bb783e39db47ae451ac8dff8"
+    },
+    "bot/app/Services/WpSyncService.php": {
+      "before": "be91df39a5d637eef18e63e21482a15d5d42753d5c8f3e1c2fee33975beb9472",
+      "after": "200130d2b1ba473010199f08e29bd66b58188e71ef953d78d419d797515da3ae"
+    },
+    "bot/app/Console/Commands/CustomerLoyaltyApprovalTimes.php": {
+      "before": null,
+      "after": "1fac52a29d0a125149da5f4b6ad300fd103ea69f89bf933bc203846194775ab3"
+    },
+    "bot/config/loyalty.php": {
+      "before": null,
+      "after": "960a4a2652e39ada64c578d7cc9789c39b34419cd5e47393a37f423e0dee3f6e"
+    },
+    "bot/tests/Feature/CustomerLoyaltyTest.php": {
+      "before": null,
+      "after": "94e7a6e033d5c87966ad98eac813ac809179b20e6c0123a086b0f1b32dfedf7d"
+    },
+    "bot/routes/api.php": {
+      "before": "01630a3e9ec1eb09c82b4efe09890f8a21316c10f7e3b3d7a3374d30d5f46373",
+      "after": "9be9e66249790e20b77c2ee3c8a40bb82605e1a75716b459bef7effcce785cb4"
+    },
+    "bot/docs/customer-loyalty.md": {
+      "before": null,
+      "after": "6b782528b040f494e5b3e7b3415f750eca5cda11c02a94065e2e348dec64eae3"
+    }
+  }
+}

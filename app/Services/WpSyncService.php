@@ -495,6 +495,9 @@ class WpSyncService
             $before = (int) $target->balance;
             $target->balance = $before + $amount;
             $target->save();
+            if (in_array($method, ['admin_credit', 'admin_debit'], true)) {
+                $meta['loyalty_approved_at'] = now()->toIso8601String();
+            }
             $meta['wallet_balance_before'] = $before;
             $meta['wallet_balance_after'] = (int) $target->balance;
             Payment::create([
@@ -533,6 +536,9 @@ class WpSyncService
             $before = (int) $target->balance;
             $target->balance = $before - $amount;
             $target->save();
+            if (in_array($method, ['admin_credit', 'admin_debit'], true)) {
+                $meta['loyalty_approved_at'] = now()->toIso8601String();
+            }
             $meta['wallet_balance_before'] = $before;
             $meta['wallet_balance_after'] = (int) $target->balance;
             Payment::create([
@@ -803,7 +809,10 @@ class WpSyncService
 
         return DB::transaction(function () use ($payment, $payload) {
             $payment = Payment::where('id', $payment->id)->lockForUpdate()->first();
+            if ((string) $payment->status === '1') return ['ok' => true, 'payment' => $this->formatPayment($payment, true), 'already_approved' => true];
+            if ((string) $payment->status !== '0') return ['ok' => false, 'message' => 'payment_not_pending'];
             $detail = is_array($payment->detail) ? $payment->detail : (json_decode((string) $payment->detail, true) ?: []);
+            $detail['loyalty_approved_at'] = $detail['loyalty_approved_at'] ?? now()->toIso8601String();
             $detail['approved_from_wp_api'] = true;
             $detail['approved_note'] = $payload['note'] ?? '';
             $payment->status = 1;
