@@ -76,7 +76,7 @@ class CustomerLoyaltyService
     {
         $quote = ['amount' => $amount, 'base_amount' => $amount, 'percent' => 0, 'source' => 'none', 'currency' => 'IRT'];
         if (!$this->enabled() || (int) $user->is_seller === 1
-            || !in_array($serviceId, config('loyalty.shared_service_ids', []), true)) {
+            || (!config('loyalty.all_services_shared') && !in_array($serviceId, config('loyalty.shared_service_ids', []), true))) {
             return $quote;
         }
         try {
@@ -124,20 +124,44 @@ class CustomerLoyaltyService
         return ['rows' => $rows, 'first_purchase' => Orders::where('user_id', $user->id)->whereIn('status', ['1','0','2','active','data_exhausted','suspended','inactive'])->exists(), 'currency' => 'IRT'];
     }
 
+    public static function persianNumber(string|int|float $value): string
+    {
+        return strtr((string) $value, ['0'=>'۰','1'=>'۱','2'=>'۲','3'=>'۳','4'=>'۴','5'=>'۵','6'=>'۶','7'=>'۷','8'=>'۸','9'=>'۹',','=>'٬','.'=>'٫']);
+    }
+
     public function profileText(User $user): string
     {
         if ((int) $user->is_seller === 1) return '';
         try {
             $p = $this->profile($user);
-            $source = $p['source'] === 'manual' ? 'دستی' : 'پلکانی';
-            $text = "\n⭐ سطح حساب: {$p['stars']} ستاره";
-            $text .= "\nتخفیف پلکانی بر اساس پرداخت‌ها: {$p['automatic_percent']}٪";
-            $label = $this->enabled() ? 'تخفیف فعال' : 'تخفیف حساب';
-            $text .= "\n{$label}: {$p['percent']}٪ ({$source})";
-            if (!$this->enabled()) $text .= "\nاعمال تخفیف در خرید ربات هنوز فعال نشده است.";
-            $text .= "\nپرداخت معتبر ۳۰ روز: ".number_format($p['total']).' تومان';
-            if ($p['source'] !== 'manual' && isset($p['next_amount'])) $text .= "\nتا پله بعدی: ".number_format($p['next_amount']).' تومان';
-            if (!empty($p['expires_at'])) $text .= "\nافت سطح فعلی: ".CarbonImmutable::createFromTimestamp($p['expires_at'])->setTimezone('Asia/Tehran')->format('Y/m/d H:i').' (تهران)';
+            $stars = self::persianNumber($p['stars']);
+            $percent = self::persianNumber($p['percent']);
+            $manual = $p['source'] === 'manual';
+            $text = "\n⭐ <b>سطح شما: {$stars} ستاره</b>";
+            $label = $manual ? 'تخفیف حساب شما' : 'تخفیف این سطح';
+            $text .= "\n🎁 <b>{$label}: {$percent}٪</b>";
+            if ($manual) $text .= "\nاین تخفیف توسط مدیریت تعیین شده و تاریخ انقضا ندارد.";
+            $total = self::persianNumber(number_format($p['total']));
+            $text .= "\n\n💳 پرداخت‌های تأییدشده در ۳۰ روز گذشته: <b>{$total} تومان</b>";
+            if (!$manual && isset($p['next_amount'])) {
+                $amount = self::persianNumber(number_format($p['next_amount']));
+                if (is_numeric($p['next_percent'] ?? null) && $p['next_percent'] >= 0 && $p['next_percent'] <= 100
+                    && is_int($p['next_stars'] ?? null) && $p['next_stars'] >= 2 && $p['next_stars'] <= 4) {
+                    $nextStars = self::persianNumber($p['next_stars']);
+                    $nextPercent = self::persianNumber($p['next_percent']);
+                    $text .= "\n📈 با <b>{$amount} تومان</b> پرداخت بیشتر، به سطح <b>{$nextStars} ستاره و تخفیف {$nextPercent}٪</b> می‌رسید.";
+                } else {
+                    // Older site companions may not yet expose the next tier's percentage.
+                    $text .= "\n📈 با <b>{$amount} تومان</b> پرداخت بیشتر، به سطح بعدی می‌رسید.";
+                }
+            }
+            if (!$manual && !empty($p['expires_at'])) {
+                $at = CarbonImmutable::createFromTimestamp($p['expires_at'])->setTimezone('Asia/Tehran');
+                $months = [1 => 'ژانویه', 'فوریه', 'مارس', 'آوریل', 'مه', 'ژوئن', 'ژوئیه', 'اوت', 'سپتامبر', 'اکتبر', 'نوامبر', 'دسامبر'];
+                $until = self::persianNumber($at->day.' '.$months[$at->month].' '.$at->year.'، ساعت '.$at->format('H:i'));
+                $text .= "\n\n🗓 بدون پرداخت جدید، سطح فعلی شما تا <b>{$until} به وقت تهران</b> اعتبار دارد.";
+            }
+            if (!$this->enabled()) $text .= "\n\n⏸ <b>اعمال تخفیف در خریدهای ربات هنوز فعال نشده است.</b>";
             return $text;
         } catch (RuntimeException $e) {
             return "\nاطلاعات تخفیف موقتاً در دسترس نیست.";

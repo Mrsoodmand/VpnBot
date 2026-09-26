@@ -21,7 +21,7 @@ class CustomerLoyaltyTest extends TestCase
     {
         parent::setUp();
         Http::preventStrayRequests();
-        config(['services.wp_sync.secret' => 'test-secret', 'loyalty.enabled' => true, 'loyalty.shared_service_ids' => [1]]);
+        config(['services.wp_sync.secret' => 'test-secret', 'loyalty.enabled' => true, 'loyalty.all_services_shared' => false, 'loyalty.shared_service_ids' => [1]]);
         Carbon::setTestNow('2026-09-26 12:00:00');
         foreach (['0001_01_01_000000_create_users_table.php', '2026_05_21_173105_create_payments_table.php',
             '2026_05_17_112220_create_settings_table.php', '2026_05_20_145319_create_pre_orders_table.php',
@@ -48,7 +48,7 @@ class CustomerLoyaltyTest extends TestCase
     {
         Http::fake(['*/sync/customer-loyalty/*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => [
             'kind' => 'customer', 'automatic_percent' => $percent, 'percent' => $percent, 'source' => 'automatic', 'stars' => 3, 'total' => 5000000,
-            'expires_at' => null, 'next_amount' => 5000000, 'manual_value' => '',
+            'expires_at' => null, 'next_amount' => 5000000, 'next_percent' => 20, 'next_stars' => 4, 'manual_value' => '',
         ]])]);
     }
 
@@ -322,8 +322,7 @@ class CustomerLoyaltyTest extends TestCase
         $controller = new LoyaltyTestController(User::find(1));
         $controller->call('profile', []);
         $text = end($controller->messages)['text'];
-        foreach (['سطح حساب: 3 ستاره', 'تخفیف پلکانی بر اساس پرداخت‌ها: 10٪', 'تخفیف حساب: 10٪ (پلکانی)',
-            '5,000,000 تومان', 'تا پله بعدی:', 'هنوز فعال نشده'] as $expected) {
+        foreach (['سطح شما: ۳ ستاره', 'تخفیف این سطح: ۱۰٪', '۵٬۰۰۰٬۰۰۰ تومان', '۴ ستاره و تخفیف ۲۰٪', 'هنوز فعال نشده'] as $expected) {
             $this->assertStringContainsString($expected, $text);
         }
         $this->assertSame(0, Payment::count());
@@ -336,11 +335,11 @@ class CustomerLoyaltyTest extends TestCase
             'stars' => 3, 'total' => 2000000, 'expires_at' => null, 'manual_value' => '15',
         ]])]);
         $text = app(CustomerLoyaltyService::class)->profileText(User::find(1));
-        $this->assertStringContainsString('سطح حساب: 3 ستاره', $text);
-        $this->assertStringContainsString('پرداخت‌ها: 5٪', $text);
-        $this->assertStringContainsString('تخفیف فعال: 15٪ (دستی)', $text);
-        $this->assertStringNotContainsString('تا پله بعدی', $text);
-        $this->assertStringNotContainsString('افت سطح', $text);
+        $this->assertStringContainsString('سطح شما: ۳ ستاره', $text);
+        $this->assertStringNotContainsString('تخفیف این سطح', $text);
+        $this->assertStringContainsString('تخفیف حساب شما: ۱۵٪', $text);
+        $this->assertStringNotContainsString('پرداخت بیشتر', $text);
+        $this->assertStringNotContainsString('بدون پرداخت جدید', $text);
     }
 
     public function test_automatic_top_level_shows_expiry_without_next_tier(): void
@@ -350,10 +349,10 @@ class CustomerLoyaltyTest extends TestCase
             'stars' => 4, 'total' => 10000000, 'expires_at' => now()->addDay()->timestamp, 'next_amount' => null,
         ]])]);
         $text = app(CustomerLoyaltyService::class)->profileText(User::find(1));
-        $this->assertStringContainsString('سطح حساب: 4 ستاره', $text);
-        $this->assertStringContainsString('تخفیف فعال: 20٪', $text);
-        $this->assertStringContainsString('افت سطح فعلی:', $text);
-        $this->assertStringNotContainsString('تا پله بعدی', $text);
+        $this->assertStringContainsString('سطح شما: ۴ ستاره', $text);
+        $this->assertStringContainsString('تخفیف این سطح: ۲۰٪', $text);
+        $this->assertStringContainsString('بدون پرداخت جدید، سطح فعلی شما تا', $text);
+        $this->assertStringNotContainsString('پرداخت بیشتر', $text);
     }
 
     public function test_unavailable_profile_keeps_account_screen_usable_without_inventing_a_discount(): void
@@ -368,6 +367,51 @@ class CustomerLoyaltyTest extends TestCase
         $this->assertStringNotContainsString('تخفیف فعال:', $text);
         try { app(CustomerLoyaltyService::class)->quote(User::find(1), 1, 100000); $this->fail(); }
         catch (\RuntimeException $e) { $this->assertStringNotContainsString('WP_BASE_URL', $e->getMessage()); }
+    }
+
+    public function test_owner_confirmed_shared_services_are_all_eligible_without_an_id_list(): void
+    {
+        $defaults = require config_path('loyalty.php');
+        $this->assertTrue($defaults['enabled']);
+        $this->assertTrue($defaults['all_services_shared']);
+        config(['loyalty' => $defaults]); $this->fakeProfile();
+        $user = User::find(1);
+        $this->assertSame(90000, app(CustomerLoyaltyService::class)->quote($user, 987, 100000)['amount']);
+        $user->is_seller = 1;
+        $this->assertSame(100000, app(CustomerLoyaltyService::class)->quote($user, 987, 100000)['amount']);
+        config(['loyalty.enabled' => false]); $user->is_seller = 0;
+        $this->assertSame(100000, app(CustomerLoyaltyService::class)->quote($user, 987, 100000)['amount']);
+    }
+
+    public function test_account_copy_uses_configured_next_tier_and_persian_numbers(): void
+    {
+        Http::fake(['*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => [
+            'kind' => 'customer', 'percent' => 7.5, 'automatic_percent' => 7.5, 'source' => 'automatic',
+            'stars' => 2, 'total' => 2000000, 'expires_at' => Carbon::parse('2026-10-26T23:48:00+03:30')->timestamp,
+            'next_amount' => 3000000, 'next_stars' => 3, 'next_percent' => 12.5,
+        ]])]);
+        $controller = new LoyaltyTestController(User::find(1)); $controller->call('profile', []);
+        $text = end($controller->messages)['text'];
+        foreach (['👤 <b>حساب کاربری شما</b>', 'شناسه تلگرام: ۱۰۰۱', 'تخفیف این سطح: ۷٫۵٪',
+            '۳٬۰۰۰٬۰۰۰ تومان', '۳ ستاره و تخفیف ۱۲٫۵٪', '۲۶ اکتبر ۲۰۲۶، ساعت ۲۳:۴۸ به وقت تهران'] as $expected) {
+            $this->assertStringContainsString($expected, $text);
+        }
+        $this->assertStringNotContainsString('هنوز فعال نشده', $text);
+        $this->assertStringNotContainsString('تخفیف حساب:', $text);
+    }
+
+    public function test_manual_zero_copy_has_no_expiry_or_next_tier(): void
+    {
+        Http::fake(['*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => [
+            'kind' => 'customer', 'percent' => 0, 'automatic_percent' => 10, 'source' => 'manual',
+            'stars' => 1, 'total' => 5000000, 'expires_at' => now()->addDay()->timestamp,
+            'next_amount' => 5000000, 'next_percent' => 20, 'next_stars' => 4,
+        ]])]);
+        $text = app(CustomerLoyaltyService::class)->profileText(User::find(1));
+        $this->assertStringContainsString('تخفیف حساب شما: ۰٪', $text);
+        $this->assertStringContainsString('توسط مدیریت تعیین شده و تاریخ انقضا ندارد', $text);
+        $this->assertStringNotContainsString('پرداخت بیشتر', $text);
+        $this->assertStringNotContainsString('بدون پرداخت جدید', $text);
     }
 
     public function test_missing_secret_is_reported_without_sending_a_request(): void

@@ -21,7 +21,7 @@ diff --git a/includes/class-ipsvp-db.php b/includes/class-ipsvp-db.php
 +        }
          return $this->get_user_by_id($user->id);
      }
- 
+
 diff --git a/includes/class-ipsvp-loyalty.php b/includes/class-ipsvp-loyalty.php
 --- a/includes/class-ipsvp-loyalty.php
 +++ b/includes/class-ipsvp-loyalty.php
@@ -66,7 +66,7 @@ diff --git a/includes/class-ipsvp-customer-loyalty-sync.php b/includes/class-ips
 new file mode 100644
 --- /dev/null
 +++ b/includes/class-ipsvp-customer-loyalty-sync.php
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,175 @@
 +<?php
 +/** Read-only financial federation. Existing receipts/payments remain the only ledgers. */
 +defined('ABSPATH') || exit;
@@ -77,7 +77,7 @@ new file mode 100644
 +
 +    public static function enabled()
 +    {
-+        return defined('IPSVP_CUSTOMER_LOYALTY_BOT') && IPSVP_CUSTOMER_LOYALTY_BOT;
++        return !defined('IPSVP_CUSTOMER_LOYALTY_BOT') || IPSVP_CUSTOMER_LOYALTY_BOT;
 +    }
 +
 +    public static function register()
@@ -220,10 +220,17 @@ new file mode 100644
 +            }
 +            $profile['manual_value'] = $manual === null ? '' : (string) $manual;
 +            $profile['next_amount'] = null;
++            $profile['next_percent'] = null;
++            $profile['next_stars'] = null;
 +            if ($profile['source'] === 'automatic') {
-+                foreach (IPSVP_Loyalty::settings()['customer'] as $tier) {
++                foreach (IPSVP_Loyalty::settings()['customer'] as $index => $tier) {
 +                    $floor = $tier['min'] + $tier['strict'];
-+                    if ($floor > $profile['total']) { $profile['next_amount'] = $floor - $profile['total']; break; }
++                    if ($floor > $profile['total']) {
++                        $profile['next_amount'] = $floor - $profile['total'];
++                        $profile['next_percent'] = (float) $tier['percent'];
++                        $profile['next_stars'] = $index + 1;
++                        break;
++                    }
 +                }
 +            }
 +            return array('ok' => true, 'profile' => $profile, 'currency' => 'IRT');
@@ -239,12 +246,12 @@ diff --git a/tests/customer-loyalty-sync-test.php b/tests/customer-loyalty-sync-
 new file mode 100644
 --- /dev/null
 +++ b/tests/customer-loyalty-sync-test.php
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,130 @@
 +<?php
 +/** Offline contract tests for the actual shared WordPress authority. */
 +if (PHP_SAPI !== 'cli') exit;
 +define('ABSPATH', '/');
-+define('IPSVP_CUSTOMER_LOYALTY_BOT', true);
++// Test the default-enabled bridge without a wp-config constant.
 +class WP_Error { public function __construct(public $code, public $message, public $data = []) {} }
 +function is_wp_error($v) { return $v instanceof WP_Error; }
 +function add_action(...$args) {}
@@ -296,6 +303,11 @@ new file mode 100644
 +function bot_profile($rows,$tel='1001',$first=false) { return endpoint('profile',['tel_id'=>$tel,'events'=>event_payload($rows,$first)])['profile']; }
 +check(is_wp_error(IPSVP_Customer_Loyalty_Sync::authorize(new Request([], 'wrong'))),true,'Unauthorized rejected');
 +check(IPSVP_Customer_Loyalty_Sync::authorize(new Request()),true,'Same shared key');
++check(IPSVP_Customer_Loyalty_Sync::enabled(),true,'Bridge enabled by default');
++$next = bot_profile([bot_event(1,2000000)]);
++check($next['next_amount'],3000000,'Next amount from policy');
++check($next['next_percent'],10.0,'Next discount from policy');
++check($next['next_stars'],3,'Next stars from policy');
 +foreach ([0=>0,1999999=>0,2000000=>5,3000000=>5,4999999=>5,5000000=>10,6000000=>10,9999999=>10,10000000=>20,12000000=>20] as $amount=>$rate) {
 +    check(bot_profile($amount ? [bot_event(1,$amount)] : [])['percent'],(float)$rate,'Exact customer boundary '.$amount);
 +}

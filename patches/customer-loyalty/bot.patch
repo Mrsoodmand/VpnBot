@@ -1,13 +1,15 @@
 diff --git a/.env.example b/.env.example
 --- a/.env.example
 +++ b/.env.example
-@@ -63,3 +63,11 @@
+@@ -63,3 +63,13 @@
  AWS_USE_PATH_STYLE_ENDPOINT=false
 
  VITE_APP_NAME="${APP_NAME}"
 +
-+# Customer loyalty: enable only after the WordPress companion and shared service IDs are verified.
-+CUSTOMER_LOYALTY_ENABLED=false
++# All current bot services are shared configurations (confirmed by owner).
++# Before adding other service types, disable ALL_SERVICES_SHARED and specify shared IDs.
++CUSTOMER_LOYALTY_ENABLED=true
++CUSTOMER_LOYALTY_ALL_SERVICES_SHARED=true
 +CUSTOMER_LOYALTY_SHARED_SERVICE_IDS=
 +
 +# Existing shared WordPress connection; keep the same secret on both sides.
@@ -184,15 +186,20 @@ diff --git a/app/Http/Controllers/Api/TelegramBotController.php b/app/Http/Contr
 
          $detail['extra-id'] = $extra->id;
          $detail['remark'] = (string) $order->remark;
-@@ -5647,6 +5698,7 @@
+@@ -5645,8 +5696,10 @@
+     {
+         $user = $this->user;
          $balance = number_format($user->balance);
-         $text = headTitle("حساب کاربری");
-         $text .= "🆔 آیدی تلگرام: `{$user->tel_id}`";
+-        $text = headTitle("حساب کاربری");
+-        $text .= "🆔 آیدی تلگرام: `{$user->tel_id}`";
++        $text = "👤 <b>حساب کاربری شما</b>\n\n";
++        $telId = htmlspecialchars(CustomerLoyaltyService::persianNumber((string) $user->tel_id), ENT_QUOTES, 'UTF-8');
++        $text .= "🆔 شناسه تلگرام: {$telId}";
 +        $text .= app(CustomerLoyaltyService::class)->profileText($user);
          $data = [
              'chat_id' => $this->chatId,
              'text' => trim($text),
-@@ -5724,7 +5776,13 @@
+@@ -5724,7 +5777,13 @@
          ];
          $buttons[] = [
              [
@@ -207,7 +214,7 @@ diff --git a/app/Http/Controllers/Api/TelegramBotController.php b/app/Http/Contr
                  'callback_data' => 'type=adminSetting',
              ],
          ];
-@@ -6119,6 +6177,10 @@
+@@ -6119,6 +6178,10 @@
          |--------------------------------------------------------------------------
          */
 
@@ -218,7 +225,7 @@ diff --git a/app/Http/Controllers/Api/TelegramBotController.php b/app/Http/Contr
          $data = [
              'chat_id' => $this->chatId,
              'text' => trim($text),
-@@ -8238,11 +8300,98 @@
+@@ -8238,11 +8301,98 @@
 
      // Start Setting
 
@@ -341,7 +348,7 @@ diff --git a/app/Services/CustomerLoyaltyService.php b/app/Services/CustomerLoya
 new file mode 100644
 --- /dev/null
 +++ b/app/Services/CustomerLoyaltyService.php
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,170 @@
 +<?php
 +
 +namespace App\Services;
@@ -420,7 +427,7 @@ new file mode 100644
 +    {
 +        $quote = ['amount' => $amount, 'base_amount' => $amount, 'percent' => 0, 'source' => 'none', 'currency' => 'IRT'];
 +        if (!$this->enabled() || (int) $user->is_seller === 1
-+            || !in_array($serviceId, config('loyalty.shared_service_ids', []), true)) {
++            || (!config('loyalty.all_services_shared') && !in_array($serviceId, config('loyalty.shared_service_ids', []), true))) {
 +            return $quote;
 +        }
 +        try {
@@ -468,20 +475,44 @@ new file mode 100644
 +        return ['rows' => $rows, 'first_purchase' => Orders::where('user_id', $user->id)->whereIn('status', ['1','0','2','active','data_exhausted','suspended','inactive'])->exists(), 'currency' => 'IRT'];
 +    }
 +
++    public static function persianNumber(string|int|float $value): string
++    {
++        return strtr((string) $value, ['0'=>'۰','1'=>'۱','2'=>'۲','3'=>'۳','4'=>'۴','5'=>'۵','6'=>'۶','7'=>'۷','8'=>'۸','9'=>'۹',','=>'٬','.'=>'٫']);
++    }
++
 +    public function profileText(User $user): string
 +    {
 +        if ((int) $user->is_seller === 1) return '';
 +        try {
 +            $p = $this->profile($user);
-+            $source = $p['source'] === 'manual' ? 'دستی' : 'پلکانی';
-+            $text = "\n⭐ سطح حساب: {$p['stars']} ستاره";
-+            $text .= "\nتخفیف پلکانی بر اساس پرداخت‌ها: {$p['automatic_percent']}٪";
-+            $label = $this->enabled() ? 'تخفیف فعال' : 'تخفیف حساب';
-+            $text .= "\n{$label}: {$p['percent']}٪ ({$source})";
-+            if (!$this->enabled()) $text .= "\nاعمال تخفیف در خرید ربات هنوز فعال نشده است.";
-+            $text .= "\nپرداخت معتبر ۳۰ روز: ".number_format($p['total']).' تومان';
-+            if ($p['source'] !== 'manual' && isset($p['next_amount'])) $text .= "\nتا پله بعدی: ".number_format($p['next_amount']).' تومان';
-+            if (!empty($p['expires_at'])) $text .= "\nافت سطح فعلی: ".CarbonImmutable::createFromTimestamp($p['expires_at'])->setTimezone('Asia/Tehran')->format('Y/m/d H:i').' (تهران)';
++            $stars = self::persianNumber($p['stars']);
++            $percent = self::persianNumber($p['percent']);
++            $manual = $p['source'] === 'manual';
++            $text = "\n⭐ <b>سطح شما: {$stars} ستاره</b>";
++            $label = $manual ? 'تخفیف حساب شما' : 'تخفیف این سطح';
++            $text .= "\n🎁 <b>{$label}: {$percent}٪</b>";
++            if ($manual) $text .= "\nاین تخفیف توسط مدیریت تعیین شده و تاریخ انقضا ندارد.";
++            $total = self::persianNumber(number_format($p['total']));
++            $text .= "\n\n💳 پرداخت‌های تأییدشده در ۳۰ روز گذشته: <b>{$total} تومان</b>";
++            if (!$manual && isset($p['next_amount'])) {
++                $amount = self::persianNumber(number_format($p['next_amount']));
++                if (is_numeric($p['next_percent'] ?? null) && $p['next_percent'] >= 0 && $p['next_percent'] <= 100
++                    && is_int($p['next_stars'] ?? null) && $p['next_stars'] >= 2 && $p['next_stars'] <= 4) {
++                    $nextStars = self::persianNumber($p['next_stars']);
++                    $nextPercent = self::persianNumber($p['next_percent']);
++                    $text .= "\n📈 با <b>{$amount} تومان</b> پرداخت بیشتر، به سطح <b>{$nextStars} ستاره و تخفیف {$nextPercent}٪</b> می‌رسید.";
++                } else {
++                    // Older site companions may not yet expose the next tier's percentage.
++                    $text .= "\n📈 با <b>{$amount} تومان</b> پرداخت بیشتر، به سطح بعدی می‌رسید.";
++                }
++            }
++            if (!$manual && !empty($p['expires_at'])) {
++                $at = CarbonImmutable::createFromTimestamp($p['expires_at'])->setTimezone('Asia/Tehran');
++                $months = [1 => 'ژانویه', 'فوریه', 'مارس', 'آوریل', 'مه', 'ژوئن', 'ژوئیه', 'اوت', 'سپتامبر', 'اکتبر', 'نوامبر', 'دسامبر'];
++                $until = self::persianNumber($at->day.' '.$months[$at->month].' '.$at->year.'، ساعت '.$at->format('H:i'));
++                $text .= "\n\n🗓 بدون پرداخت جدید، سطح فعلی شما تا <b>{$until} به وقت تهران</b> اعتبار دارد.";
++            }
++            if (!$this->enabled()) $text .= "\n\n⏸ <b>اعمال تخفیف در خریدهای ربات هنوز فعال نشده است.</b>";
 +            return $text;
 +        } catch (RuntimeException $e) {
 +            return "\nاطلاعات تخفیف موقتاً در دسترس نیست.";
@@ -619,19 +650,21 @@ diff --git a/config/loyalty.php b/config/loyalty.php
 new file mode 100644
 --- /dev/null
 +++ b/config/loyalty.php
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,9 @@
 +<?php
 +
 +return [
-+    'enabled' => env('CUSTOMER_LOYALTY_ENABLED', false),
-+    // Explicit allowlist: services has no shared/dedicated discriminator. Never infer from a name.
++    'enabled' => env('CUSTOMER_LOYALTY_ENABLED', true),
++    // Owner confirmed that all current bot services are shared configurations.
++    // Set false and use the allowlist before adding any non-shared services.
++    'all_services_shared' => env('CUSTOMER_LOYALTY_ALL_SERVICES_SHARED', true),
 +    'shared_service_ids' => array_values(array_filter(array_map('intval', explode(',', env('CUSTOMER_LOYALTY_SHARED_SERVICE_IDS', ''))), fn ($id) => $id > 0)),
 +];
 diff --git a/tests/Feature/CustomerLoyaltyTest.php b/tests/Feature/CustomerLoyaltyTest.php
 new file mode 100644
 --- /dev/null
 +++ b/tests/Feature/CustomerLoyaltyTest.php
-@@ -0,0 +1,424 @@
+@@ -0,0 +1,468 @@
 +<?php
 +
 +namespace Tests\Feature;
@@ -655,7 +688,7 @@ new file mode 100644
 +    {
 +        parent::setUp();
 +        Http::preventStrayRequests();
-+        config(['services.wp_sync.secret' => 'test-secret', 'loyalty.enabled' => true, 'loyalty.shared_service_ids' => [1]]);
++        config(['services.wp_sync.secret' => 'test-secret', 'loyalty.enabled' => true, 'loyalty.all_services_shared' => false, 'loyalty.shared_service_ids' => [1]]);
 +        Carbon::setTestNow('2026-09-26 12:00:00');
 +        foreach (['0001_01_01_000000_create_users_table.php', '2026_05_21_173105_create_payments_table.php',
 +            '2026_05_17_112220_create_settings_table.php', '2026_05_20_145319_create_pre_orders_table.php',
@@ -682,7 +715,7 @@ new file mode 100644
 +    {
 +        Http::fake(['*/sync/customer-loyalty/*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => [
 +            'kind' => 'customer', 'automatic_percent' => $percent, 'percent' => $percent, 'source' => 'automatic', 'stars' => 3, 'total' => 5000000,
-+            'expires_at' => null, 'next_amount' => 5000000, 'manual_value' => '',
++            'expires_at' => null, 'next_amount' => 5000000, 'next_percent' => 20, 'next_stars' => 4, 'manual_value' => '',
 +        ]])]);
 +    }
 +
@@ -956,8 +989,7 @@ new file mode 100644
 +        $controller = new LoyaltyTestController(User::find(1));
 +        $controller->call('profile', []);
 +        $text = end($controller->messages)['text'];
-+        foreach (['سطح حساب: 3 ستاره', 'تخفیف پلکانی بر اساس پرداخت‌ها: 10٪', 'تخفیف حساب: 10٪ (پلکانی)',
-+            '5,000,000 تومان', 'تا پله بعدی:', 'هنوز فعال نشده'] as $expected) {
++        foreach (['سطح شما: ۳ ستاره', 'تخفیف این سطح: ۱۰٪', '۵٬۰۰۰٬۰۰۰ تومان', '۴ ستاره و تخفیف ۲۰٪', 'هنوز فعال نشده'] as $expected) {
 +            $this->assertStringContainsString($expected, $text);
 +        }
 +        $this->assertSame(0, Payment::count());
@@ -970,11 +1002,11 @@ new file mode 100644
 +            'stars' => 3, 'total' => 2000000, 'expires_at' => null, 'manual_value' => '15',
 +        ]])]);
 +        $text = app(CustomerLoyaltyService::class)->profileText(User::find(1));
-+        $this->assertStringContainsString('سطح حساب: 3 ستاره', $text);
-+        $this->assertStringContainsString('پرداخت‌ها: 5٪', $text);
-+        $this->assertStringContainsString('تخفیف فعال: 15٪ (دستی)', $text);
-+        $this->assertStringNotContainsString('تا پله بعدی', $text);
-+        $this->assertStringNotContainsString('افت سطح', $text);
++        $this->assertStringContainsString('سطح شما: ۳ ستاره', $text);
++        $this->assertStringNotContainsString('تخفیف این سطح', $text);
++        $this->assertStringContainsString('تخفیف حساب شما: ۱۵٪', $text);
++        $this->assertStringNotContainsString('پرداخت بیشتر', $text);
++        $this->assertStringNotContainsString('بدون پرداخت جدید', $text);
 +    }
 +
 +    public function test_automatic_top_level_shows_expiry_without_next_tier(): void
@@ -984,10 +1016,10 @@ new file mode 100644
 +            'stars' => 4, 'total' => 10000000, 'expires_at' => now()->addDay()->timestamp, 'next_amount' => null,
 +        ]])]);
 +        $text = app(CustomerLoyaltyService::class)->profileText(User::find(1));
-+        $this->assertStringContainsString('سطح حساب: 4 ستاره', $text);
-+        $this->assertStringContainsString('تخفیف فعال: 20٪', $text);
-+        $this->assertStringContainsString('افت سطح فعلی:', $text);
-+        $this->assertStringNotContainsString('تا پله بعدی', $text);
++        $this->assertStringContainsString('سطح شما: ۴ ستاره', $text);
++        $this->assertStringContainsString('تخفیف این سطح: ۲۰٪', $text);
++        $this->assertStringContainsString('بدون پرداخت جدید، سطح فعلی شما تا', $text);
++        $this->assertStringNotContainsString('پرداخت بیشتر', $text);
 +    }
 +
 +    public function test_unavailable_profile_keeps_account_screen_usable_without_inventing_a_discount(): void
@@ -1002,6 +1034,51 @@ new file mode 100644
 +        $this->assertStringNotContainsString('تخفیف فعال:', $text);
 +        try { app(CustomerLoyaltyService::class)->quote(User::find(1), 1, 100000); $this->fail(); }
 +        catch (\RuntimeException $e) { $this->assertStringNotContainsString('WP_BASE_URL', $e->getMessage()); }
++    }
++
++    public function test_owner_confirmed_shared_services_are_all_eligible_without_an_id_list(): void
++    {
++        $defaults = require config_path('loyalty.php');
++        $this->assertTrue($defaults['enabled']);
++        $this->assertTrue($defaults['all_services_shared']);
++        config(['loyalty' => $defaults]); $this->fakeProfile();
++        $user = User::find(1);
++        $this->assertSame(90000, app(CustomerLoyaltyService::class)->quote($user, 987, 100000)['amount']);
++        $user->is_seller = 1;
++        $this->assertSame(100000, app(CustomerLoyaltyService::class)->quote($user, 987, 100000)['amount']);
++        config(['loyalty.enabled' => false]); $user->is_seller = 0;
++        $this->assertSame(100000, app(CustomerLoyaltyService::class)->quote($user, 987, 100000)['amount']);
++    }
++
++    public function test_account_copy_uses_configured_next_tier_and_persian_numbers(): void
++    {
++        Http::fake(['*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => [
++            'kind' => 'customer', 'percent' => 7.5, 'automatic_percent' => 7.5, 'source' => 'automatic',
++            'stars' => 2, 'total' => 2000000, 'expires_at' => Carbon::parse('2026-10-26T23:48:00+03:30')->timestamp,
++            'next_amount' => 3000000, 'next_stars' => 3, 'next_percent' => 12.5,
++        ]])]);
++        $controller = new LoyaltyTestController(User::find(1)); $controller->call('profile', []);
++        $text = end($controller->messages)['text'];
++        foreach (['👤 <b>حساب کاربری شما</b>', 'شناسه تلگرام: ۱۰۰۱', 'تخفیف این سطح: ۷٫۵٪',
++            '۳٬۰۰۰٬۰۰۰ تومان', '۳ ستاره و تخفیف ۱۲٫۵٪', '۲۶ اکتبر ۲۰۲۶، ساعت ۲۳:۴۸ به وقت تهران'] as $expected) {
++            $this->assertStringContainsString($expected, $text);
++        }
++        $this->assertStringNotContainsString('هنوز فعال نشده', $text);
++        $this->assertStringNotContainsString('تخفیف حساب:', $text);
++    }
++
++    public function test_manual_zero_copy_has_no_expiry_or_next_tier(): void
++    {
++        Http::fake(['*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => [
++            'kind' => 'customer', 'percent' => 0, 'automatic_percent' => 10, 'source' => 'manual',
++            'stars' => 1, 'total' => 5000000, 'expires_at' => now()->addDay()->timestamp,
++            'next_amount' => 5000000, 'next_percent' => 20, 'next_stars' => 4,
++        ]])]);
++        $text = app(CustomerLoyaltyService::class)->profileText(User::find(1));
++        $this->assertStringContainsString('تخفیف حساب شما: ۰٪', $text);
++        $this->assertStringContainsString('توسط مدیریت تعیین شده و تاریخ انقضا ندارد', $text);
++        $this->assertStringNotContainsString('پرداخت بیشتر', $text);
++        $this->assertStringNotContainsString('بدون پرداخت جدید', $text);
 +    }
 +
 +    public function test_missing_secret_is_reported_without_sending_a_request(): void
@@ -1072,11 +1149,23 @@ diff --git a/docs/customer-loyalty.md b/docs/customer-loyalty.md
 new file mode 100644
 --- /dev/null
 +++ b/docs/customer-loyalty.md
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,177 @@
 +# تخفیف پلکانی کاربران عادی — راهنمای بازبینی و انتشار
 +
 +این تغییر در `/private/tmp/bot-customer-loyalty` و کپی مستقل افزونهٔ سایت در `/private/tmp/bot-loyalty-wordpress` پیاده‌سازی و با دیتابیس SQLite حافظه‌ای و HTTP ساختگی آزموده شده است. هیچ تغییر مالی روی سایت/ربات، پیام تلگرام، مهاجرت دیتابیس واقعی، restart یا انتشار اجرا نشده است. یک درخواست بدون کلید و بدون دادهٔ تغییردهنده به API تنظیمات سایت صرفاً برای تشخیص دسترسی انجام شد؛ پاسخ ۴۰۴ بود.
 +
++
++## وضعیت فعلی فعال‌سازی و متن حساب — ۲۷ سپتامبر ۲۰۲۶
++
++مالک تأیید کرده است که همهٔ سرویس‌های ربات کانفیگ اشتراکی هستند. بنابراین کد ربات اکنون به صورت پیش‌فرض `enabled=true` و `all_services_shared=true` دارد؛ فهرست شناسه‌ها برای وضعیت فعلی لازم نیست. نمایندگی از این محاسبه خارج است. اتصال محاسبهٔ سایت و ربات نیز در افزونه به صورت پیش‌فرض فعال است و دیگر افزودن ثابت به wp-config برای حالت عادی لازم نیست. این بخش جایگزین پیش‌نیازهای فعال‌سازی و تعیین شناسه در دستورالعمل اولیهٔ زیر است.
++
++مقادیر صریح محیط همچنان مقدم‌اند: اگر قبلاً در `.env` واقعی `CUSTOMER_LOYALTY_ENABLED=false` یا `CUSTOMER_LOYALTY_ALL_SERVICES_SHARED=false` نوشته شده، برای فعال‌شدن باید true شوند. اگر ثابت `IPSVP_CUSTOMER_LOYALTY_BOT` در wp-config صریحاً false باشد نیز باید true شود یا تعریف آن حذف شود تا پیش‌فرض اعمال شود. فایل محیط واقعی ربات در این مخزن وجود ندارد؛ تغییر فایل نمونه تنظیمات سرور را بازنویسی نمی‌کند. پس از انتشار دو مخزن، کش تنظیمات ربات باید طبق رویهٔ استقرار بازسازی شود.
++
++متن حساب مطابق متن تأییدشدهٔ مالک ساده شده است: عنوان و شناسه، تعداد ستاره‌ها، یک درصد تخفیف، پرداخت‌های تأییدشده، هدف پلهٔ بعدی و تاریخ اعتبار. عددها فارسی و مبلغ‌ها با جداکنندهٔ هزارگان‌اند. در حالت دستی، متن تعیین توسط مدیریت و نداشتن انقضا نمایش داده می‌شود؛ تخفیف خودکار، هدف پلهٔ بعد و انقضای پلکان نمایش داده نمی‌شود. پیام توقف تخفیف فقط هنگام خاموش‌بودن صریح تنظیم ربات نشان داده می‌شود. درصد و ستارهٔ پلهٔ بعد از تنظیمات واقعی سایت برمی‌گردند؛ با نسخهٔ قدیمی سایت فقط فاصله تا پلهٔ بعد نمایش داده می‌شود و درصد حدس زده نمی‌شود.
++
++پیش از اضافه‌کردن نوع غیر اشتراکی در آینده، `CUSTOMER_LOYALTY_ALL_SERVICES_SHARED=false` و فهرست دقیق `CUSTOMER_LOYALTY_SHARED_SERVICE_IDS` تنظیم شود. کلید توقف `CUSTOMER_LOYALTY_ENABLED=false` برای بازگشت امن باقی است؛ قیمت پرداخت‌های ثبت‌شده و موجودی کیف پول تغییر نمی‌کند. این تغییر migration یا restart اجرا نمی‌کند و صرفاً در مخزنهای محلی اعمال شده است.
++
++نتیجهٔ آزمون فعلی: ۴۴ آزمون ربات با ۲۱۹ assertion، و ۴۲۷ assertion سایت (۱۱۳ + ۲۵۷ + ۵۷)، جمعاً ۶۴۶ assertion موفق.
 +
 +## رفع خطای دکمه‌های مدیریت — ۲۶ سپتامبر ۲۰۲۶
 +
@@ -1189,13 +1278,13 @@ new file mode 100644
 +
 +PHP 8.3.12؛ Laravel/PHPUnit از composer.lock موجود، بدون اجرای Composer scripts:
 +
-+- ربات: **۴۱ آزمون، ۲۰۳ assertion موفق**؛ شامل آزمون‌های قبلی، هر سه مسیر واقعی ساخت پرداخت، نمایش مبلغ، بازپخش کیف پول، تأیید مجدد، احراز هویت، مدیریت و بازیابی زمان‌های قدیمی.
++- ربات: **۴۴ آزمون، ۲۱۹ assertion موفق**؛ شامل آزمون‌های قبلی، هر سه مسیر واقعی ساخت پرداخت، نمایش مبلغ، بازپخش کیف پول، تأیید مجدد، احراز هویت، مدیریت و بازیابی زمان‌های قدیمی.
 +- سایت: `loyalty-test.php`: **۱۱۳ assertion موفق**.
 +- سایت: `loyalty-integration-test.php`: **۲۵۷ assertion موفق** (۲۰۰ assertion نمایندگی موجود در همین شمارش است؛ تغییر رفتار نمایندگی درخواست نشده).
-+- اتصال جدید: `customer-loyalty-sync-test.php`: **۵۳ assertion موفق**؛ مرزها، جمع، انقضا، اصلاح، منبع واحد، کپی‌ها، صفر/خالی، تنظیمات سفارشی، یکسانی سایت/ربات و انتقال مقدار ثابت هنگام اتصال.
++- اتصال جدید: `customer-loyalty-sync-test.php`: **۵۷ assertion موفق**؛ مرزها، جمع، انقضا، اصلاح، منبع واحد، کپی‌ها، صفر/خالی، تنظیمات سفارشی، یکسانی سایت/ربات و انتقال مقدار ثابت هنگام اتصال.
 +- بررسی syntax تمام PHPهای جدید/تغییریافته موفق؛ route جدید ثبت شده است.
 +
-+جمع: **۶۲۶ assertion**. آزمون احرازهویت‌شدهٔ شبکهٔ زنده، دیتابیس MySQL واقعی یا بار هم‌زمان چند worker اجرا نشده است. بازپخش ترتیبی و منطق قفل بررسی شده‌اند؛ تست استیج واقعی پیش از انتشار همچنان ضروری است.
++جمع: **۶۴۶ assertion**. آزمون احرازهویت‌شدهٔ شبکهٔ زنده، دیتابیس MySQL واقعی یا بار هم‌زمان چند worker اجرا نشده است. بازپخش ترتیبی و منطق قفل بررسی شده‌اند؛ تست استیج واقعی پیش از انتشار همچنان ضروری است.
 +
 +تکرار آزمون در کپی مستقل:
 +

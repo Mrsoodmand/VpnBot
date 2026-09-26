@@ -15,15 +15,15 @@
     },
     "wordpress/includes/class-ipsvp-customer-loyalty-sync.php": {
       "before": null,
-      "after": "d267e7662adef9f5b6175a8b7944ff18d9e1953d3e5d6b8222f5b16aa8ccecd6"
+      "after": "617da690da81838a8474aa281f4aa691fb58232efd1c8dc697348296b92733ee"
     },
     "wordpress/tests/customer-loyalty-sync-test.php": {
       "before": null,
-      "after": "26219b7108a379fe33deaccd131bb186357cef3b40f65d278c6612f356024fa4"
+      "after": "fa18b259813133420333f398458e7ae6583154c1eb53d66ffc93d5cc8dba7617"
     },
     "bot/.env.example": {
       "before": "a527dd22cebd532f74bdca8352dc2e624bdf0655a8c85be88edd35ac44bd13c3",
-      "after": "3400d0479038aa7decfda0d2e315cc94a323fb2d59388212762e36cf3afd685c"
+      "after": "eae30d9c973081f8ca6e0adb1a36384223d6c1f65ce6c19e0d5e2ca2b5ca92bb"
     },
     "bot/phpunit.xml": {
       "before": "493369cfb7feea104da4bec214c2cc6526ca2f1b9d937c50a2961fc59cb61aaf",
@@ -35,7 +35,7 @@
     },
     "bot/app/Http/Controllers/Api/TelegramBotController.php": {
       "before": "a955dd2503050ab0a675b04d92f50a2f887c1bdeec84740d92d8a6c8772c7121",
-      "after": "3011ef10c78673e5f96f6a6614029d14a4aebe42fe98f6e41bddfb5ae9d42657"
+      "after": "e63a7f8e4b9117cc7e3bcf25335307fdea257efa1c51a2650a99d88c64a19427"
     },
     "bot/app/Http/Controllers/Api/WpSyncController.php": {
       "before": "80e889d88cf0c3c22b56d78aaeca73b16a50724490e9a26341fcbbb043cf42ae",
@@ -43,7 +43,7 @@
     },
     "bot/app/Services/CustomerLoyaltyService.php": {
       "before": null,
-      "after": "b8f902c9b5b0a1f05773288897237257c85b7c9d182c31d6da02e82fa7f87d41"
+      "after": "71c62b4c8ee63d9e2997105eb46674f3c33bd99bccedf32c7e0ad40f0d65b1b4"
     },
     "bot/app/Services/WpSyncService.php": {
       "before": "be91df39a5d637eef18e63e21482a15d5d42753d5c8f3e1c2fee33975beb9472",
@@ -55,11 +55,11 @@
     },
     "bot/config/loyalty.php": {
       "before": null,
-      "after": "960a4a2652e39ada64c578d7cc9789c39b34419cd5e47393a37f423e0dee3f6e"
+      "after": "8f8b4be7d371970e146063d8d21c300d2cc76f288c1fd3c0b94b33b4b1f6fe43"
     },
     "bot/tests/Feature/CustomerLoyaltyTest.php": {
       "before": null,
-      "after": "8ee517869b0dd230b35368bc7316c727ec9c0fe5682e4b573269b93ee58a5e67"
+      "after": "7f38abf5082461399fc2274651f7bceda5bca03ff60dd507a3ce15ce0d47c22b"
     },
     "bot/routes/api.php": {
       "before": "01630a3e9ec1eb09c82b4efe09890f8a21316c10f7e3b3d7a3374d30d5f46373",
@@ -67,7 +67,7 @@
     },
     "bot/docs/customer-loyalty.md": {
       "before": null,
-      "after": "6600e197250adb5957812a66659a9afb0a229f8960ef962ba231749cc1cade80"
+      "after": "ba73951530028060042c2da0907ef05e39f39bba5bf1dea7cc762f12816202e9"
     },
     "bot/config/services.php": {
       "before": "8258c4487eb1d73a97e569eb0e411e3f25368044812df4cba807860432be1d92",

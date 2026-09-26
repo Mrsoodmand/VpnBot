@@ -5696,8 +5696,9 @@ $codeText
     {
         $user = $this->user;
         $balance = number_format($user->balance);
-        $text = headTitle("حساب کاربری");
-        $text .= "🆔 آیدی تلگرام: `{$user->tel_id}`";
+        $text = "👤 <b>حساب کاربری شما</b>\n\n";
+        $telId = htmlspecialchars(CustomerLoyaltyService::persianNumber((string) $user->tel_id), ENT_QUOTES, 'UTF-8');
+        $text .= "🆔 شناسه تلگرام: {$telId}";
         $text .= app(CustomerLoyaltyService::class)->profileText($user);
         $data = [
             'chat_id' => $this->chatId,
