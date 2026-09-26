@@ -5,7 +5,7 @@ WordPress directory: /private/tmp/bot-loyalty-wordpress
 Database: SQLite :memory: (forced in phpunit.xml). HTTP: faked / stray requests prohibited in new tests.
 
 php vendor/bin/phpunit
-OK (31 tests, 157 assertions)
+OK (41 tests, 203 assertions)
 
 php tests/loyalty-test.php
 PASS: 113 loyalty policy assertions.
@@ -18,8 +18,8 @@ PASS: 257 total reseller and loyalty integration assertions.
 php tests/customer-loyalty-sync-test.php
 PASS: 53 customer synchronization assertions.
 
-Total: 580 assertions passed.
-Syntax: all 9 new/changed bot PHP files and all 5 new/changed WordPress PHP files passed php -l.
+Total: 626 assertions passed.
+Syntax: all new/changed bot PHP files and all 5 new/changed WordPress PHP files passed php -l.
 Route discovery: POST api/wp-sync/customer-loyalty/events registered.
 Patch checks: bot.patch and wordpress.patch passed git apply --check against their local source baselines.
 Whitespace: git diff --check passed.
@@ -30,5 +30,7 @@ wallet-spend exclusion; unapproved/crypto/referral/refund/sync exclusions; dupli
 site/bot profile agreement; admin authorization; all three checkout price snapshots; replayed approval
 and wallet payment; multi-unit rounding; malformed authority response; preview-only approval backfill and all-or-nothing rollback on mismatched evidence.
 
-No production DB migrations, API traffic, Telegram messages, restarts or deployment were performed.
+No production DB migrations, authenticated API requests, Telegram messages, restarts or deployment were performed. One unauthenticated read-only settings request returned HTTP 404 rest_no_route on ip-sabet.me.
 No real MySQL concurrent-worker/load test was performed. Shared service IDs remain a release prerequisite.
+
+Regression coverage: both admin callbacks, explicit fixed zero editor, account level and automatic/manual percentages, disabled pricing flag display, top-level expiry, 404/auth/bridge/network diagnostics. Real isolated config:cache test passed without runtime environment keys.

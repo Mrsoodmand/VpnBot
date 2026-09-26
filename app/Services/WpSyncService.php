@@ -26,12 +26,12 @@ class WpSyncService
 {
     public function secret(): string
     {
-        return (string) env('WP_SYNC_SECRET', '');
+        return (string) config('services.wp_sync.secret', '');
     }
 
     public function wpBaseUrl(): string
     {
-        return rtrim((string) env('WP_BASE_URL', 'https://ip-sabet.me'), '/');
+        return rtrim((string) config('services.wp_sync.base_url', 'https://ip-sabet.me'), '/');
     }
 
     public function authorize(?string $key): bool

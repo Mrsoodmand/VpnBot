@@ -21,12 +21,12 @@ class CustomerLoyaltyTest extends TestCase
     {
         parent::setUp();
         Http::preventStrayRequests();
-        config(['loyalty.enabled' => true, 'loyalty.shared_service_ids' => [1]]);
+        config(['services.wp_sync.secret' => 'test-secret', 'loyalty.enabled' => true, 'loyalty.shared_service_ids' => [1]]);
         Carbon::setTestNow('2026-09-26 12:00:00');
         foreach (['0001_01_01_000000_create_users_table.php', '2026_05_21_173105_create_payments_table.php',
             '2026_05_17_112220_create_settings_table.php', '2026_05_20_145319_create_pre_orders_table.php',
             '2026_05_19_100650_create_services_table.php', '2026_05_17_112153_create_plans_table.php',
-            '2026_05_18_155104_create_countries_table.php', '2026_05_17_113131_create_panels_table.php',
+            '2026_05_18_155104_create_countries_table.php', '2026_05_17_114351_create_telegram_data_table.php', '2026_05_17_113131_create_panels_table.php',
             '2026_05_18_093434_create_extra_bandwidths_table.php', '2026_05_20_104904_add_price_column_to_services_table.php'] as $migration) {
             (require database_path('migrations/'.$migration))->up();
         }
@@ -47,7 +47,7 @@ class CustomerLoyaltyTest extends TestCase
     private function fakeProfile(float $percent = 10): void
     {
         Http::fake(['*/sync/customer-loyalty/*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => [
-            'kind' => 'customer', 'percent' => $percent, 'source' => 'automatic', 'stars' => 3, 'total' => 5000000,
+            'kind' => 'customer', 'automatic_percent' => $percent, 'percent' => $percent, 'source' => 'automatic', 'stars' => 3, 'total' => 5000000,
             'expires_at' => null, 'next_amount' => 5000000, 'manual_value' => '',
         ]])]);
     }
@@ -191,7 +191,7 @@ class CustomerLoyaltyTest extends TestCase
 
     public function test_authenticated_event_endpoint_and_duplicate_reference(): void
     {
-        putenv('WP_SYNC_SECRET=test-secret'); $_ENV['WP_SYNC_SECRET'] = $_SERVER['WP_SYNC_SECRET'] = 'test-secret';
+        config(['services.wp_sync.secret' => 'test-secret']);
         $this->payment(['ref_id' => 'bank-1']); $this->payment(['ref_id' => 'bank-1']);
         $this->postJson('/api/wp-sync/customer-loyalty/events', ['tel_id' => '1001'])->assertForbidden();
         $response = $this->withHeader('X-IPSABET-API-KEY', 'test-secret')->postJson('/api/wp-sync/customer-loyalty/events', ['tel_id' => '1001']);
@@ -248,6 +248,151 @@ class CustomerLoyaltyTest extends TestCase
         } finally { unlink($file); }
     }
 
+    public function test_admin_home_and_settings_expose_loyalty_even_when_disabled_and_open_the_editor(): void
+    {
+        config(['loyalty.enabled' => false]);
+        $user = User::find(1); $user->is_admin = 1; $user->save();
+        $controller = new LoyaltyTestController($user);
+        foreach (['admin-home', 'adminSetting'] as $callback) {
+            $controller->callback('type='.$callback);
+            $message = end($controller->messages);
+            $keyboard = json_decode($message['reply_markup'], true)['inline_keyboard'];
+            $buttons = array_merge(...$keyboard);
+            $matches = array_values(array_filter($buttons, fn ($button) => ($button['callback_data'] ?? '') === 'type=adminCustomerLoyalty'));
+            $this->assertCount(1, $matches);
+            $this->assertStringContainsString('تخفیف پلکانی کاربران عادی', $matches[0]['text']);
+        }
+        Http::assertNothingSent();
+        Http::fake(['*/sync/customer-loyalty/settings' => Http::response(['ok' => true, 'currency' => 'IRT', 'customer' => [
+            ['min' => 0, 'strict' => 0, 'percent' => 0],
+            ['min' => 2000000, 'strict' => 0, 'percent' => 5],
+            ['min' => 5000000, 'strict' => 0, 'percent' => 10],
+            ['min' => 10000000, 'strict' => 0, 'percent' => 20],
+        ]])]);
+        $controller->callback('type=adminCustomerLoyalty');
+        $message = end($controller->messages);
+        $this->assertStringContainsString("0:0\n2000000:5\n5000000:10\n10000000:20", $message['text']);
+        $this->assertSame('adminCustomerLoyaltySave', $user->fresh()->path);
+        Http::assertSentCount(1);
+    }
+
+    public function test_sync_uses_cached_config_for_auth_and_outgoing_requests(): void
+    {
+        config(['services.wp_sync.secret' => 'cached-key', 'services.wp_sync.base_url' => 'https://site.test/']);
+        $sync = app(WpSyncService::class);
+        $this->assertTrue($sync->authorize('cached-key'));
+        $this->assertFalse($sync->authorize('test-secret'));
+        $this->assertSame('https://site.test', $sync->wpBaseUrl());
+        Http::fake(['https://site.test/*' => Http::response(['ok' => true])]);
+        app(CustomerLoyaltyService::class)->request('settings');
+        Http::assertSent(fn ($r) => $r->url() === 'https://site.test/wp-json/ipsvp/v1/sync/customer-loyalty/settings'
+            && $r->hasHeader('X-IPSABET-API-KEY', 'cached-key'));
+    }
+
+    public function test_both_admin_buttons_explain_missing_site_route_without_entering_save_mode(): void
+    {
+        Http::fake(['*' => Http::response(['code' => 'rest_no_route'], 404)]);
+        $user = User::find(1); $user->is_admin = 1; $user->path = 'adminSetting'; $user->save();
+        $controller = new LoyaltyTestController($user);
+        foreach (['type=adminCustomerLoyalty', 'type=adminCustomerDiscount|id=1'] as $callback) {
+            $controller->callback($callback);
+            $this->assertStringContainsString('نسخهٔ جدید افزونهٔ سایت', end($controller->messages)['text']);
+            $this->assertNotContains($user->fresh()->path, ['adminCustomerLoyaltySave', 'adminCustomerDiscountSave']);
+        }
+        $this->assertSame(0, Payment::count());
+        $this->assertSame(1000000, (int) $user->fresh()->balance);
+    }
+
+    public function test_admin_fixed_discount_editor_opens_and_shows_explicit_zero(): void
+    {
+        Http::fake(['*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => [
+            'kind' => 'customer', 'percent' => 0, 'automatic_percent' => 10, 'source' => 'manual',
+            'stars' => 1, 'total' => 5000000, 'manual_value' => '0',
+        ]])]);
+        $user = User::find(1); $user->is_admin = 1; $user->save();
+        $controller = new LoyaltyTestController($user);
+        $controller->callback('type=adminCustomerDiscount|id=1');
+        $this->assertStringContainsString('تخفیف ثابت حساب: 0٪', end($controller->messages)['text']);
+        $this->assertSame('adminCustomerDiscountSave', $user->fresh()->path);
+    }
+
+    public function test_account_screen_shows_level_and_percentage_even_before_pricing_is_enabled(): void
+    {
+        config(['loyalty.enabled' => false]); $this->fakeProfile();
+        $controller = new LoyaltyTestController(User::find(1));
+        $controller->call('profile', []);
+        $text = end($controller->messages)['text'];
+        foreach (['سطح حساب: 3 ستاره', 'تخفیف پلکانی بر اساس پرداخت‌ها: 10٪', 'تخفیف حساب: 10٪ (پلکانی)',
+            '5,000,000 تومان', 'تا پله بعدی:', 'هنوز فعال نشده'] as $expected) {
+            $this->assertStringContainsString($expected, $text);
+        }
+        $this->assertSame(0, Payment::count());
+    }
+
+    public function test_manual_account_level_and_discount_are_distinct_from_automatic_tier(): void
+    {
+        Http::fake(['*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => [
+            'kind' => 'customer', 'percent' => 15, 'automatic_percent' => 5, 'source' => 'manual',
+            'stars' => 3, 'total' => 2000000, 'expires_at' => null, 'manual_value' => '15',
+        ]])]);
+        $text = app(CustomerLoyaltyService::class)->profileText(User::find(1));
+        $this->assertStringContainsString('سطح حساب: 3 ستاره', $text);
+        $this->assertStringContainsString('پرداخت‌ها: 5٪', $text);
+        $this->assertStringContainsString('تخفیف فعال: 15٪ (دستی)', $text);
+        $this->assertStringNotContainsString('تا پله بعدی', $text);
+        $this->assertStringNotContainsString('افت سطح', $text);
+    }
+
+    public function test_automatic_top_level_shows_expiry_without_next_tier(): void
+    {
+        Http::fake(['*' => Http::response(['ok' => true, 'currency' => 'IRT', 'profile' => [
+            'kind' => 'customer', 'percent' => 20, 'automatic_percent' => 20, 'source' => 'automatic',
+            'stars' => 4, 'total' => 10000000, 'expires_at' => now()->addDay()->timestamp, 'next_amount' => null,
+        ]])]);
+        $text = app(CustomerLoyaltyService::class)->profileText(User::find(1));
+        $this->assertStringContainsString('سطح حساب: 4 ستاره', $text);
+        $this->assertStringContainsString('تخفیف فعال: 20٪', $text);
+        $this->assertStringContainsString('افت سطح فعلی:', $text);
+        $this->assertStringNotContainsString('تا پله بعدی', $text);
+    }
+
+    public function test_unavailable_profile_keeps_account_screen_usable_without_inventing_a_discount(): void
+    {
+        Http::fake(['*' => Http::response([], 404)]);
+        $controller = new LoyaltyTestController(User::find(1));
+        $controller->call('profile', []);
+        $text = end($controller->messages)['text'];
+        $this->assertStringContainsString('حساب کاربری', $text);
+        $this->assertStringContainsString('اطلاعات تخفیف موقتاً در دسترس نیست', $text);
+        $this->assertStringNotContainsString('WP_BASE_URL', $text);
+        $this->assertStringNotContainsString('تخفیف فعال:', $text);
+        try { app(CustomerLoyaltyService::class)->quote(User::find(1), 1, 100000); $this->fail(); }
+        catch (\RuntimeException $e) { $this->assertStringNotContainsString('WP_BASE_URL', $e->getMessage()); }
+    }
+
+    public function test_missing_secret_is_reported_without_sending_a_request(): void
+    {
+        config(['services.wp_sync.secret' => '']);
+        try { app(CustomerLoyaltyService::class)->request('settings'); $this->fail(); }
+        catch (\RuntimeException $e) { $this->assertStringContainsString('WP_SYNC_SECRET', $e->getMessage()); }
+        Http::assertNothingSent();
+    }
+
+    public function test_auth_bridge_and_network_errors_have_specific_admin_diagnostics(): void
+    {
+        foreach ([[403, [], 'کلید اتصال'], [503, ['message' => 'customer_loyalty_bridge_disabled'], 'IPSVP_CUSTOMER_LOYALTY_BOT']] as [$status, $body, $expected]) {
+            Http::swap(new \Illuminate\Http\Client\Factory());
+            Http::preventStrayRequests();
+            Http::fake(['*' => Http::response($body, $status)]);
+            try { app(CustomerLoyaltyService::class)->request('settings'); $this->fail(); }
+            catch (\RuntimeException $e) { $this->assertStringContainsString($expected, $e->getMessage()); }
+        }
+        Http::swap(new \Illuminate\Http\Client\Factory());
+        Http::fake(fn () => throw new \Illuminate\Http\Client\ConnectionException('test timeout'));
+        try { app(CustomerLoyaltyService::class)->request('settings'); $this->fail(); }
+        catch (\RuntimeException $e) { $this->assertStringContainsString('ارتباط با سایت برقرار نشد', $e->getMessage()); }
+    }
+
     public function test_non_admin_cannot_write_settings_or_override(): void
     {
         $controller = new LoyaltyTestController(User::find(1));
@@ -268,9 +413,11 @@ class LoyaltyTestController extends TelegramBotController
         $this->method = 'toUser'; $this->type = 'text'; $this->text = '10';
         $sdk = \Mockery::mock(Telegram::class);
         $sdk->shouldReceive('sendMessage')->andReturnUsing(function ($data) { $this->messages[] = $data; return ['ok' => false]; });
+        $sdk->shouldReceive('editMessage')->andReturnUsing(function ($data) { $this->messages[] = $data; return ['ok' => false]; });
         $sdk->shouldReceive('answerCallback')->andReturn([]);
         $this->telegramSdk = $sdk;
     }
+    public function callback(string $data) { $this->callbackData = $data; $this->type = 'callback_query'; return $this->index(); }
     public function input(string $text) { $this->text = $text; }
     public function call($method, $data) { return $this->$method($data); }
     protected function finalPaymentStep($payment) { $this->fulfilled++; return true; }

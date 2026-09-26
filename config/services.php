@@ -14,6 +14,11 @@ return [
     |
     */
 
+    'wp_sync' => [
+        'secret' => env('WP_SYNC_SECRET', ''),
+        'base_url' => env('WP_BASE_URL', 'https://ip-sabet.me'),
+    ],
+
     'postmark' => [
         'key' => env('POSTMARK_API_KEY'),
     ],

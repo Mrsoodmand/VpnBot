@@ -5776,7 +5776,13 @@ $codeText
         ];
         $buttons[] = [
             [
-                'text' => "تنظمیات کلی",
+                'text' => '⭐ تخفیف پلکانی کاربران عادی',
+                'callback_data' => 'type=adminCustomerLoyalty',
+            ],
+        ];
+        $buttons[] = [
+            [
+                'text' => "تنظیمات کلی",
                 'callback_data' => 'type=adminSetting',
             ],
         ];
