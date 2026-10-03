@@ -1028,7 +1028,7 @@ class TelegramBotController extends Controller
             return null;
         }
 
-        return Orders::where('id', $payment->order_id)
+        return Orders::botManaged()->where('id', $payment->order_id)
             ->where('user_id', $payment->user_id)
             ->value('remark');
     }
@@ -2512,12 +2512,12 @@ class TelegramBotController extends Controller
         }
 
         if ((int) $payment->type === 2) {
-            $order = Orders::where('id', $payment->order_id)->where('user_id', $user->id)->first();
+            $order = Orders::botManaged()->where('id', $payment->order_id)->where('user_id', $user->id)->first();
             if (!$order || !app(OrderLifecycleService::class)->canRenew($order)) {
                 return $this->sendTemporaryMessage('❌ مهلت ۷ روزه تمدید این سفارش به پایان رسیده است.');
             }
         } elseif ((int) $payment->type === 3) {
-            $order = Orders::where('id', $payment->order_id)->where('user_id', $user->id)->first();
+            $order = Orders::botManaged()->where('id', $payment->order_id)->where('user_id', $user->id)->first();
             if (!$order || !app(OrderLifecycleService::class)->canBuyExtra($order)) {
                 return $this->sendTemporaryMessage('خرید حجم برای این سفارش امکان‌پذیر نیست.');
             }
@@ -3099,14 +3099,14 @@ class TelegramBotController extends Controller
         }
 
         if ((int) $payment->type === 2) {
-            $order = Orders::where('id', $payment->order_id)
+            $order = Orders::botManaged()->where('id', $payment->order_id)
                 ->where('user_id', $payment->user_id)
                 ->first();
             if (!$order || !app(OrderLifecycleService::class)->canRenew($order)) {
                 return $this->sendTemporaryMessage('❌ مهلت ۷ روزه تمدید این سفارش به پایان رسیده است؛ رسید تایید نشد.');
             }
         } elseif ((int) $payment->type === 3) {
-            $order = Orders::where('id', $payment->order_id)
+            $order = Orders::botManaged()->where('id', $payment->order_id)
                 ->where('user_id', $payment->user_id)
                 ->first();
             if (!$order || !app(OrderLifecycleService::class)->canBuyExtra($order)) {
@@ -3144,14 +3144,14 @@ class TelegramBotController extends Controller
         }
 
         if ((int) $payment->type === 2) {
-            $order = Orders::where('id', $payment->order_id)
+            $order = Orders::botManaged()->where('id', $payment->order_id)
                 ->where('user_id', $user->id)
                 ->first();
             if (!$order || !app(OrderLifecycleService::class)->canRenew($order)) {
                 return $this->sendTemporaryMessage('❌ مهلت ۷ روزه تمدید این سفارش به پایان رسیده است.');
             }
         } elseif ((int) $payment->type === 3) {
-            $order = Orders::where('id', $payment->order_id)
+            $order = Orders::botManaged()->where('id', $payment->order_id)
                 ->where('user_id', $user->id)
                 ->first();
             if (!$order || !app(OrderLifecycleService::class)->canBuyExtra($order)) {
@@ -3813,7 +3813,7 @@ $codeText
         $lifecycle = app(OrderLifecycleService::class);
         $lifecycle->refreshPasarguardListStatuses($user->id);
 
-        $query = Orders::where('user_id', $user->id);
+        $query = Orders::botManaged()->where('user_id', $user->id);
 
         if ($status !== 'all') {
             $query->where('status', $status);
@@ -3920,7 +3920,7 @@ $codeText
             ]);
         }
 
-        $order = Orders::where('id', $id)
+        $order = Orders::botManaged()->where('id', $id)
             ->where('user_id', $user->id)
             ->first();
 
@@ -4144,7 +4144,7 @@ $codeText
 
     protected function clientOrderTransactions($data)
     {
-        $order = Orders::where('id', $data['id'] ?? null)
+        $order = Orders::botManaged()->where('id', $data['id'] ?? null)
             ->where('user_id', $this->user->id)
             ->first();
         if (!$order) {
@@ -4188,7 +4188,7 @@ $codeText
             return $this->denyAdminAccess();
         }
 
-        $order = Orders::find($data['id'] ?? null);
+        $order = Orders::botManaged()->find($data['id'] ?? null);
         if (!$order) {
             return $this->sendTemporaryMessage('سفارش مورد نظر یافت نشد.');
         }
@@ -4249,7 +4249,7 @@ $codeText
         $orderId = $data['id'];
         $user = $this->user;
 
-        $orderQuery = Orders::where('id', $orderId);
+        $orderQuery = Orders::botManaged()->where('id', $orderId);
         if (!$this->isAdmin) {
             $orderQuery->where('user_id', $user->id);
         }
@@ -4314,7 +4314,7 @@ $codeText
         $user = $this->user;
         $userDetail = $user->tel_detail;
 
-        $orderQuery = Orders::where('id', $userDetail['order-id'] ?? null);
+        $orderQuery = Orders::botManaged()->where('id', $userDetail['order-id'] ?? null);
         if (!$this->isAdmin) {
             $orderQuery->where('user_id', $user->id);
         }
@@ -4398,7 +4398,7 @@ $codeText
         $id = $data['id'];
         $uid = (string)Str::uuid();
 
-        $orderQuery = Orders::where('id', $id);
+        $orderQuery = Orders::botManaged()->where('id', $id);
         if (!$this->isAdmin) {
             $orderQuery->where('user_id', $this->user->id);
         }
@@ -4493,7 +4493,7 @@ $codeText
     protected function clientRenewOrder($data)
     {
         $orderId = $data['id'] ?? null;
-        $order = Orders::where('id', $orderId)
+        $order = Orders::botManaged()->where('id', $orderId)
             ->where('user_id', $this->user->id)
             ->first();
 
@@ -4577,7 +4577,7 @@ $codeText
         $orderId = $data['o_id'];
         $planId = $data['pl_id'];
         $user = $this->user;
-        $order = Orders::where('id', $orderId)
+        $order = Orders::botManaged()->where('id', $orderId)
             ->where('user_id', $user->id)
             ->first();
         $plan = Plans::find($planId);
@@ -4696,7 +4696,7 @@ $codeText
             return $this->sendTemporaryMessage('کاربر مربوط به تراکنش یافت نشد.');
         }
 
-        $order = Orders::where('id', $payment->order_id)
+        $order = Orders::botManaged()->where('id', $payment->order_id)
             ->where('user_id', $payment->user_id)
             ->first();
         if (!$order || !app(OrderLifecycleService::class)->canRenew($order)) {
@@ -5095,7 +5095,7 @@ $codeText
 
     protected function clientBuyExtra($data)
     {
-        $order = Orders::where('id', $data['id'] ?? null)
+        $order = Orders::botManaged()->where('id', $data['id'] ?? null)
             ->where('user_id', $this->user->id)
             ->first();
         if (!$order || !app(OrderLifecycleService::class)->canBuyExtra($order)) {
@@ -5187,7 +5187,7 @@ $codeText
         $extraId = $data['ex_id'];
         $user = $this->user;
 
-        $order = Orders::where('id', $orderId)
+        $order = Orders::botManaged()->where('id', $orderId)
             ->where('user_id', $user->id)
             ->first();
         if (!$order || !app(OrderLifecycleService::class)->canBuyExtra($order)) {
@@ -5319,7 +5319,7 @@ $codeText
             return $this->sendTemporaryMessage('کاربر مربوط به تراکنش یافت نشد.');
         }
 
-        $order = Orders::where('id', $payment->order_id)
+        $order = Orders::botManaged()->where('id', $payment->order_id)
             ->where('user_id', $payment->user_id)
             ->first();
         if (!$order || !app(OrderLifecycleService::class)->canBuyExtra($order)) {
@@ -11880,7 +11880,7 @@ $codeText
         $lifecycle = app(OrderLifecycleService::class);
         $lifecycle->reconcileTimeStatuses($userId ? (int) $userId : null);
 
-        $query = Orders::query();
+        $query = Orders::botManaged();
 
         /*
         |--------------------------------------------------------------------------
@@ -12084,7 +12084,7 @@ $codeText
             ]);
         }
 
-        $order = Orders::where('id', $id)
+        $order = Orders::botManaged()->where('id', $id)
             ->first();
         if (is_null($order)) {
             return $this->telegramSdk->sendMessage([
@@ -12224,7 +12224,7 @@ $codeText
     protected function adminOrderChangeBw($data)
     {
         $id = $data['id'] ?? null;
-        $order = Orders::find($id);
+        $order = Orders::botManaged()->find($id);
 
         $user = $this->user;
         $telDetail = $user->tel_detail;
@@ -12273,7 +12273,7 @@ $codeText
     {
         $text = intval($data['text']);
         $user = $this->user;
-        $order = Orders::find($user->tel_detail['order-bw']);
+        $order = Orders::botManaged()->find($user->tel_detail['order-bw']);
         $panel = Panels::find($order->panel_id);
 
         $data = getConfigDetail($order);
@@ -12438,7 +12438,7 @@ $codeText
     {
         $id = $data['id'] ?? null;
 
-        $order = Orders::find($id);
+        $order = Orders::botManaged()->find($id);
 
         if (!$order) {
             return $this->sendTemporaryMessage('سفارش مورد نظر یافت نشد.');
@@ -12501,7 +12501,7 @@ $codeText
     {
         $text = intval($data['text']);
         $user = $this->user;
-        $order = Orders::find($user->tel_detail['order-bw']);
+        $order = Orders::botManaged()->find($user->tel_detail['order-bw']);
         $panel = Panels::find($order->panel_id);
 
         $data = getConfigDetail($order);
@@ -12667,7 +12667,7 @@ $codeText
     {
         $id = $data['id'];
 
-        $order = Orders::find($id);
+        $order = Orders::botManaged()->find($id);
         $panel = Panels::find($order->panel_id);
         $data = getConfigDetail($order);
         if ($data['status']) {

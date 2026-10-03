@@ -615,6 +615,8 @@ class WpSyncService
 
     public function importSiteOrder(array $siteOrder, ?User $fallbackUser = null): ?Orders
     {
+        if (($siteOrder['service_type'] ?? '') === 'dedicated') return null;
+
         $siteOrderId = (int) ($siteOrder['site_order_id'] ?? $siteOrder['id'] ?? 0);
         if ($siteOrderId <= 0) return null;
 
@@ -690,7 +692,7 @@ class WpSyncService
     public function findOrder(int $id, array $payload = []): ?Orders
     {
         if ($id <= 0) return null;
-        $query = Orders::query()->where('id', $id);
+        $query = Orders::botManaged()->where('id', $id);
         $user = $this->resolveUser($payload);
         if ($user) $query->where('user_id', $user->id);
         return $query->first();
@@ -698,7 +700,7 @@ class WpSyncService
 
     public function updateBotOrder(User $user, int $orderId, array $payload): ?Orders
     {
-        $order = Orders::where('id', $orderId)->where('user_id', $user->id)->first();
+        $order = Orders::botManaged()->where('id', $orderId)->where('user_id', $user->id)->first();
         if (!$order) return null;
         $detail = is_array($order->detail) ? $order->detail : (json_decode((string) $order->detail, true) ?: []);
         if (!empty($payload['detail']) && is_array($payload['detail'])) {
@@ -721,7 +723,7 @@ class WpSyncService
 
     public function renewBotOrder(User $user, int $orderId, array $payload): array
     {
-        $order = Orders::where('id', $orderId)->where('user_id', $user->id)->first();
+        $order = Orders::botManaged()->where('id', $orderId)->where('user_id', $user->id)->first();
         if (!$order) return ['ok' => false, 'message' => 'bot_order_not_found'];
         if (!app(OrderLifecycleService::class)->canRenew($order)) {
             return ['ok' => false, 'message' => 'renewal_grace_period_ended'];
@@ -876,7 +878,7 @@ class WpSyncService
 
     public function ordersListForUser(User $user, int $page = 1, int $perPage = 20, string $search = ''): array
     {
-        $q = Orders::query()->where('user_id', $user->id);
+        $q = Orders::botManaged()->where('user_id', $user->id);
         if ($search !== '') {
             $q->where(function ($w) use ($search) {
                 $w->where('remark', 'like', "%{$search}%")->orWhere('plan', 'like', "%{$search}%")->orWhere('id', 'like', "%{$search}%");
@@ -887,7 +889,7 @@ class WpSyncService
 
     public function ordersList(int $page = 1, int $perPage = 20, string $search = '', string $source = ''): array
     {
-        $q = Orders::query()->leftJoin('users as u', 'u.id', '=', 'orders.user_id')->leftJoin('panels as p', 'p.id', '=', 'orders.panel_id')
+        $q = Orders::botManaged()->leftJoin('users as u', 'u.id', '=', 'orders.user_id')->leftJoin('panels as p', 'p.id', '=', 'orders.panel_id')
             ->select('orders.*', 'u.tel_id as user_tel_id', 'u.username as user_username', 'u.first_name as user_first_name', 'p.name as panel_name');
         if ($search !== '') {
             $q->where(function ($w) use ($search) {

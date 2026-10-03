@@ -152,6 +152,9 @@ class WpSyncController extends Controller
         if ($g = $this->guard($request, $sync)) return $g;
         $order = $request->input('order', []);
         if (!is_array($order)) return $this->json(['ok' => false, 'message' => 'invalid_order_payload'], 422);
+        if (($order['service_type'] ?? '') === 'dedicated') {
+            return $this->json(['ok' => true, 'skipped' => 'site_managed_dedicated_order']);
+        }
         $saved = $sync->importSiteOrder($order);
         if (!$saved) return $this->json(['ok' => false, 'message' => 'linked_user_not_found_or_invalid_order'], 404);
         return $this->json(['ok' => true, 'bot_order_id' => $saved->id, 'order' => $sync->formatOrder($saved, true)]);

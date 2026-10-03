@@ -14,6 +14,24 @@ class Orders extends Model
 
     public const STATUS_SUSPENDED = 'suspended';
 
+    /** Keep website-only dedicated services out of bot queries, including old imports. */
+    public function scopeBotManaged($query)
+    {
+        foreach (['orders.detail->service_type', 'orders.detail->raw->service_type'] as $field) {
+            $query->where(function ($q) use ($field) {
+                $q->whereNull($field)->orWhere($field, '!=', 'dedicated');
+            });
+        }
+        return $query;
+    }
+
+    public function isSiteManagedDedicated(): bool
+    {
+        $detail = is_array($this->detail) ? $this->detail : [];
+        return ($detail['service_type'] ?? '') === 'dedicated'
+            || ($detail['raw']['service_type'] ?? '') === 'dedicated';
+    }
+
     protected function casts()
     {
         return [

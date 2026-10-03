@@ -74,6 +74,8 @@ class OrderLifecycleService
 
     public function canRenew(Orders $order, ?Carbon $now = null): bool
     {
+        if ($order->isSiteManagedDedicated()) return false;
+
         $this->refreshTimeStatus($order, $now);
 
         return $this->normalizeStatus($order->status) !== Orders::STATUS_INACTIVE;
@@ -81,6 +83,8 @@ class OrderLifecycleService
 
     public function canBuyExtra(Orders $order, ?Carbon $now = null): bool
     {
+        if ($order->isSiteManagedDedicated()) return false;
+
         $this->refreshTimeStatus($order, $now);
 
         return in_array($this->normalizeStatus($order->status), [
