@@ -155,7 +155,7 @@ class AdminRejectCartReceiptTest extends TestCase
         $this->assertSame('callback-1', $telegram->answeredCallbacks[0]['callback_query_id']);
         $this->assertSame($channelId, $telegram->editedCaptions[0]['chat_id']);
         $this->assertStringContainsString('وضعیت: ❌ رد شده', $telegram->editedCaptions[0]['caption']);
-        $this->assertStringContainsString('IR820540102680020817909002', $telegram->editedCaptions[0]['caption']);
+        $this->assertStringNotContainsString('IR820540102680020817909002', $telegram->editedCaptions[0]['caption']);
         $this->assertSame(['inline_keyboard' => []], json_decode($telegram->editedCaptions[0]['reply_markup'], true));
         $this->assertSame('2002', (string) $telegram->sentMessages[0]['chat_id']);
         $this->assertStringContainsString('پرداخت شما تایید نشد', $telegram->sentMessages[0]['text']);
@@ -412,7 +412,7 @@ class AdminRejectCartReceiptTest extends TestCase
         $this->assertNotEmpty($payment->detail['receipt_submitted_at']);
         $this->assertCount(1, $firstTelegram->sentPhotos);
         $this->assertSame(-1001234567890, (int) $firstTelegram->sentPhotos[0]['chat_id']);
-        $this->assertStringContainsString('IR820540102680020817909002', $firstTelegram->sentPhotos[0]['caption']);
+        $this->assertStringNotContainsString('IR820540102680020817909002', $firstTelegram->sentPhotos[0]['caption']);
         $this->assertSame('sendCartBeCartReceipt', DB::table('users')->where('id', 2)->value('path'));
 
         $secondController = new TelegramBotController($this->receiptPhotoRequest('receipt-2'));

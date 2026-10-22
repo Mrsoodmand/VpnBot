@@ -531,7 +531,7 @@ class PasarGuardReceiptFulfillmentTest extends TestCase
         $this->assertNotEmpty($payment->fresh()->detail['receipt_details']);
         $this->assertStringContainsString('adminRejectCartReceipt', json_encode($initial->calls));
         if ($type !== 4) {
-            $this->assertStringContainsString('آی پی ثابت اشتراکی', $text);
+            $this->assertStringNotContainsString('نوع سرویس:', $text);
             $this->assertStringContainsString('پلن ده گیگ', $text);
             $this->assertStringContainsString('آلمان 🇩🇪', $text);
         }
@@ -555,7 +555,7 @@ class PasarGuardReceiptFulfillmentTest extends TestCase
         $this->assertStringContainsString('تایید شده توسط: @admin', $text);
         if ($type !== 4) {
             $this->assertStringContainsString('در حال تحویل سفارش', $text);
-            $this->assertStringContainsString('آی پی ثابت اشتراکی', $text);
+            $this->assertStringNotContainsString('نوع سرویس:', $text);
             $this->assertStringContainsString('پلن ده گیگ', $text);
             $this->assertStringContainsString('آلمان 🇩🇪', $text);
             $this->assertStringNotContainsString('تغییر یافته', $text);

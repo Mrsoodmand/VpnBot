@@ -96,7 +96,6 @@ class PaymentReceiptFormatter
         };
         $lines = ['🧾 <b>رسید آی پی ثابت — ربات</b>', ''];
         $this->field($lines, 'نوع', $typeLabel);
-        if ($type !== '4') $this->field($lines, 'نوع سرویس', $info['service']);
         $this->field($lines, 'وضعیت', $status);
         // Payment ID is stable across retries; preorder IDs and service IDs can overlap.
         $this->field($lines, $type === '1' ? 'کد سفارش' : 'کد پیگیری', 'BOT-P' . $payment->id, true);
@@ -108,8 +107,6 @@ class PaymentReceiptFormatter
         $this->field($lines, 'موبایل', $info['phone']);
         if ($type !== '4') {
             $this->field($lines, $type === '2' ? 'پلن تمدید' : 'پلن', $info['plan']);
-            if ($info['bandwidth'] !== null) $this->field($lines, 'حجم پلن', $info['bandwidth'] . ' گیگ');
-            if ($info['days'] !== null) $this->field($lines, 'مدت پلن', $info['days'] . ' روز');
             $this->field($lines, 'کشور', $info['country']);
         }
         if ($type === '1') $this->field($lines, 'تعداد سرویس', $info['quantity']);
@@ -140,9 +137,7 @@ class PaymentReceiptFormatter
             if ($admin) $this->field($lines, $state === 'rejected' ? 'رد شده توسط' : 'تایید شده توسط',
                 $admin->username ? '@' . $admin->username : ($admin->first_name ?: 'ادمین'));
         }
-        foreach (['cart-number' => 'شماره کارت', 'cart-sheba' => 'شماره شبا', 'cart-name' => 'صاحب کارت'] as $key => $label) {
-            if (!empty($detail[$key])) $this->field($lines, $label, $detail[$key], $key !== 'cart-name');
-        }
+        if (!empty($detail['cart-name'])) $this->field($lines, 'صاحب کارت', $detail['cart-name']);
         if ($state === 'needs_review' && !empty($detail['fulfillment']['message'])) {
             $this->field($lines, 'خطا', $detail['fulfillment']['message']);
         }
