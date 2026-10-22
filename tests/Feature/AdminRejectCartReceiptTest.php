@@ -154,7 +154,7 @@ class AdminRejectCartReceiptTest extends TestCase
 
         $this->assertSame('callback-1', $telegram->answeredCallbacks[0]['callback_query_id']);
         $this->assertSame($channelId, $telegram->editedCaptions[0]['chat_id']);
-        $this->assertStringContainsString('تراکنش کارت به کارت رد شد', $telegram->editedCaptions[0]['caption']);
+        $this->assertStringContainsString('وضعیت: ❌ رد شده', $telegram->editedCaptions[0]['caption']);
         $this->assertStringContainsString('IR820540102680020817909002', $telegram->editedCaptions[0]['caption']);
         $this->assertSame(['inline_keyboard' => []], json_decode($telegram->editedCaptions[0]['reply_markup'], true));
         $this->assertSame('2002', (string) $telegram->sentMessages[0]['chat_id']);

@@ -24,6 +24,7 @@ use App\Models\User;
 use App\Services\OrderCountryResolver;
 use App\Services\OrderLifecycleService;
 use App\Services\PasarGuardPaymentService;
+use App\Services\PaymentReceiptFormatter;
 use App\Services\Telegram;
 use App\Services\WpSyncService;
 use App\Services\CustomerLoyaltyService;
@@ -81,10 +82,11 @@ class TelegramBotController extends Controller
             $this->chatId = $data['message']['chat']['id'];
             $this->actorId = $data['message']['from']['id'] ?? $this->chatId;
             $this->type = 'text';
-            if (array_key_exists('photo', $data['message'])) {
+            if (!empty($data['message']['photo'])) {
                 $this->text = "photo";
-                $this->fileId = $data['message']['photo'][2]['file_id'];
-                $this->file_unique_id = $data['message']['photo'][2]['file_unique_id'];
+                $photo = end($data['message']['photo']);
+                $this->fileId = $photo['file_id'];
+                $this->file_unique_id = $photo['file_unique_id'] ?? null;
             } elseif (array_key_exists('text', $data['message'])) {
                 $this->text = PersianNumToEn($data['message']['text']);
             }
@@ -1002,6 +1004,59 @@ class TelegramBotController extends Controller
         return htmlspecialchars((string) $value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     }
 
+    private function sendAdminPaymentReceipt(Payment $payment, string $state, $channelId = null): array
+    {
+        $payment->refresh();
+        $edit = $payment->method === 'cart-be-cart';
+        $receipt = $payment->detail['fulfillment']['receipt'] ?? [];
+        $channelId = $edit
+            ? ($receipt['chat_id'] ?? $this->chatId)
+            : ($channelId ?: Setting::where('key', 'cart_be_cart_id')->value('value') ?: User::where('is_admin', 1)->value('tel_id'));
+        if (!$channelId) return ['ok' => false];
+
+        $photo = $edit && ($receipt['is_photo'] ?? $this->isPhoto);
+        $parts = app(PaymentReceiptFormatter::class)->parts($payment, $state, $photo ? 1024 : 4096);
+        $body = array_shift($parts);
+        $params = [
+            'chat_id' => $channelId,
+            'parse_mode' => 'HTML',
+            'reply_markup' => in_array($state, ['processing', 'needs_review'], true)
+                ? $this->retryPaymentKeyboard($payment) : json_encode(['inline_keyboard' => []]),
+        ];
+        if ($edit) {
+            $params['message_id'] = $receipt['message_id'] ?? $this->messageId;
+            $result = $photo
+                ? $this->telegramSdk->editCaption($params + ['caption' => $body])
+                : $this->telegramSdk->editMessage($params + ['text' => $body]);
+        } else {
+            $result = $this->telegramSdk->sendMessage($params + ['text' => $body]);
+        }
+        if ($edit && empty($result['ok']) && !str_contains($result['description'] ?? '', 'message is not modified')) {
+            unset($params['message_id']);
+            $result = $this->telegramSdk->sendMessage($params + ['text' => $body]);
+            if (!empty($result['ok']) && !empty($result['result']['message_id'])) {
+                $detail = $payment->detail ?? [];
+                $detail['fulfillment']['receipt'] = ['chat_id' => $channelId,
+                    'message_id' => $result['result']['message_id'], 'is_photo' => false];
+                $payment->detail = $detail;
+                $payment->save();
+            }
+        }
+        $this->sendReceiptContinuation($payment, $parts, $channelId);
+        return $result;
+    }
+
+    private function sendReceiptContinuation(Payment $payment, array $parts, $channelId): void
+    {
+        foreach ($parts as $part) {
+            $this->telegramSdk->sendMessage([
+                'chat_id' => $channelId,
+                'text' => "🧾 ادامهٔ رسید #{$payment->id}\n\n" . $part,
+                'parse_mode' => 'HTML',
+            ]);
+        }
+    }
+
     private function cardShebaLine(mixed $sheba): string
     {
         $sheba = trim((string) $sheba);
@@ -1766,51 +1821,9 @@ class TelegramBotController extends Controller
             return $this->sendTemporaryMessage('❌ مقصد ارسال رسید یافت نشد.');
         }
 
-        $targetUserName = $targetUser->username
-            ? "@{$targetUser->username}"
-            : ($targetUser->first_name ?? 'بدون نام');
-
-        $price = number_format($payment->price);
-
-        if ($payment->method == 'cart-be-cart') {
-
-            $adminUserName = $this->user->username
-                ? "@{$this->user->username}"
-                : ($this->user->first_name ?? 'ادمین');
-
-            $caption = "✅ <b>تراکنش تایید شد</b>\n\n";
-            $caption .= "━━━━━━━━━━━━━━━\n";
-            $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-            $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-            $caption .= "━━━━━━━━━━━━━━━\n";
-            $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-            $caption .= "🔢 <b>شماره تراکنش:</b> <code>{$payment->id}</code>\n";
-            $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-            $caption .= "💰 <b>نوع پرداخت:</b> کارت به کارت \n";
-            $caption .= "━━━━━━━━━━━━━━━\n";
-            $caption .= "👨‍💻 <b>تایید شده توسط:</b> {$adminUserName}\n";
-            $caption .= "📌 <b>وضعیت:</b> موفق\n";
-            $adminMethod = 'edit';
-
-            $balance = number_format($targetUser->balance);
-            $userCaption = "✅ تراکنش شارژ کیف پول شما با موفقیت تایید شد.\n💰 موجودی فعلی شما: {$balance} تومان";
-        }
-
-        if ($this->isPhoto) {
-            $this->telegramSdk->editCaption([
-                'chat_id' => $channelId,
-                'message_id' => $this->messageId,
-                'caption' => $caption,
-                'parse_mode' => 'HTML',
-            ]);
-        } else {
-            $this->method = $adminMethod;
-            $this->sendMessage([
-                'chat_id' => $channelId,
-                'text' => $caption,
-                'parse_mode' => 'HTML',
-            ], 'message');
-        }
+        $this->sendAdminPaymentReceipt($payment, 'approved', $channelId);
+        $balance = number_format($targetUser->balance);
+        $userCaption = "✅ تراکنش شارژ کیف پول شما با موفقیت تایید شد.\n💰 موجودی فعلی شما: {$balance} تومان";
 
         $this->method = 'toUser';
         $this->sendMessage([
@@ -2774,6 +2787,8 @@ class TelegramBotController extends Controller
             $detail['cart-name'] = $detail['cart-name']
                 ?? ($telDetail['payment-cart-name'] ?? null);
             $detail['value'] = $value;
+            $detail['receipt_is_photo'] = (bool) $this->fileId;
+            $detail['receipt_details'] = app(PaymentReceiptFormatter::class)->snapshot($lockedPayment);
             $detail['receipt_submission_state'] = 'sending';
             $detail['receipt_submission_started_at'] = now()->toDateTimeString();
             $detail['receipt_submission_token'] = $reservationToken;
@@ -2795,37 +2810,11 @@ class TelegramBotController extends Controller
                 : $this->sendTemporaryMessage('❌ تراکنش معتبر پیدا نشد.');
         }
 
-        $caption = "💳 <b>رسید جدید کارت به کارت</b>\n\n";
-        $paymentType = __('payment.type.' . $payment->type);
-        $caption .= "💥 نوع تراکنش: <code>{$paymentType}</code>\n";
-        $paymentRemark = $this->paymentOrderRemark($payment);
-        if ($paymentRemark !== null) {
-            $caption .= "🏷 ریمارک سرویس: <code>" . $this->escapeHtml($paymentRemark) . "</code>\n";
-        }
-
-        $paymentDetail = is_array($payment->detail) ? $payment->detail : [];
-        $paymentCardNumber = $paymentDetail['cart-number'] ?? '—';
-        $paymentCardSheba = $paymentDetail['cart-sheba'] ?? null;
-        $paymentCardName = $paymentDetail['cart-name'] ?? '—';
-        $price = number_format($payment->price);
-        $caption .= "👤 کاربر\n";
-        if (!empty($user->username)) {
-            $caption .= "@{$user->username}\n";
-        } else {
-            $caption .= "{$user->first_name}\n";
-        }
-        $caption .= " آیدی: <code>{$user->tel_id}</code>\n\n";
-        $caption .= "اطلاعات پرداخت\n";
-        $caption .= "💰 شماره تراکنش: <code>{$payment->id}</code>\n";
-        $caption .= $this->cardNumberLine($paymentCardNumber);
-        $caption .= $this->cardShebaLine($paymentCardSheba);
-        $caption .= "👤 صاحب کارت: {$paymentCardName}\n";
-        $caption .= "🧾 مبلغ تراکنش: <code>{$price}</code> تومان\n\n";
-        $caption .= "رسید کاربر: \n";
+        $receiptParts = app(PaymentReceiptFormatter::class)->parts($payment, 'pending', $this->fileId ? 1024 : 4096);
+        $caption = array_shift($receiptParts);
 
         $this->method = 'toUser';
         if ($this->fileId == false) {
-            $caption .= $this->escapeHtml($value);
             $sendResult = $this->sendMessage([
                 'chat_id' => $channelId,
                 'text' => $caption,
@@ -2908,6 +2897,8 @@ class TelegramBotController extends Controller
             $lockedPayment->detail = $detail;
             $lockedPayment->save();
         });
+
+        $this->sendReceiptContinuation($payment, $receiptParts, $channelId);
 
         $payment->refresh();
         $statusLabel = $this->cartReceiptStatusLabel($payment);
@@ -2994,9 +2985,6 @@ class TelegramBotController extends Controller
         |--------------------------------------------------------------------------
         */
 
-        $adminUser = $alreadyRejected && $payment->admin_id
-            ? (User::find($payment->admin_id) ?? $this->user)
-            : $this->user;
         $targetUser = User::find($payment->user_id);
 
         if (!$targetUser) {
@@ -3011,68 +2999,7 @@ class TelegramBotController extends Controller
 
         $price = number_format($payment->price);
 
-        $paymentCardNumber = $payment->detail['cart-number'] ?? '—';
-        $paymentCardSheba = $payment->detail['cart-sheba'] ?? null;
-        $paymentCardName = $payment->detail['cart-name'] ?? '—';
-
-        /*
-        |--------------------------------------------------------------------------
-        | Usernames
-        |--------------------------------------------------------------------------
-        */
-
-        $targetUserName = !empty($targetUser->username)
-            ? "@{$targetUser->username}"
-            : ($targetUser->first_name ?? 'بدون نام');
-
-        $adminUserName = !empty($adminUser->username)
-            ? "@{$adminUser->username}"
-            : ($adminUser->first_name ?? 'ادمین');
-
-        /*
-        |--------------------------------------------------------------------------
-        | Caption
-        |--------------------------------------------------------------------------
-        */
-
-        $caption = "❌ <b>تراکنش کارت به کارت رد شد</b>\n\n";
-
-        $caption .= "━━━━━━━━━━━━━━━\n";
-        $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-        $caption .= "🆔 <b>آیدی تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-        $caption .= "━━━━━━━━━━━━━━━\n";
-
-        $caption .= "💳 <b>اطلاعات پرداخت</b>\n";
-        $caption .= "🔢 <b>شماره تراکنش:</b> <code>{$payment->id}</code>\n";
-        $caption .= $this->cardNumberLine($paymentCardNumber);
-        $caption .= $this->cardShebaLine($paymentCardSheba);
-        $caption .= "👤 <b>صاحب کارت:</b> {$paymentCardName}\n";
-        $caption .= "💰 <b>مبلغ:</b> <code>{$price}</code> تومان\n";
-        $paymentRemark = $this->paymentOrderRemark($payment);
-        if ($paymentRemark !== null) {
-            $caption .= "🏷 <b>ریمارک سرویس:</b> <code>" . $this->escapeHtml($paymentRemark) . "</code>\n";
-        }
-
-        $caption .= "━━━━━━━━━━━━━━━\n";
-        $caption .= "🚫 <b>رد شده توسط:</b>\n{$adminUserName}";
-
-
-        if ($this->isPhoto) {
-            $this->telegramSdk->editCaption([
-                'chat_id' => $channelId,
-                'message_id' => $this->messageId,
-                'caption' => $caption,
-                'parse_mode' => 'HTML',
-                'reply_markup' => json_encode(['inline_keyboard' => []]),
-            ]);
-        } else {
-            $this->sendMessage([
-                'chat_id' => $channelId,
-                'text' => $caption,
-                'parse_mode' => 'HTML',
-                'reply_markup' => json_encode(['inline_keyboard' => []]),
-            ], 'message');
-        }
+        $this->sendAdminPaymentReceipt($payment, 'rejected', $channelId);
 
         if ($alreadyRejected) {
             return;
@@ -3283,12 +3210,14 @@ class TelegramBotController extends Controller
         if ($payment->method === 'cart-be-cart') {
             $receipt = $payment->detail['fulfillment']['receipt'] ?? null;
             $channelId = Setting::where('key', 'cart_be_cart_id')->value('value') ?: User::where('is_admin', 1)->value('tel_id');
-            if ($receipt && (string) $receipt['chat_id'] === (string) $channelId) {
+            if ($receipt) {
+                $this->chatId = $receipt['chat_id'];
                 $this->messageId = $receipt['message_id'];
                 $this->isPhoto = $receipt['is_photo'];
             } elseif ((string) $this->chatId !== (string) $channelId) {
                 $notice = $this->telegramSdk->sendMessage(['chat_id' => $channelId, 'text' => "⏳ تلاش مجدد برای تراکنش #{$payment->id}"]);
                 if (empty($notice['ok'])) return $this->sendTemporaryMessage('ارسال پیام پیگیری به ادمین ناموفق بود.');
+                $this->chatId = $channelId;
                 $this->messageId = $notice['result']['message_id'];
                 $this->isPhoto = false;
             }
@@ -3307,6 +3236,7 @@ class TelegramBotController extends Controller
             $payment->refresh();
             if ((string) $payment->status !== '1' || ($payment->detail['fulfillment']['status'] ?? '') === 'completed') return;
             $detail = $payment->detail ?? [];
+            $detail['receipt_details'] = app(PaymentReceiptFormatter::class)->snapshot($payment);
             $state = $detail['fulfillment'] ?? [];
             $state['version'] = 1;
             $state['status'] = 'processing';
@@ -3314,7 +3244,7 @@ class TelegramBotController extends Controller
             $state['started_at'] = now()->toIso8601String();
             if ($payment->method === 'cart-be-cart') {
                 $state['receipt'] = [
-                    'chat_id' => Setting::where('key', 'cart_be_cart_id')->value('value') ?: $this->chatId,
+                    'chat_id' => $this->chatId,
                     'message_id' => $this->messageId, 'is_photo' => $this->isPhoto,
                 ];
             }
@@ -3394,29 +3324,7 @@ class TelegramBotController extends Controller
             'message' => $error,
         ]);
 
-        $channelId = Setting::where('key', 'cart_be_cart_id')->value('value')
-            ?: User::where('is_admin', 1)->value('tel_id');
-        $caption = $refunded
-            ? "❌ <b>عملیات انجام نشد؛ مبلغ به کیف پول برگشت</b>\n\n"
-            : "⚠️ <b>پرداخت تأیید شد؛ تکمیل سفارش نیاز به بررسی دارد</b>\n\n";
-        $caption .= "شماره تراکنش: <code>{$payment->id}</code>\n";
-        if (!$refunded) $caption .= "عملیات کامل نشده یا نتیجهٔ پنل قطعی نیست. قبل از اجرای مجدد، وضعیت سرویس در پنل بررسی شود.\n";
-        $caption .= "خطا: <code>" . $this->escapeHtml($error) . "</code>";
-        if (!empty($failure['http_code'])) $caption .= "\nHTTP: " . (int) $failure['http_code'];
-        if ($channelId) {
-            $params = ['chat_id' => $channelId, 'parse_mode' => 'HTML',
-                'reply_markup' => $this->retryPaymentKeyboard($payment)];
-            if ($payment->method === 'cart-be-cart') {
-                $params['message_id'] = $this->messageId;
-                $notice = $this->isPhoto
-                    ? $this->telegramSdk->editCaption($params + ['caption' => $caption])
-                    : $this->telegramSdk->editMessage($params + ['text' => $caption]);
-            }
-            if (empty($notice['ok'])) {
-                $this->telegramSdk->sendMessage(['chat_id' => $channelId, 'text' => $caption, 'parse_mode' => 'HTML',
-                    'reply_markup' => $this->retryPaymentKeyboard($payment)]);
-            }
-        }
+        $this->sendAdminPaymentReceipt($payment, $refunded ? 'refunded' : 'needs_review');
         $telId = User::whereKey($payment->user_id)->value('tel_id');
         if ($telId) {
             $this->telegramSdk->sendMessage([
@@ -3449,25 +3357,8 @@ class TelegramBotController extends Controller
         }
 
         if ($payment->method == 'cart-be-cart') {
-            $caption = "✅ <b>تراکنش تایید شد</b>\n\n⏳ در حال تحویل سفارش به کاربر هستیم...\nلطفاً چند لحظه صبر کنید.\nشناسه کاربر:  <code>{$targetUser->tel_id}</code>\nشماره تراکنش:<code>{$payment->id}</code>\n";
             $adminMethod = 'edit';
-            if ($this->isPhoto) {
-                $this->telegramSdk->editCaption([
-                    'chat_id' => $channelId,
-                    'message_id' => $this->messageId,
-                    'caption' => $caption,
-                    'reply_markup' => $this->retryPaymentKeyboard($payment),
-                    'parse_mode' => 'HTML',
-                ]);
-            } else {
-                $this->method = $adminMethod;
-                $this->sendMessage([
-                    'chat_id' => $channelId,
-                    'text' => $caption,
-                    'reply_markup' => $this->retryPaymentKeyboard($payment),
-                    'parse_mode' => 'HTML',
-                ], 'message');
-            }
+            $this->sendAdminPaymentReceipt($payment, 'processing', $channelId);
         }
         if ($payment->method == 'wallet') {
 
@@ -3711,72 +3602,7 @@ $codeText
             }
             if ($failure !== null) return $failure;
 
-            $remarks = collect($orders)
-                ->pluck('remark')
-                ->filter()
-                ->map(fn($r) => "<code>{$r}</code>")
-                ->implode(', ');
-
-            $targetUserName = $targetUser->username
-                ? "@{$targetUser->username}"
-                : ($targetUser->first_name ?? 'بدون نام');
-
-            $price = number_format($payment->price);
-            $paymentType = __('payment.type.' . $payment->type);
-
-            if ($payment->method == 'cart-be-cart') {
-
-                $adminUserName = $this->user->username
-                    ? "@{$this->user->username}"
-                    : ($this->user->first_name ?? 'ادمین');
-
-                $caption = "✅ <b>تراکنش تایید شد</b>\n\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                $caption .= "💥 نوع تراکنش: <code>{$paymentType}</code>\n";
-                $caption .= "🔢 <b>شماره تراکنش:</b> <code>{$payment->id}</code>\n";
-                $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                $caption .= "💰 <b>نوع پرداخت:</b> کارت به کارت \n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "👨‍💻 <b>تایید شده توسط:</b> {$adminUserName}\n";
-                $caption .= "📌 <b>وضعیت:</b> موفق\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "🔗<b>ریمـارک‌های تحویل شده:</b>\n{$remarks}";
-            } elseif ($payment->method == 'wallet') {
-
-                $this->deleteChat();
-                $caption = "✅ <b>خرید آی پی</b>\n\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                $caption .= "💰 <b>نوع پرداخت:</b> کیف پول\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "🔗<b>ریمـارک‌های تحویل شده:</b>\n{$remarks}";
-            }
-
-            if ($this->isPhoto) {
-                $this->telegramSdk->editCaption([
-                    'chat_id' => $channelId,
-                    'message_id' => $this->messageId,
-                    'caption' => $caption,
-                    'reply_markup' => json_encode(['inline_keyboard' => []]),
-                    'parse_mode' => 'HTML',
-                ]);
-            } else {
-                $this->method = $adminMethod;
-                $this->sendMessage([
-                    'chat_id' => $channelId,
-                    'text' => $caption,
-                    'reply_markup' => json_encode(['inline_keyboard' => []]),
-                    'parse_mode' => 'HTML',
-                ], 'message');
-            }
+            $this->sendAdminPaymentReceipt($payment, 'approved', $channelId);
 
         } else {
             $session['session'] = "";
@@ -3795,12 +3621,7 @@ $codeText
                 $payment->update(['status' => -2]);
                 $preOrder->update(['status' => -2]);
 
-                $this->method = $adminMethod;
-                $this->sendMessage([
-                    'chat_id' => $channelId,
-                    'text' => "❌ خطا در اتصال به سرور رخ داده است.\n\n🏷 نام سرور: {$panel->name}",
-                    'parse_mode' => 'HTML',
-                ], 'message');
+                $this->sendAdminPaymentReceipt($payment, 'refunded', $channelId);
 
                 $this->method = $userMethod;
                 return $this->sendMessage([
@@ -3960,68 +3781,7 @@ $codeText
             |--------------------------------------------------------------------------
             */
 
-            $remarks = collect($orders)
-                ->pluck('remark')
-                ->filter()
-                ->map(fn($r) => "<code>{$r}</code>")
-                ->implode(', ');
-
-            $targetUserName = $targetUser->username
-                ? "@{$targetUser->username}"
-                : ($targetUser->first_name ?? 'بدون نام');
-
-            $price = number_format($payment->price);
-
-            if ($payment->method == 'cart-be-cart') {
-
-                $adminUserName = $this->user->username
-                    ? "@{$this->user->username}"
-                    : ($this->user->first_name ?? 'ادمین');
-
-                $caption = "✅ <b>تراکنش تایید شد</b>\n\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                $caption .= "🔢 <b>شماره تراکنش:</b> <code>{$payment->id}</code>\n";
-                $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                $caption .= "💰 <b>نوع پرداخت:</b> کارت به کارت \n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "👨‍💻 <b>تایید شده توسط:</b> {$adminUserName}\n";
-                $caption .= "📌 <b>وضعیت:</b> موفق\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "👨‍💻 <b>ریمـارک‌های تحویل شده:</b>\n{$remarks}";
-            } elseif ($payment->method == 'wallet') {
-
-                $this->deleteChat();
-                $caption = "✅ <b>خرید آی پی</b>\n\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                $caption .= "💰 <b>نوع پرداخت:</b> کیف پول\n";
-                $caption .= "━━━━━━━━━━━━━━━\n";
-                $caption .= "👨‍💻 <b>ریمـارک‌های تحویل شده:</b>\n{$remarks}";
-            }
-
-            if ($this->isPhoto) {
-                $this->telegramSdk->editCaption([
-                    'chat_id' => $channelId,
-                    'message_id' => $this->messageId,
-                    'caption' => $caption,
-                    'parse_mode' => 'HTML',
-                ]);
-            } else {
-                $this->method = $adminMethod;
-                $this->sendMessage([
-                    'chat_id' => $channelId,
-                    'text' => $caption,
-                    'parse_mode' => 'HTML',
-                ], 'message');
-            }
+            $this->sendAdminPaymentReceipt($payment, 'approved', $channelId);
         }
     }
 
@@ -4956,26 +4716,8 @@ $codeText
             return ['status' => false, 'message' => '❌ مقصد ارسال رسید یافت نشد.'];
         }
         if ($payment->method == 'cart-be-cart') {
-            $remark = $this->escapeHtml($order->remark);
-            $caption = "✅ <b>تراکنش تایید شد</b>\n\n🏷 <b>ریمارک سرویس:</b> <code>{$remark}</code>\n\n⏳ در حال تحویل سفارش به کاربر هستیم...\nلطفاً چند لحظه صبر کنید.";
             $adminMethod = 'edit';
-            if ($this->isPhoto) {
-                $this->telegramSdk->editCaption([
-                    'chat_id' => $channelId,
-                    'message_id' => $this->messageId,
-                    'caption' => $caption,
-                    'reply_markup' => $this->retryPaymentKeyboard($payment),
-                    'parse_mode' => 'HTML',
-                ]);
-            } else {
-                $this->method = 'edit';
-                $this->sendMessage([
-                    'chat_id' => $channelId,
-                    'text' => $caption,
-                    'reply_markup' => $this->retryPaymentKeyboard($payment),
-                    'parse_mode' => 'HTML',
-                ], 'message');
-            }
+            $this->sendAdminPaymentReceipt($payment, 'processing', $channelId);
         }
         if ($payment->method == 'wallet') {
 
@@ -5075,64 +4817,7 @@ $codeText
                 ], 'message');
 
 
-                $targetUserName = $targetUser->username
-                    ? "@{$targetUser->username}"
-                    : ($targetUser->first_name ?? 'بدون نام');
-
-                $price = number_format($payment->price);
-                if ($payment->method == 'cart-be-cart') {
-
-                    $adminUserName = $this->user->username
-                        ? "@{$this->user->username}"
-                        : ($this->user->first_name ?? 'ادمین');
-
-                    $caption = "✅ <b>تمدید تایید شد</b>\n\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                    $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                    $caption .= $remarkLine;
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                    $caption .= "💥 نوع تراکنش: <code>{$paymentType}</code>\n";
-                    $caption .= "🔢 <b>شماره تراکنش:</b> <code>{$payment->id}</code>\n";
-                    $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                    $caption .= "💰 <b>نوع پرداخت:</b> کارت به کارت \n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👨‍💻 <b>تایید شده توسط:</b> {$adminUserName}\n";
-                    $caption .= "📌 <b>وضعیت:</b> موفق\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                } elseif ($payment->method == 'wallet') {
-                    $this->deleteChat();
-                    $caption = "✅ <b>تمدید آی پی</b>\n\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                    $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                    $caption .= $remarkLine;
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                    $caption .= "💥 نوع تراکنش: <code>{$paymentType}</code>\n";
-                    $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                    $caption .= "💰 <b>نوع پرداخت:</b> کیف پول\n";
-                }
-
-
-                if ($this->isPhoto) {
-                    $this->telegramSdk->editCaption([
-                        'chat_id' => $channelId,
-                        'message_id' => $this->messageId,
-                        'caption' => $caption,
-                        'reply_markup' => json_encode(['inline_keyboard' => []]),
-                        'parse_mode' => 'HTML',
-                    ]);
-                } else {
-                    $this->method = $adminMethod;
-                    $this->sendMessage([
-                        'chat_id' => $channelId,
-                        'text' => $caption,
-                        'reply_markup' => json_encode(['inline_keyboard' => []]),
-                        'parse_mode' => 'HTML',
-                    ], 'message');
-                }
+                $this->sendAdminPaymentReceipt($payment, 'approved', $channelId);
             } else {
                 $failure = is_array($result) && ($result['status'] ?? null) === false
                     ? $result : ['status' => false, 'message' => 'Invalid PasarGuard update response'];
@@ -5210,61 +4895,7 @@ $codeText
                 ], 'message');
 
 
-                $targetUserName = $targetUser->username
-                    ? "@{$targetUser->username}"
-                    : ($targetUser->first_name ?? 'بدون نام');
-
-                $price = number_format($payment->price);
-                if ($payment->method == 'cart-be-cart') {
-
-                    $adminUserName = $this->user->username
-                        ? "@{$this->user->username}"
-                        : ($this->user->first_name ?? 'ادمین');
-
-                    $caption = "✅ <b>تمدید تایید شد</b>\n\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                    $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                    $caption .= $remarkLine;
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                    $caption .= "🔢 <b>شماره تراکنش:</b> <code>{$payment->id}</code>\n";
-                    $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                    $caption .= "💰 <b>نوع پرداخت:</b> کارت به کارت \n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👨‍💻 <b>تایید شده توسط:</b> {$adminUserName}\n";
-                    $caption .= "📌 <b>وضعیت:</b> موفق\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                } elseif ($payment->method == 'wallet') {
-
-                    $this->deleteChat();
-                    $caption = "✅ <b>تمدید آی پی</b>\n\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                    $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                    $caption .= $remarkLine;
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                    $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                    $caption .= "💰 <b>نوع پرداخت:</b> کیف پول\n";
-                }
-
-
-                if ($this->isPhoto) {
-                    $this->telegramSdk->editCaption([
-                        'chat_id' => $channelId,
-                        'message_id' => $this->messageId,
-                        'caption' => $caption,
-                        'parse_mode' => 'HTML',
-                    ]);
-                } else {
-                    $this->method = $adminMethod;
-                    $this->sendMessage([
-                        'chat_id' => $channelId,
-                        'text' => $caption,
-                        'parse_mode' => 'HTML',
-                    ], 'message');
-                }
+                $this->sendAdminPaymentReceipt($payment, 'approved', $channelId);
 
             } else {
                 $this->refundPaymentToWallet($payment, $targetUser, 'renew_failed');
@@ -5287,21 +4918,7 @@ $codeText
                     'parse_mode' => 'HTML',
                 ], 'message');
 
-                $caption = "🚨 <b>خطا در پردازش سفارش</b>
-
-❌ تمدید سرویس ناموفق بود و سرویس ایجاد نشد.
-
-📄 شماره تراکنش: <code>{$payment->id}</code>
-💰 مبلغ: <code>{$payment->price}</code>
-
-🔄 مبلغ به کیف پول کاربر بازگردانده شد.
-✅ عملیات بازگشت وجه با موفقیت انجام شد.";
-                $this->method = $adminMethod;
-                return $this->sendMessage([
-                    'chat_id' => $channelId,
-                    'text' => $caption,
-                    'parse_mode' => 'HTML',
-                ], 'message');
+                return $this->sendAdminPaymentReceipt($payment, 'refunded', $channelId);
 
             }
         }
@@ -5552,27 +5169,8 @@ $codeText
             return ['status' => false, 'message' => '❌ مقصد ارسال رسید یافت نشد.'];
         }
         if ($payment->method == 'cart-be-cart') {
-            $remark = $this->escapeHtml($order->remark);
-            $caption = "✅ <b>تراکنش تایید شد</b>\n\n🏷 <b>ریمارک سرویس:</b> <code>{$remark}</code>\n\n⏳ در حال تحویل سفارش به کاربر هستیم...\nلطفاً چند لحظه صبر کنید.";
             $adminMethod = 'edit';
-
-            if ($this->isPhoto) {
-                $this->telegramSdk->editCaption([
-                    'chat_id' => $channelId,
-                    'message_id' => $this->messageId,
-                    'caption' => $caption,
-                    'reply_markup' => $this->retryPaymentKeyboard($payment),
-                    'parse_mode' => 'HTML',
-                ]);
-            } else {
-                $this->method = $adminMethod;
-                $this->sendMessage([
-                    'chat_id' => $channelId,
-                    'text' => $caption,
-                    'reply_markup' => $this->retryPaymentKeyboard($payment),
-                    'parse_mode' => 'HTML',
-                ], 'message');
-            }
+            $this->sendAdminPaymentReceipt($payment, 'processing', $channelId);
         }
         if ($payment->method == 'wallet') {
 
@@ -5655,62 +5253,7 @@ $codeText
                 ], 'message');
 
 
-                $targetUserName = $targetUser->username
-                    ? "@{$targetUser->username}"
-                    : ($targetUser->first_name ?? 'بدون نام');
-
-                $price = number_format($payment->price);
-                if ($payment->method == 'cart-be-cart') {
-
-                    $adminUserName = $this->user->username
-                        ? "@{$this->user->username}"
-                        : ($this->user->first_name ?? 'ادمین');
-
-                    $caption = "✅ <b>خرید حجم تایید شد</b>\n\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                    $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                    $caption .= $remarkLine;
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                    $caption .= "🔢 <b>شماره تراکنش:</b> <code>{$payment->id}</code>\n";
-                    $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                    $caption .= "💰 <b>نوع پرداخت:</b> کارت به کارت \n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👨‍💻 <b>تایید شده توسط:</b> {$adminUserName}\n";
-                    $caption .= "📌 <b>وضعیت:</b> موفق\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                } elseif ($payment->method == 'wallet') {
-
-                    $this->deleteChat();
-                    $caption = "✅ <b>خرید حجم</b>\n\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                    $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                    $caption .= $remarkLine;
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                    $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                    $caption .= "💰 <b>نوع پرداخت:</b> کیف پول\n";
-                }
-
-                if ($this->isPhoto) {
-                    $this->telegramSdk->editCaption([
-                        'chat_id' => $channelId,
-                        'message_id' => $this->messageId,
-                        'caption' => $caption,
-                        'reply_markup' => json_encode(['inline_keyboard' => []]),
-                        'parse_mode' => 'HTML',
-                    ]);
-                } else {
-                    $this->method = $adminMethod;
-                    $this->sendMessage([
-                        'chat_id' => $channelId,
-                        'text' => $caption,
-                        'reply_markup' => json_encode(['inline_keyboard' => []]),
-                        'parse_mode' => 'HTML',
-                    ], 'message');
-                }
+                $this->sendAdminPaymentReceipt($payment, 'approved', $channelId);
             } else {
                 $failure = is_array($result) && ($result['status'] ?? null) === false
                     ? $result : ['status' => false, 'message' => 'Invalid PasarGuard update response'];
@@ -5775,61 +5318,7 @@ $codeText
                     ]),
                 ], 'message');
 
-                $targetUserName = $targetUser->username
-                    ? "@{$targetUser->username}"
-                    : ($targetUser->first_name ?? 'بدون نام');
-
-                $price = number_format($payment->price);
-                if ($payment->method == 'cart-be-cart') {
-
-                    $adminUserName = $this->user->username
-                        ? "@{$this->user->username}"
-                        : ($this->user->first_name ?? 'ادمین');
-
-                    $caption = "✅ <b>خرید حجم تایید شد</b>\n\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                    $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                    $caption .= $remarkLine;
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                    $caption .= "🔢 <b>شماره تراکنش:</b> <code>{$payment->id}</code>\n";
-                    $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                    $caption .= "💰 <b>نوع پرداخت:</b> کارت به کارت \n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👨‍💻 <b>تایید شده توسط:</b> {$adminUserName}\n";
-                    $caption .= "📌 <b>وضعیت:</b> موفق\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                } elseif ($payment->method == 'wallet') {
-
-                    $this->deleteChat();
-                    $caption = "✅ <b>خرید حجم</b>\n\n";
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "👤 <b>کاربر:</b> {$targetUserName}\n";
-                    $caption .= "🆔 <b>شناسه تلگرام:</b> <code>{$targetUser->tel_id}</code>\n";
-                    $caption .= $remarkLine;
-                    $caption .= "━━━━━━━━━━━━━━━\n";
-                    $caption .= "💳 <b>جزئیات پرداخت</b>\n";
-                    $caption .= "💰 <b>مبلغ واریزی:</b> <code>{$price}</code> تومان\n";
-                    $caption .= "💰 <b>نوع پرداخت:</b> کیف پول\n";
-                }
-
-
-                if ($this->isPhoto) {
-                    $this->telegramSdk->editCaption([
-                        'chat_id' => $channelId,
-                        'message_id' => $this->messageId,
-                        'caption' => $caption,
-                        'parse_mode' => 'HTML',
-                    ]);
-                } else {
-                    $this->method = $adminMethod;
-                    $this->sendMessage([
-                        'chat_id' => $channelId,
-                        'text' => $caption,
-                        'parse_mode' => 'HTML',
-                    ], 'message');
-                }
+                $this->sendAdminPaymentReceipt($payment, 'approved', $channelId);
 
             } else {
                 $this->refundPaymentToWallet($payment, $targetUser, 'extra_failed');
@@ -5852,21 +5341,7 @@ $codeText
                     'parse_mode' => 'HTML',
                 ], 'message');
 
-                $caption = "🚨 <b>خطا در پردازش سفارش</b>
-
-❌ خرید حجم ناموفق بود و سرویس ایجاد نشد.
-
-📄 شماره تراکنش: <code>{$payment->id}</code>
-💰 مبلغ: <code>{$payment->price}</code>
-
-🔄 مبلغ به کیف پول کاربر بازگردانده شد.
-✅ عملیات بازگشت وجه با موفقیت انجام شد.";
-                $this->method = $adminMethod;
-                return $this->sendMessage([
-                    'chat_id' => $channelId,
-                    'text' => $caption,
-                    'parse_mode' => 'HTML',
-                ], 'message');
+                return $this->sendAdminPaymentReceipt($payment, 'refunded', $channelId);
 
             }
         }

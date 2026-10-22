@@ -6,6 +6,8 @@ use App\Http\Controllers\Api\TelegramBotController;
 use App\Models\Orders;
 use App\Models\Payment;
 use App\Services\Telegram;
+use App\Services\PaymentReceiptFormatter;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Carbon\Carbon;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Http\Request;
@@ -72,14 +74,14 @@ class PasarGuardReceiptFulfillmentTest extends TestCase
             'method' => 'cart-be-cart', 'price' => 100000, 'detail' => ['plan-id' => 1, 'extra-id' => 1]]);
     }
 
-    private function approve(Payment $payment, bool $photoFailure = false, string $callback = 'adminConfirmCartReceipt', bool $legacy = false, ?int $actor = null, ?int $chatId = null): ReceiptTelegramFake
+    private function approve(Payment $payment, bool $photoFailure = false, string $callback = 'adminConfirmCartReceipt', bool $legacy = false, ?int $actor = null, ?int $chatId = null, bool $photo = true): ReceiptTelegramFake
     {
         $wallet = $callback === 'paymentWallet';
         $controller = new TelegramBotController(Request::create('/api/telegram-webhook', 'POST', [
             'callback_query' => ['id' => 'cb-'.$payment->id, 'from' => ['id' => $actor ?? ($wallet ? 2002 : 1001)],
                 'data' => 'type='.$callback.($wallet ? '|id=' : '|p_id=').$payment->id.($legacy ? '|legacy=1' : ''),
                 'message' => ['message_id' => $chatId ? 777 : 77, 'chat' => ['id' => $chatId ?? ($wallet ? 2002 : -1001234)],
-                    'photo' => [['file_id' => 'receipt']], 'caption' => 'رسید']],
+                    ...($photo ? ['photo' => [['file_id' => 'receipt']], 'caption' => 'رسید'] : ['text' => 'رسید'])]],
         ]));
         $telegram = new ReceiptTelegramFake($photoFailure);
         (new \ReflectionProperty($controller, 'telegramSdk'))->setValue($controller, $telegram);
@@ -458,6 +460,218 @@ class PasarGuardReceiptFulfillmentTest extends TestCase
         $this->assertSame('completed', $payment->fresh()->detail['fulfillment']['status']);
     }
 
+
+    public static function receiptTypes(): array
+    {
+        $cases = [];
+        foreach ([1 => 'خرید جدید ربات', 2 => 'تمدید سرویس ربات', 3 => 'خرید حجم ربات', 4 => 'شارژ کیف پول ربات'] as $type => $label) {
+            foreach ([true, false] as $photo) $cases[$type . ($photo ? '-photo' : '-text')] = [$type, $label, $photo];
+        }
+        return $cases;
+    }
+
+    private function receiptPayment(int $type): Payment
+    {
+        (require database_path('migrations/2026_05_19_100650_create_services_table.php'))->up();
+        (require database_path('migrations/2026_06_20_000000_create_wp_sync_links_table.php'))->up();
+        DB::table('services')->insert(['id' => 1, 'name' => 'آی پی ثابت اشتراکی']);
+        DB::table('plans')->where('id', 1)->update(['name' => 'پلن ده گیگ', 'type' => '1']);
+        DB::table('panels')->where('id', 7)->update(['panel_type' => 1, 'country_id' => 1]);
+        DB::table('countries')->insert(['id' => 1, 'name' => 'آلمان 🇩🇪']);
+        DB::table('users')->where('id', 2)->update(['username' => 'customer']);
+        DB::table('users')->where('id', 1)->update(['username' => 'admin']);
+        DB::table('wp_sync_links')->insert(['user_id' => 2, 'tel_id' => '2002', 'phone' => '+989120000000']);
+        $payment = $this->payment($type);
+        if ($type === 1) {
+            DB::table('pre_orders')->where('id', $payment->order_id)->update(['data' => json_encode([
+                'service-id' => 1, 'country-id' => 1, 'plan-id' => 1, 'pasarguard-id' => 0, 'name' => 'random',
+            ])]);
+        } elseif ($type !== 4) {
+            Orders::whereKey($payment->order_id)->update(['inbound_id' => 1]);
+        } else {
+            $payment->update(['order_id' => 0]);
+        }
+        $payment->update(['detail' => array_merge($payment->detail, [
+            'cart-number' => '1111222233334444', 'cart-name' => 'نام <کارت> &',
+        ])]);
+        DB::table('users')->where('id', 2)->update(['path' => 'sendCartBeCartReceipt',
+            'tel_detail' => json_encode(['payment-id' => $payment->id])]);
+        return $payment;
+    }
+
+    private function submitReceipt(Payment $payment, bool $photo): ReceiptTelegramFake
+    {
+        $controller = new TelegramBotController(Request::create('/api/telegram-webhook', 'POST', [
+            'message' => ['message_id' => 10, 'from' => ['id' => 2002], 'chat' => ['id' => 2002],
+                ...($photo ? ['photo' => [['file_id' => 'receipt']]] : ['text' => 'کد بانکی <123> & 456'])],
+        ]));
+        $telegram = new ReceiptTelegramFake();
+        (new \ReflectionProperty($controller, 'telegramSdk'))->setValue($controller, $telegram);
+        $controller->index();
+        return $telegram;
+    }
+
+    private function adminReceiptText(ReceiptTelegramFake $telegram): string
+    {
+        return implode("\n", array_map(fn ($call) => $call[1]['caption'] ?? $call[1]['text'] ?? '',
+            array_filter($telegram->calls, fn ($call) => ($call[1]['chat_id'] ?? null) == -1001234)));
+    }
+
+    #[DataProvider('receiptTypes')]
+    public function test_receipt_details_survive_initial_processing_and_approval(int $type, string $label, bool $photo): void
+    {
+        $payment = $this->receiptPayment($type);
+        $initial = $this->submitReceipt($payment, $photo);
+        $text = $this->adminReceiptText($initial);
+        $this->assertStringContainsString('وضعیت: ⏳ در انتظار بررسی', $text);
+        $this->assertStringContainsString('نوع: ' . $label, $text);
+        $this->assertStringContainsString('موبایل: +989120000000', $text);
+        $this->assertStringContainsString('نام &lt;کارت&gt; &amp;', $text);
+        if (!$photo) $this->assertStringContainsString('کد بانکی &lt;123&gt; &amp; 456', $text);
+        $this->assertNotEmpty($payment->fresh()->detail['receipt_details']);
+        $this->assertStringContainsString('adminRejectCartReceipt', json_encode($initial->calls));
+        if ($type !== 4) {
+            $this->assertStringContainsString('آی پی ثابت اشتراکی', $text);
+            $this->assertStringContainsString('پلن ده گیگ', $text);
+            $this->assertStringContainsString('آلمان 🇩🇪', $text);
+        }
+        // Later metadata edits must not rewrite the customer's original receipt.
+        DB::table('plans')->update(['name' => 'پلن تغییر یافته']);
+        DB::table('countries')->update(['name' => 'کشور تغییر یافته']);
+        DB::table('services')->update(['name' => 'سرویس تغییر یافته']);
+        Http::fake([
+            '*/api/user' => Http::response(['id' => 99, 'username' => 'delivered-user', 'status' => 'on_hold', 'subscription_url' => '/sub/99']),
+            '*/subscription/links' => Http::response('vless://config'),
+            '*/by-id/42' => Http::sequence()
+                ->push(['id' => 42, 'status' => 'active', 'expire' => now()->addDays(5)->toISOString(), 'data_limit' => 10 * 1073741824])
+                ->push(['id' => 42, 'status' => 'active']),
+        ]);
+        $approved = $this->approve($payment, photo: $photo);
+        $text = $this->adminReceiptText($approved);
+        $this->assertStringContainsString('وضعیت: ✅ تایید شده', $text);
+        $this->assertStringContainsString('نوع: ' . $label, $text);
+        $this->assertStringContainsString('مبلغ: 100,000 تومان', $text);
+        $this->assertStringContainsString('شناسه رسید: <code>#' . $payment->id, $text);
+        $this->assertStringContainsString('تایید شده توسط: @admin', $text);
+        if ($type !== 4) {
+            $this->assertStringContainsString('در حال تحویل سفارش', $text);
+            $this->assertStringContainsString('آی پی ثابت اشتراکی', $text);
+            $this->assertStringContainsString('پلن ده گیگ', $text);
+            $this->assertStringContainsString('آلمان 🇩🇪', $text);
+            $this->assertStringNotContainsString('تغییر یافته', $text);
+            $this->assertStringContainsString($type === 1 ? 'delivered-user' : 'existing-user', $text);
+        } else {
+            $this->assertStringContainsString('موجودی پس از شارژ: 1,100,000 تومان', $text);
+            $this->assertSame(1100000, (int) DB::table('users')->where('id', 2)->value('balance'));
+        }
+        if ($type === 3) $this->assertStringContainsString('حجم خریداری شده: 5 گیگ', $text);
+        $edits = array_values(array_filter($approved->calls, fn ($call) => in_array($call[0], ['editMessageCaption', 'editMessageText'])));
+        $last = end($edits);
+        $this->assertSame($photo ? 'editMessageCaption' : 'editMessageText', $last[0]);
+        $this->assertSame(['inline_keyboard' => []], json_decode($last[1]['reply_markup'], true));
+        $this->assertSame('completed', $payment->fresh()->detail['fulfillment']['status']);
+    }
+
+    #[DataProvider('receiptTypes')]
+    public function test_rejected_receipt_keeps_purchased_selection_and_never_contacts_panel(int $type, string $label, bool $photo): void
+    {
+        $payment = $this->receiptPayment($type);
+        $this->submitReceipt($payment, $photo);
+        DB::table('settings')->where('key', 'cart_be_cart_id')->update(['value' => '-1009999']);
+        $telegram = $this->approve($payment, callback: 'adminRejectCartReceipt', photo: $photo);
+        $text = $this->adminReceiptText($telegram);
+        $this->assertStringContainsString('وضعیت: ❌ رد شده', $text);
+        $this->assertStringContainsString('نوع: ' . $label, $text);
+        $this->assertStringContainsString('رد شده توسط: @admin', $text);
+        $this->assertStringContainsString('100,000 تومان', $text);
+        if ($type !== 4) {
+            $this->assertStringContainsString('پلن ده گیگ', $text);
+            $this->assertStringContainsString('آلمان 🇩🇪', $text);
+        }
+        if ($type === 3) $this->assertStringContainsString('حجم خریداری شده: 5 گیگ', $text);
+        if (!$photo) $this->assertStringContainsString('کد بانکی &lt;123&gt; &amp; 456', $text);
+        $this->assertSame(-1, (int) $payment->fresh()->status);
+        $this->assertSame(1000000, (int) DB::table('users')->where('id', 2)->value('balance'));
+        Http::assertNothingSent();
+    }
+
+    public function test_long_receipts_and_batch_remarks_are_split_without_invalid_html_or_lost_details(): void
+    {
+        $payment = $this->receiptPayment(1);
+        $this->submitReceipt($payment, true);
+        for ($i = 0; $i < 45; $i++) {
+            Orders::create(['user_id' => 2, 'panel_id' => 7, 'remark' => 'customer-service-' . $i, 'uid' => (string) $i,
+                'status' => 'active', 'expire_at' => now()->addDays(30), 'detail' => ['preOrderId' => $payment->order_id]]);
+        }
+        $formatter = app(PaymentReceiptFormatter::class);
+        $parts = $formatter->parts($payment->fresh(), 'approved');
+        $this->assertGreaterThan(1, count($parts));
+        $this->assertStringContainsString('customer-service-44', implode("\n", $parts));
+        foreach ($parts as $part) {
+            $plain = html_entity_decode(strip_tags($part), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            $this->assertLessThanOrEqual(1024, strlen(mb_convert_encoding($plain, 'UTF-16LE', 'UTF-8')) / 2);
+        }
+        $payment->refresh();
+        $payment->detail = array_merge($payment->detail, ['receipt_is_photo' => false,
+            'value' => str_repeat('🧾<>&', 1800) . 'END-RECEIPT']);
+        $parts = array_merge($parts, $formatter->parts($payment, 'rejected', 4096));
+        $this->assertStringContainsString('END-RECEIPT', implode("\n", $parts));
+        foreach ($parts as $part) {
+            $plain = html_entity_decode(strip_tags($part), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            $this->assertLessThanOrEqual(4000, strlen(mb_convert_encoding($plain, 'UTF-16LE', 'UTF-8')) / 2);
+            $this->assertSame(substr_count($part, '<code>'), substr_count($part, '</code>'));
+            $this->assertStringNotContainsString('<>&', $part);
+        }
+    }
+
+    public function test_failed_receipt_and_retry_keep_details_in_original_channel_after_settings_change(): void
+    {
+        $payment = $this->receiptPayment(3);
+        $this->submitReceipt($payment, true);
+        Http::fake(['*/by-id/42' => Http::sequence()
+            ->push(['id' => 42, 'status' => 'active', 'data_limit' => 10 * 1073741824])
+            ->push(['detail' => 'Gateway timeout'], 504)
+            ->push(['id' => 42, 'status' => 'active', 'data_limit' => 15 * 1073741824])]);
+        $failed = $this->approve($payment);
+        $text = $this->adminReceiptText($failed);
+        $this->assertStringContainsString('تحویل نیاز به بررسی دارد', $text);
+        $this->assertStringContainsString('حجم خریداری شده: 5 گیگ', $text);
+        $this->assertStringContainsString('آلمان 🇩🇪', $text);
+        $this->assertStringContainsString('existing-user', $text);
+        $this->assertStringContainsString('Gateway timeout', $text);
+        $this->assertStringContainsString('adminRetryPayment', json_encode($failed->calls));
+        DB::table('settings')->where('key', 'cart_be_cart_id')->update(['value' => '-1009999']);
+        $retry = $this->approve($payment, callback: 'adminRetryPayment', chatId: 1001);
+        $text = $this->adminReceiptText($retry);
+        $this->assertStringContainsString('وضعیت: ✅ تایید شده', $text);
+        $this->assertStringContainsString('حجم خریداری شده: 5 گیگ', $text);
+        foreach ($retry->calls as [$method, $params]) {
+            if ($method === 'editMessageCaption') {
+                $this->assertSame(-1001234, (int) $params['chat_id']);
+                $this->assertSame(77, $params['message_id']);
+            }
+        }
+        $this->assertCount(1, Http::recorded(fn ($r) => $r->method() === 'PUT'));
+        $this->assertSame('completed', $payment->fresh()->detail['fulfillment']['status']);
+    }
+
+    public function test_wallet_purchase_sends_same_detailed_admin_receipt_without_editing_customer_photo(): void
+    {
+        $payment = $this->receiptPayment(2);
+        Http::fake(['*/by-id/42' => Http::sequence()
+            ->push(['id' => 42, 'status' => 'active', 'expire' => now()->addDays(5)->toISOString(), 'data_limit' => 10 * 1073741824])
+            ->push(['id' => 42, 'status' => 'active'])]);
+        $telegram = $this->approve($payment, callback: 'paymentWallet');
+        $text = $this->adminReceiptText($telegram);
+        $this->assertStringContainsString('نوع: تمدید سرویس ربات', $text);
+        $this->assertStringContainsString('روش پرداخت: کیف پول', $text);
+        $this->assertStringContainsString('پلن ده گیگ', $text);
+        $this->assertStringContainsString('آلمان 🇩🇪', $text);
+        $this->assertStringContainsString('وضعیت: ✅ تایید شده', $text);
+        $this->assertEmpty(array_filter($telegram->calls, fn ($call) => $call[0] === 'editMessageCaption'));
+        $this->assertSame(900000, (int) DB::table('users')->where('id', 2)->value('balance'));
+    }
+
 }
 
 class ReceiptTelegramFake extends Telegram
@@ -472,6 +686,11 @@ class ReceiptTelegramFake extends Telegram
         return ['ok' => !($this->photoFailure && $method === 'sendPhoto')
             && !str_contains($params['text'] ?? '', 'قبلاً پردازش')
             && !str_contains($params['text'] ?? '', 'قابل اجرای مجدد'), 'result' => ['message_id' => 77]];
+    }
+
+    public function downloadFileById(string $fileId, string $savePath): array
+    {
+        return ['ok' => true];
     }
 
     public function text(): string
