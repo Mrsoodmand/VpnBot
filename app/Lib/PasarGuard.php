@@ -2,7 +2,9 @@
 
 namespace App\Lib;
 
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Http;
 
 class PasarGuard
 {
@@ -10,6 +12,7 @@ class PasarGuard
     private $url = null;
     private $cacheKey = null;
     private $verifySsl = false;
+    private array $loginData;
 
     public $loginStatus = [
         'status' => false,
@@ -20,6 +23,7 @@ class PasarGuard
     {
         $this->url = rtrim($loginData['url'], '/');
         $this->verifySsl = $loginData['verify_ssl'] ?? false;
+        $this->loginData = $loginData;
 
         $this->cacheKey = "pasarguard-token-{$loginData['id']}";
 
@@ -36,14 +40,19 @@ class PasarGuard
             return;
         }
 
+        $this->login();
+    }
+
+    private function login(): void
+    {
         $result = $this->request([
             'link' => "{$this->url}/api/admin/token",
             'method' => 'POST',
             'endpoint' => 'login',
             'body_type' => 'form',
             'query' => [
-                'username' => $loginData['username'],
-                'password' => $loginData['password'],
+                'username' => $this->loginData['username'],
+                'password' => $this->loginData['password'],
             ],
         ]);
 
@@ -58,14 +67,12 @@ class PasarGuard
             return;
         }
 
-        if (isset($result['detail'])) {
+        if (($result['status'] ?? null) === false || isset($result['detail'])) {
             $this->token = false;
 
             $this->loginStatus = [
                 'status' => false,
-                'message' => is_array($result['detail'])
-                    ? json_encode($result['detail'], JSON_UNESCAPED_UNICODE)
-                    : $result['detail'],
+                'message' => self::errorMessage($result),
             ];
 
             return;
@@ -94,103 +101,83 @@ class PasarGuard
 
     public function request(array $data)
     {
-        $url = $data['link'];
-        $query = $data['query'] ?? [];
         $method = strtoupper($data['method'] ?? 'GET');
-        $endpoint = $data['endpoint'] ?? null;
-        $bodyType = $data['body_type'] ?? 'json';
-        $raw = $data['raw'] ?? false;
+        $isLogin = ($data['endpoint'] ?? null) === 'login';
+        $query = $data['query'] ?? [];
 
-        $headers = [
-            'Accept: application/json',
-        ];
-
-        if ($endpoint !== 'login' && !empty($this->token)) {
-            $headers[] = 'Authorization: Bearer ' . $this->token;
-        }
-
-        if ($method === 'GET' && !empty($query) && is_array($query)) {
-            $url .= '?' . http_build_query($query);
-        }
-
-        $ch = curl_init();
-
-        $options = [
-            CURLOPT_URL => $url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_SSL_VERIFYPEER => $this->verifySsl,
-            CURLOPT_SSL_VERIFYHOST => $this->verifySsl ? 2 : 0,
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_TIMEOUT => 30,
-        ];
-
-        if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'])) {
-            $options[CURLOPT_CUSTOMREQUEST] = $method;
-
-            if ($bodyType === 'form') {
-                $options[CURLOPT_POSTFIELDS] = is_array($query)
-                    ? http_build_query($query)
-                    : $query;
-
-                $options[CURLOPT_HTTPHEADER][] = 'Content-Type: application/x-www-form-urlencoded';
-            } else {
-                $options[CURLOPT_POSTFIELDS] = is_array($query)
-                    ? json_encode($query, JSON_UNESCAPED_UNICODE)
-                    : $query;
-
-                $options[CURLOPT_HTTPHEADER][] = 'Content-Type: application/json';
+        // Only an explicit 401 is safe to replay. Never repeat a timed-out write:
+        // the panel may already have created or updated the user.
+        for ($attempt = 0; $attempt < 2; $attempt++) {
+            $request = Http::acceptJson()->timeout(30)->connectTimeout(10)
+                ->withOptions(['verify' => (bool) $this->verifySsl, 'allow_redirects' => false]);
+            if (!$isLogin && !empty($this->token)) {
+                $request = $request->withToken($this->token);
             }
+            $options = [];
+            if ($method === 'GET') {
+                $options['query'] = $query;
+            } elseif (($data['body_type'] ?? 'json') === 'form') {
+                $request = $request->asForm();
+                $options['form_params'] = $query;
+            } else {
+                $request = $request->withBody(
+                    is_array($query) ? json_encode($query, JSON_UNESCAPED_UNICODE) : $query,
+                    'application/json'
+                );
+            }
+
+            try {
+                $response = $request->send($method, $data['link'], $options);
+            } catch (ConnectionException $exception) {
+                return ['status' => false, 'message' => 'PasarGuard connection failed or timed out'];
+            }
+
+            if ($response->status() === 401 && !$isLogin) {
+                $this->clearTokenCache();
+                if ($attempt === 0) {
+                    $this->login();
+                    if ($this->checkConnection()) {
+                        continue;
+                    }
+                    return ['status' => false, 'http_code' => 401, 'message' => $this->loginStatus['message']];
+                }
+            }
+
+            $decoded = $response->json();
+            if (!$response->successful()) {
+                return [
+                    'status' => false,
+                    'http_code' => $response->status(),
+                    'message' => self::errorMessage(is_array($decoded) ? $decoded : []),
+                ];
+            }
+            if ($data['raw'] ?? false) {
+                return [
+                    'status' => true,
+                    'http_code' => $response->status(),
+                    'content_type' => $response->header('Content-Type'),
+                    'body' => $response->body(),
+                ];
+            }
+            if (!is_array($decoded)) {
+                return ['status' => false, 'http_code' => $response->status(), 'message' => 'Invalid JSON response'];
+            }
+
+            return $decoded;
         }
+    }
 
-        curl_setopt_array($ch, $options);
-
-        $response = curl_exec($ch);
-
-        if ($response === false) {
-            $error = curl_error($ch);
-            curl_close($ch);
-
-            return [
-                'status' => false,
-                'message' => 'cURL Error: ' . $error,
-            ];
+    public static function errorMessage(array $response): string
+    {
+        $message = $response['message'] ?? $response['detail'] ?? 'PasarGuard request failed';
+        if (is_array($message)) {
+            // Validation errors can contain input data. Keep only field names and messages.
+            $message = implode('; ', array_map(static function ($error) {
+                if (!is_array($error)) return is_scalar($error) ? (string) $error : 'Invalid value';
+                return implode('.', (array) ($error['loc'] ?? [])) . ': ' . ($error['msg'] ?? 'Invalid value');
+            }, $message));
         }
-
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $contentType = curl_getinfo($ch, CURLINFO_CONTENT_TYPE);
-
-        curl_close($ch);
-
-        if ($raw) {
-            return [
-                'status' => $httpCode >= 200 && $httpCode < 300,
-                'http_code' => $httpCode,
-                'content_type' => $contentType,
-                'body' => $response,
-            ];
-        }
-
-        $decoded = json_decode($response, true);
-
-        if ($decoded === null && json_last_error() !== JSON_ERROR_NONE) {
-            return [
-                'status' => false,
-                'http_code' => $httpCode,
-                'message' => 'Invalid JSON response',
-                'raw' => $response,
-            ];
-        }
-
-        if ($httpCode >= 400) {
-            return [
-                'status' => false,
-                'http_code' => $httpCode,
-                'message' => $decoded['detail'] ?? 'Request failed',
-                'response' => $decoded,
-            ];
-        }
-
-        return $decoded;
+        return mb_substr((string) $message, 0, 500);
     }
 
     /* Connection */
@@ -497,14 +484,16 @@ class PasarGuard
             'status' => $params['status'] ?? 'active',
             'data_limit' => $params['data_limit'] ?? $dataLimit,
             'data_limit_reset_strategy' => $params['data_limit_reset_strategy'] ?? 'no_reset',
-            'group_ids' => $groupId,
+            'group_ids' => array_values(array_map('intval', (array) $groupId)),
+            'proxy_settings' => (object) [],
             'auto_delete_in_days' => $params['auto_delete_in_days'] ?? 7,
         ];
 
-        if ($params['status'] == 'on_hold') {
-            $createParams['on_hold_expire_duration'] = $params['on_hold_expire_duration'] ?? now()->addDays($days)->utc()->toISOString();
+        if ($createParams['status'] === 'on_hold') {
+            $createParams['expire'] = 0;
+            $createParams['on_hold_expire_duration'] = (int) ($params['on_hold_expire_duration'] ?? ($days * 86400));
             $createParams['on_hold_timeout'] = $params['on_hold_timeout'] ?? 0;
-        }else{
+        } else {
             $createParams['expire'] = $params['expire'] ?? now()->addDays($days)->utc()->toISOString();
         }
 
@@ -530,11 +519,13 @@ class PasarGuard
             return [
                 'status' => false,
                 'message' => $user['message'] ?? 'User creation failed',
+                'http_code' => $user['http_code'] ?? null,
                 'response' => $user,
             ];
         }
 
-        $userId = $user['id'] ?? $user['user']['id'] ?? null;
+        $user = $user['user'] ?? $user;
+        $userId = $user['id'] ?? null;
 
         if (empty($userId)) {
             return [
@@ -544,9 +535,17 @@ class PasarGuard
             ];
         }
 
+        return $this->configForCreatedUser($user, $clientType);
+    }
+
+    public function configForCreatedUser(array $user, string $clientType = 'links'): array
+    {
+        $userId = $user['id'];
         $config = $this->getUserConfig($userId, $clientType);
 
-        if (!is_array($config) || empty($config['status'])) {
+        $subscriptionUrl = $user['subscription_url'] ?? null;
+        $configBody = is_array($config) && !empty($config['status']) ? trim((string) ($config['body'] ?? '')) : '';
+        if ($configBody === '' && empty($subscriptionUrl)) {
             return [
                 'status' => false,
                 'message' => 'Config generation failed',
@@ -560,8 +559,8 @@ class PasarGuard
             'user' => $user,
             'user_id' => $userId,
             'config_type' => $clientType,
-            'config' => $config['body'],
-            'subscription_url' => $user['subscription_url'] ?? $user['user']['subscription_url'] ?? null,
+            'config' => $configBody,
+            'subscription_url' => $subscriptionUrl,
         ];
     }
 }

@@ -23,12 +23,14 @@ use App\Models\TelegramData;
 use App\Models\User;
 use App\Services\OrderCountryResolver;
 use App\Services\OrderLifecycleService;
+use App\Services\PasarGuardPaymentService;
 use App\Services\Telegram;
 use App\Services\WpSyncService;
 use App\Services\CustomerLoyaltyService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
@@ -511,6 +513,10 @@ class TelegramBotController extends Controller
             case "adminRejectCartReceipt":
                 return $this->adminRejectCartReceipt($type);
                 break;
+            case 'adminRetryPayment':
+                return $this->adminRetryPayment($type);
+            case 'adminUserPayments':
+                return $this->adminUserPayments($type);
             case "adminConfirmCartReceipt":
                 return $this->adminConfirmCartReceipt($type);
                 break;
@@ -1181,6 +1187,13 @@ class TelegramBotController extends Controller
             if ($payment->expired_at) {
                 $text .= "⌛ انقضای پرداخت: <code>{$payment->expired_at->format('Y-m-d H:i')}</code>\n";
             }
+            if (!empty($detail['fulfillment']['status'])) {
+                $stateLabel = match ($detail['fulfillment']['status']) {
+                    'completed' => 'تکمیل شد', 'processing' => 'در حال پردازش', 'refunded' => 'برگشت وجه',
+                    default => 'نیاز به پیگیری / تلاش مجدد',
+                };
+                $text .= "📦 تحویل: {$stateLabel}\n";
+            }
             $text .= "🕒 ایجاد: <code>{$createdAt}</code> | بروزرسانی: <code>{$updatedAt}</code>\n";
         } else {
             $text .= "🕒 تاریخ: <code>{$createdAt}</code>\n";
@@ -1201,6 +1214,16 @@ class TelegramBotController extends Controller
         }
 
         $keyboard = [];
+        if ($admin) {
+            foreach ($payments as $payment) {
+                if ($this->canRetryPayment($payment)) {
+                    $keyboard[] = [[
+                        'text' => "🔄 پیگیری / تحویل مجدد #{$payment->id}",
+                        'callback_data' => "type=adminRetryPayment|p_id={$payment->id}",
+                    ]];
+                }
+            }
+        }
         $pagination = $this->paginationFooterButton($payments, $payments->currentPage(), $callback);
         if (!empty($pagination)) {
             $keyboard[] = $pagination;
@@ -3098,6 +3121,10 @@ class TelegramBotController extends Controller
             return $this->sendTemporaryMessage('تراکنش یافت نشد');
         }
 
+        if ((string) $payment->status === '1' && $this->canRetryPayment($payment)) {
+            return $this->adminRetryPayment(['p_id' => $payment->id]);
+        }
+
         if ((int) $payment->type === 2) {
             $order = Orders::botManaged()->where('id', $payment->order_id)
                 ->where('user_id', $payment->user_id)
@@ -3203,22 +3230,204 @@ class TelegramBotController extends Controller
         return $this->finalPaymentStep($walletResult['payment']);
     }
 
+    private function canRetryPayment(Payment $payment): bool
+    {
+        return (string) $payment->status === '1'
+            && in_array((string) $payment->type, ['1', '2', '3'], true)
+            && in_array($payment->method, ['cart-be-cart', 'wallet'], true)
+            && ($payment->detail['fulfillment']['status'] ?? '') !== 'completed';
+    }
+
+    private function retryPaymentKeyboard(Payment $payment): string
+    {
+        return json_encode(['inline_keyboard' => $this->canRetryPayment($payment) ? [[[
+            'text' => '🔄 تلاش مجدد برای تحویل',
+            'callback_data' => "type=adminRetryPayment|p_id={$payment->id}",
+        ]]] : []]);
+    }
+
+    protected function adminRetryPayment($data)
+    {
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        $payment = Payment::find($data['p_id'] ?? null);
+        if (!$payment || !$this->canRetryPayment($payment)) {
+            return $this->sendTemporaryMessage('این تراکنش قابل اجرای مجدد نیست؛ ممکن است تکمیل یا برگشت داده شده باشد.');
+        }
+        if ((int) $payment->type === 1) {
+            $preOrder = PreOrder::find($payment->order_id);
+            $panelId = $preOrder?->data['pasarguard-id'] ?? 0;
+            if (!$panelId && $preOrder) {
+                $panelId = Inbounds::where('country_id', $preOrder->data['country-id'] ?? 0)->where('status', 1)->value('panel_id');
+            }
+        } else {
+            $panelId = Orders::botManaged()->where('id', $payment->order_id)->where('user_id', $payment->user_id)->value('panel_id');
+        }
+        if (!$panelId || Panels::whereKey($panelId)->value('system_type') !== 'pasarguard') {
+            return $this->sendTemporaryMessage('این گزینه برای سفارش‌های پاسارگارد است؛ اطلاعات پنل سفارش بررسی شود.');
+        }
+
+        // Old attempts have no saved target, so their remote outcome cannot be inferred safely.
+        if (empty($payment->detail['fulfillment']['version']) && empty($data['legacy'])) {
+            $text = "⚠️ تراکنش قدیمی #{$payment->id}\nاطلاعات تلاش قبلی ذخیره نشده است. ابتدا در پنل بررسی کنید که سرویس ساخته نشده یا تمدید/حجم اعمال نشده باشد.\nپس از بررسی، دکمهٔ زیر فقط عملیات باقی‌مانده را اجرا می‌کند؛ مبلغ دوباره کسر نمی‌شود.";
+            $params = ['chat_id' => $this->chatId, 'message_id' => $this->messageId,
+                'reply_markup' => json_encode(['inline_keyboard' => [[[
+                    'text' => 'پنل را بررسی کردم؛ تلاش مجدد',
+                    'callback_data' => "type=adminRetryPayment|p_id={$payment->id}|legacy=1",
+                ]]]])];
+            return $this->isPhoto
+                ? $this->telegramSdk->editCaption($params + ['caption' => $text])
+                : $this->telegramSdk->editMessage($params + ['text' => $text]);
+        }
+
+        // A retry from the user's transaction list must not edit an unrelated channel message.
+        if ($payment->method === 'cart-be-cart') {
+            $receipt = $payment->detail['fulfillment']['receipt'] ?? null;
+            $channelId = Setting::where('key', 'cart_be_cart_id')->value('value') ?: User::where('is_admin', 1)->value('tel_id');
+            if ($receipt && (string) $receipt['chat_id'] === (string) $channelId) {
+                $this->messageId = $receipt['message_id'];
+                $this->isPhoto = $receipt['is_photo'];
+            } elseif ((string) $this->chatId !== (string) $channelId) {
+                $notice = $this->telegramSdk->sendMessage(['chat_id' => $channelId, 'text' => "⏳ تلاش مجدد برای تراکنش #{$payment->id}"]);
+                if (empty($notice['ok'])) return $this->sendTemporaryMessage('ارسال پیام پیگیری به ادمین ناموفق بود.');
+                $this->messageId = $notice['result']['message_id'];
+                $this->isPhoto = false;
+            }
+        }
+        return $this->finalPaymentStep($payment);
+    }
+
     protected function finalPaymentStep($payment)
     {
-        switch ($payment->type) {
-            case "1":
-                return $this->submitOrder($payment->id, 'toUser');
-                break;
-            case "2":
-                return $this->clientFinalRenew(['id' => $payment->id]);
-                break;
-            case "3":
-                return $this->clientFinalExtra(['id' => $payment->id]);
-                break;
-            case "4":
-                return $this->addFundFinal(['id' => $payment->id]);
-                break;
+        $lock = Cache::lock('bot-payment-fulfillment-'.$payment->id, 600);
+        if (!$lock->get()) {
+            return $this->telegramSdk->answerCallback(['callback_query_id' => $this->callbackId,
+                'text' => 'این سفارش در حال پردازش است؛ کمی بعد دوباره بررسی کنید.', 'show_alert' => true]);
         }
+        try {
+            $payment->refresh();
+            if ((string) $payment->status !== '1' || ($payment->detail['fulfillment']['status'] ?? '') === 'completed') return;
+            $detail = $payment->detail ?? [];
+            $state = $detail['fulfillment'] ?? [];
+            $state['version'] = 1;
+            $state['status'] = 'processing';
+            $state['attempts'] = (int) ($state['attempts'] ?? 0) + 1;
+            $state['started_at'] = now()->toIso8601String();
+            if ($payment->method === 'cart-be-cart') {
+                $state['receipt'] = [
+                    'chat_id' => Setting::where('key', 'cart_be_cart_id')->value('value') ?: $this->chatId,
+                    'message_id' => $this->messageId, 'is_photo' => $this->isPhoto,
+                ];
+            }
+            $detail['fulfillment'] = $state;
+            $payment->detail = $detail;
+            $payment->save();
+            $result = $this->executePaymentFulfillment($payment);
+            if (!is_array($result) || ($result['status'] ?? null) !== false) {
+                $payment->refresh();
+                $detail = $payment->detail ?? [];
+                $detail['fulfillment']['status'] = (int) $payment->status === -2 ? 'refunded' : 'completed';
+                $detail['fulfillment']['completed_at'] = now()->toIso8601String();
+                $payment->detail = $detail;
+                $payment->save();
+            }
+            return $result;
+        } finally {
+            $lock->release();
+        }
+    }
+
+    private function executePaymentFulfillment($payment)
+    {
+        try {
+            $result = match ((string) $payment->type) {
+                '1' => $this->submitOrder($payment->id),
+                '2' => $this->clientFinalRenew(['id' => $payment->id]),
+                '3' => $this->clientFinalExtra(['id' => $payment->id]),
+                '4' => $this->addFundFinal(['id' => $payment->id]),
+                default => ['status' => false, 'message' => 'Unknown payment type'],
+            };
+        } catch (\Throwable $exception) {
+            Log::error('Bot payment fulfillment exception', [
+                'payment_id' => $payment->id,
+                'exception' => get_class($exception),
+                'file' => basename($exception->getFile()),
+                'line' => $exception->getLine(),
+            ]);
+            $result = ['status' => false, 'message' => 'Unexpected fulfillment error; check application log'];
+        }
+
+        if (is_array($result) && ($result['status'] ?? null) === false) {
+            return $this->reportFulfillmentFailure($payment, $result);
+        }
+
+        return $result;
+    }
+
+    private function reportFulfillmentFailure(Payment $payment, array $failure)
+    {
+        // A failed response is not proof that a remote write failed. Keep the
+        // approved payment and require reconciliation, rather than double-crediting it.
+        $payment->refresh();
+        if (!empty($failure['refund_safe'])) {
+            $targetUser = User::find($payment->user_id);
+            if ($targetUser) {
+                $this->refundPaymentToWallet($payment, $targetUser, (int) $payment->type === 2 ? 'renew_failed' : 'extra_failed');
+                $payment->refresh();
+            }
+        }
+        $refunded = (int) $payment->status === -2;
+        $detail = is_array($payment->detail) ? $payment->detail : [];
+        $error = PasarGuard::errorMessage($failure);
+        $detail['fulfillment'] = array_merge($detail['fulfillment'] ?? [], [
+            'status' => $refunded ? 'refunded' : 'needs_review',
+            'failed_at' => now()->toIso8601String(),
+            'http_code' => $failure['http_code'] ?? $failure['response']['http_code'] ?? null,
+            'remote_user_id' => $failure['user']['id'] ?? null,
+            'message' => $error,
+        ]);
+        $payment->detail = $detail;
+        $payment->save();
+        Log::warning('Bot payment fulfillment needs review', [
+            'payment_id' => $payment->id,
+            'type' => $payment->type,
+            'http_code' => $failure['http_code'] ?? null,
+            'message' => $error,
+        ]);
+
+        $channelId = Setting::where('key', 'cart_be_cart_id')->value('value')
+            ?: User::where('is_admin', 1)->value('tel_id');
+        $caption = $refunded
+            ? "❌ <b>عملیات انجام نشد؛ مبلغ به کیف پول برگشت</b>\n\n"
+            : "⚠️ <b>پرداخت تأیید شد؛ تکمیل سفارش نیاز به بررسی دارد</b>\n\n";
+        $caption .= "شماره تراکنش: <code>{$payment->id}</code>\n";
+        if (!$refunded) $caption .= "عملیات کامل نشده یا نتیجهٔ پنل قطعی نیست. قبل از اجرای مجدد، وضعیت سرویس در پنل بررسی شود.\n";
+        $caption .= "خطا: <code>" . $this->escapeHtml($error) . "</code>";
+        if (!empty($failure['http_code'])) $caption .= "\nHTTP: " . (int) $failure['http_code'];
+        if ($channelId) {
+            $params = ['chat_id' => $channelId, 'parse_mode' => 'HTML',
+                'reply_markup' => $this->retryPaymentKeyboard($payment)];
+            if ($payment->method === 'cart-be-cart') {
+                $params['message_id'] = $this->messageId;
+                $notice = $this->isPhoto
+                    ? $this->telegramSdk->editCaption($params + ['caption' => $caption])
+                    : $this->telegramSdk->editMessage($params + ['text' => $caption]);
+            }
+            if (empty($notice['ok'])) {
+                $this->telegramSdk->sendMessage(['chat_id' => $channelId, 'text' => $caption, 'parse_mode' => 'HTML',
+                    'reply_markup' => $this->retryPaymentKeyboard($payment)]);
+            }
+        }
+        $telId = User::whereKey($payment->user_id)->value('tel_id');
+        if ($telId) {
+            $this->telegramSdk->sendMessage([
+                'chat_id' => $telId,
+                'text' => $refunded
+                    ? "❌ عملیات انجام نشد و مبلغ {$payment->price} تومان به کیف پول شما بازگردانده شد.\nشماره تراکنش: {$payment->id}"
+                    : "⚠️ پرداخت شما ثبت شده، اما تکمیل سفارش نیاز به بررسی پشتیبانی دارد.\nشماره تراکنش: {$payment->id}\nلطفاً دوباره پرداخت نکنید.",
+            ]);
+        }
+
+        return ['status' => false, 'payment_id' => $payment->id];
     }
 
     private function submitOrder($payment)
@@ -3236,7 +3445,7 @@ class TelegramBotController extends Controller
             : optional(User::where('is_admin', 1)->first())->tel_id;
 
         if (!$channelId) {
-            return $this->sendTemporaryMessage('❌ مقصد ارسال رسید یافت نشد.');
+            return ['status' => false, 'message' => '❌ مقصد ارسال رسید یافت نشد.'];
         }
 
         if ($payment->method == 'cart-be-cart') {
@@ -3247,6 +3456,7 @@ class TelegramBotController extends Controller
                     'chat_id' => $channelId,
                     'message_id' => $this->messageId,
                     'caption' => $caption,
+                    'reply_markup' => $this->retryPaymentKeyboard($payment),
                     'parse_mode' => 'HTML',
                 ]);
             } else {
@@ -3254,6 +3464,7 @@ class TelegramBotController extends Controller
                 $this->sendMessage([
                     'chat_id' => $channelId,
                     'text' => $caption,
+                    'reply_markup' => $this->retryPaymentKeyboard($payment),
                     'parse_mode' => 'HTML',
                 ], 'message');
             }
@@ -3329,6 +3540,15 @@ class TelegramBotController extends Controller
         return $this->generateAccount($data);
     }
 
+    private function pasarGuardDeliveryOrder(Orders $order, Panels $panel): array
+    {
+        $sub = (string) $order->sub_id;
+        if ($sub !== '' && !preg_match('#^https?://#i', $sub)) {
+            $sub = rtrim($panel->sub_address ?: $panel->url, '/') . '/' . ltrim($sub, '/');
+        }
+        return ['order-id' => $order->id, 'code' => $order->detail['code'] ?? '', 'sub' => $sub, 'remark' => $order->remark];
+    }
+
     private function generateAccount($data)
     {
         $panel = $data['panel'];
@@ -3359,7 +3579,7 @@ class TelegramBotController extends Controller
                     ->where('status', 1)
                     ->pluck('inbound_id')
                     ->toArray();
-                $inboundId = $activeGroup[0];
+                $inboundId = $activeGroup[0] ?? 0;
             }
 
             $pasarGuard = new PasarGuard([
@@ -3376,16 +3596,21 @@ class TelegramBotController extends Controller
                 ];
             }
 
-            $leftCount = (int)$preOrder->count_left;
-
-            $successCount = 0;
-            $orders = [];
+            $existingOrders = Orders::where('user_id', $payment->user_id)
+                ->where('detail->preOrderId', $preOrder->id)->orderBy('id')->get();
+            $leftCount = max(0, (int) $preOrder->count - $existingOrders->count());
+            $preOrder->update(['count_left' => $leftCount, 'status' => $leftCount === 0 ? 1 : 0]);
+            $orders = $existingOrders->map(fn ($order) => $this->pasarGuardDeliveryOrder($order, $panel))->all();
+            $failure = null;
 
             for ($i = 0; $i < $leftCount; $i++) {
 
                 $remarkBase = $orderDetail['name'] !== 'random' ? $orderDetail['name'] : "{$targetUser->tel_id}";
 
-                $remark = $remarkBase . '-' . rand(1111, 9999);
+                $item = $existingOrders->count() + $i + 1;
+                $suffix = '_p'.$payment->id.'i'.$item;
+                $prefix = trim(preg_replace('/[^a-zA-Z0-9]+/', '-', $remarkBase), '-');
+                $remark = substr($prefix ?: (string) $targetUser->tel_id, 0, 128 - strlen($suffix)) . $suffix;
 
                 $bandwidth = (int)$plan->bandwidth;
 
@@ -3394,7 +3619,7 @@ class TelegramBotController extends Controller
                 }
 
 
-                $result = $pasarGuard->createUserAndGetConfig([
+                $result = app(PasarGuardPaymentService::class)->createAccount($pasarGuard, $payment, $item, [
                     'username' => $remark,
                     'group_id' => $activeGroup,
                     'days' => (int)$plan->days,
@@ -3405,19 +3630,20 @@ class TelegramBotController extends Controller
                     "on_hold_timeout" => 0,
                     'on_hold_expire_duration' => (int)$plan->days * 24 * 60 * 60,
                     'auto_delete_in_days' => 7
-                ]);
+                ], (int) $panel->id);
 
                 if (!$result['status']) {
-                    return $result;
+                    $failure = $result;
+                    break;
                 }
 
                 $config = $result['config'];
 
                 $Order = Orders::create([
                     'user_id' => $payment->user_id,
-                    'remark' => $remark,
-                    'uid' => $result['user']['id'],
-                    'sub_id' => $result['user']['subscription_url'],
+                    'remark' => $result['user']['username'] ?? $payment->fresh()->detail['fulfillment_operations']['create_'.$item]['params']['username'] ?? $remark,
+                    'uid' => $result['user_id'],
+                    'sub_id' => $result['subscription_url'] ?? '',
                     'plan' => $plan->id,
                     'panel_id' => $panel->id,
                     'inbound_id' => $inboundId,
@@ -3432,22 +3658,14 @@ class TelegramBotController extends Controller
                     ],
                 ]);
 
-                $orders[] = [
-                    'order-id' => $Order->id,
-                    'code' => $config,
-                    'sub' => "{$panel->sub_address}{$Order->sub_id}",
-                    'remark' => $Order->remark,
-                ];
-                $successCount++;
+                // Save each completed item before the next API request in a bulk order.
+                $remaining = max(0, (int) $preOrder->count_left - 1);
+                $preOrder->update(['count_left' => $remaining, 'status' => $remaining === 0 ? 1 : 0]);
+                $orders[] = $this->pasarGuardDeliveryOrder($Order, $panel);
             }
 
-            $preOrder->update([
-                'status' => $successCount == $preOrder->count ? 1 : 0,
-                'count_left' => max(0, $preOrder->count_left - $successCount),
-            ]);
-
             foreach ($orders as $singleOrder) {
-                if (array_key_exists('pasarguard-id', $orderDetail) && $orderDetail['pasarguard-id'] != 0) {
+                if ($singleOrder['code'] === '' || (!empty($orderDetail['pasarguard-id']) && $singleOrder['sub'] !== '')) {
                     $code = $singleOrder['sub'];
                     $codeText = "";
                 } else {
@@ -3456,7 +3674,7 @@ class TelegramBotController extends Controller
 <code>{$singleOrder['code']}</code>";
                 }
                 $photo = "https://api.qrserver.com/v1/create-qr-code/?size=500x500&data=" . urlencode($code);
-                $this->telegramSdk->sendPhoto([
+                $photoParams = [
                     'chat_id' => $targetUser->tel_id,
                     'photo' => $photo,
                     'caption' => "
@@ -3479,8 +3697,19 @@ $codeText
                             ]
                         ]
                     ]),
-                ]);
+                ];
+                $delivery = $this->telegramSdk->sendPhoto($photoParams);
+                if (empty($delivery['ok'])) {
+                    $textParams = $photoParams;
+                    $textParams['text'] = $textParams['caption'];
+                    unset($textParams['photo'], $textParams['caption']);
+                    $delivery = $this->telegramSdk->sendMessage($textParams);
+                }
+                if (empty($delivery['ok'])) {
+                    $failure ??= ['status' => false, 'message' => 'Service saved, but Telegram delivery failed'];
+                }
             }
+            if ($failure !== null) return $failure;
 
             $remarks = collect($orders)
                 ->pluck('remark')
@@ -3536,6 +3765,7 @@ $codeText
                     'chat_id' => $channelId,
                     'message_id' => $this->messageId,
                     'caption' => $caption,
+                    'reply_markup' => json_encode(['inline_keyboard' => []]),
                     'parse_mode' => 'HTML',
                 ]);
             } else {
@@ -3543,6 +3773,7 @@ $codeText
                 $this->sendMessage([
                     'chat_id' => $channelId,
                     'text' => $caption,
+                    'reply_markup' => json_encode(['inline_keyboard' => []]),
                     'parse_mode' => 'HTML',
                 ], 'message');
             }
@@ -4214,6 +4445,16 @@ $codeText
         );
     }
 
+    protected function adminUserPayments($data)
+    {
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        $userId = (int) ($data['id'] ?? 0);
+        $payments = Payment::where('user_id', $userId)->orderByDesc('id')
+            ->paginate(5, ['*'], 'page', max(1, (int) ($data['page'] ?? 1)));
+        return $this->sendTransactionsPage($payments, '📋 همه تراکنش‌ها و پیگیری تحویل',
+            "adminUserPayments|id={$userId}", "type=adminUserDetail|id={$userId}", true);
+    }
+
     protected function adminWalletTransactions($data)
     {
         if (!$this->isAdmin) {
@@ -4688,19 +4929,19 @@ $codeText
     {
         $payment = Payment::find($data['id'] ?? null);
         if (!$payment || (int) $payment->type !== 2) {
-            return $this->sendTemporaryMessage('تراکنش مورد نظر یافت نشد.');
+            return ['status' => false, 'message' => 'تراکنش مورد نظر یافت نشد.'];
         }
 
         $targetUser = User::find($payment->user_id);
         if (!$targetUser) {
-            return $this->sendTemporaryMessage('کاربر مربوط به تراکنش یافت نشد.');
+            return ['status' => false, 'message' => 'کاربر مربوط به تراکنش یافت نشد.'];
         }
 
         $order = Orders::botManaged()->where('id', $payment->order_id)
             ->where('user_id', $payment->user_id)
             ->first();
         if (!$order || !app(OrderLifecycleService::class)->canRenew($order)) {
-            return $this->sendTemporaryMessage('❌ مهلت ۷ روزه تمدید این سفارش به پایان رسیده است.');
+            return ['status' => false, 'message' => '❌ مهلت ۷ روزه تمدید این سفارش به پایان رسیده است.'];
         }
 
         $adminMethod = 'toUser';
@@ -4712,7 +4953,7 @@ $codeText
             : optional(User::where('is_admin', 1)->first())->tel_id;
 
         if (!$channelId) {
-            return $this->sendTemporaryMessage('❌ مقصد ارسال رسید یافت نشد.');
+            return ['status' => false, 'message' => '❌ مقصد ارسال رسید یافت نشد.'];
         }
         if ($payment->method == 'cart-be-cart') {
             $remark = $this->escapeHtml($order->remark);
@@ -4723,6 +4964,7 @@ $codeText
                     'chat_id' => $channelId,
                     'message_id' => $this->messageId,
                     'caption' => $caption,
+                    'reply_markup' => $this->retryPaymentKeyboard($payment),
                     'parse_mode' => 'HTML',
                 ]);
             } else {
@@ -4730,6 +4972,7 @@ $codeText
                 $this->sendMessage([
                     'chat_id' => $channelId,
                     'text' => $caption,
+                    'reply_markup' => $this->retryPaymentKeyboard($payment),
                     'parse_mode' => 'HTML',
                 ], 'message');
             }
@@ -4752,7 +4995,7 @@ $codeText
         $panel = Panels::find($order->panel_id);
 
         if (!$targetUser || !$plan || !$panel) {
-            return $this->sendTemporaryMessage('اطلاعات لازم برای تمدید کامل نیست.');
+            return ['status' => false, 'message' => 'اطلاعات لازم برای تمدید کامل نیست.'];
         }
 
         return $this->renewClient($panel, $order, $plan, $targetUser, $payment, $adminMethod, $channelId);
@@ -4779,27 +5022,30 @@ $codeText
                 ];
             }
             $result = $pasarGuard->getUserById($order->uid);
+            if (!is_array($result) || ($result['status'] ?? null) === false
+                || empty($result['id']) || !array_key_exists('expire', $result) || !is_numeric($result['data_limit'] ?? null)) {
+                return is_array($result) && ($result['status'] ?? null) === false
+                    ? $result : ['status' => false, 'message' => 'Invalid PasarGuard user response'];
+            }
 
-            $currentExpire = is_array($result) && !empty($result['expire'])
+            $currentExpire = !empty($result['expire'])
                 ? Carbon::parse($result['expire'])
                 : Carbon::parse($order->expire_at);
             $renewalBase = $currentExpire->isFuture() ? $currentExpire : now();
-            $expire = $renewalBase->copy()->addDays((int) $plan->days)->format('Y-m-d H:i:s');
+            $expire = $renewalBase->copy()->addDays((int) $plan->days)->timezone(config('app.timezone'));
             $band = gbToByte($plan->bandwidth);
 
             $data = [
                 'status' => 'active',
-                'expire' => $expire,
-                'data_limit' => (is_array($result) && is_numeric($result['data_limit'] ?? null)
-                    ? (float) $result['data_limit']
-                    : 0) + $band,
+                'expire' => $expire->copy()->utc()->toISOString(),
+                'data_limit' => (int) $result['data_limit'] + $band,
             ];
 
-            $result = $pasarGuard->updateUserById($order->uid, $data);
+            $result = app(PasarGuardPaymentService::class)->updateAccount($pasarGuard, $payment, (string) $order->uid, $result, $data, (int) $panel->id);
 
-            if (is_array($result) && ($result['status'] ?? true) !== false) {
+            if (is_array($result) && !empty($result['id']) && ($result['status'] ?? false) !== false) {
 
-                $order->expire_at = $expire;
+                $order->expire_at = Carbon::parse($result['expire'] ?? $result['_applied_params']['expire'] ?? $expire)->timezone(config('app.timezone'));
                 $order->status = Orders::STATUS_ACTIVE;
                 $order->reminded = 0;
                 $orderDetail = is_array($order->detail) ? $order->detail : [];
@@ -4875,6 +5121,7 @@ $codeText
                         'chat_id' => $channelId,
                         'message_id' => $this->messageId,
                         'caption' => $caption,
+                        'reply_markup' => json_encode(['inline_keyboard' => []]),
                         'parse_mode' => 'HTML',
                     ]);
                 } else {
@@ -4882,47 +5129,14 @@ $codeText
                     $this->sendMessage([
                         'chat_id' => $channelId,
                         'text' => $caption,
+                        'reply_markup' => json_encode(['inline_keyboard' => []]),
                         'parse_mode' => 'HTML',
                     ], 'message');
                 }
             } else {
-
-                $this->refundPaymentToWallet($payment, $targetUser, 'renew_failed');
-
-                $caption = "❌ <b>تمدید سرویس ناموفق بود</b>
-
-متاسفانه عملیات تمدید سرویس شما با خطا مواجه شد.
-
-💰 مبلغ پرداختی شما به کیف پول بازگردانده شد.
-
-📄 <b>شماره تراکنش:</b> <code>{$payment->id}</code>
-💳 <b>مبلغ بازگشتی:</b> <code>{$payment->price}</code>
-
-✅ موجودی کیف پول شما با موفقیت شارژ شد.";
-
-                $this->method = 'toUser';
-                $this->sendMessage([
-                    'chat_id' => $targetUser->tel_id,
-                    'text' => $caption,
-                    'parse_mode' => 'HTML',
-                ], 'message');
-
-                $caption = "🚨 <b>خطا در پردازش سفارش</b>
-
-❌ تمدید سرویس ناموفق بود و سرویس ایجاد نشد.
-
-📄 شماره تراکنش: <code>{$payment->id}</code>
-💰 مبلغ: <code>{$payment->price}</code>
-
-🔄 مبلغ به کیف پول کاربر بازگردانده شد.
-✅ عملیات بازگشت وجه با موفقیت انجام شد.";
-                $this->method = $adminMethod;
-                return $this->sendMessage([
-                    'chat_id' => $channelId,
-                    'text' => $caption,
-                    'parse_mode' => 'HTML',
-                ], 'message');
-
+                $failure = is_array($result) && ($result['status'] ?? null) === false
+                    ? $result : ['status' => false, 'message' => 'Invalid PasarGuard update response'];
+                return $failure;
             }
         } else {
             $loginData = [
@@ -5312,18 +5526,18 @@ $codeText
 
         $payment = Payment::find($data['id'] ?? null);
         if (!$payment || (int) $payment->type !== 3) {
-            return $this->sendTemporaryMessage('تراکنش مورد نظر یافت نشد.');
+            return ['status' => false, 'message' => 'تراکنش مورد نظر یافت نشد.'];
         }
         $targetUser = User::find($payment->user_id);
         if (!$targetUser) {
-            return $this->sendTemporaryMessage('کاربر مربوط به تراکنش یافت نشد.');
+            return ['status' => false, 'message' => 'کاربر مربوط به تراکنش یافت نشد.'];
         }
 
         $order = Orders::botManaged()->where('id', $payment->order_id)
             ->where('user_id', $payment->user_id)
             ->first();
         if (!$order || !app(OrderLifecycleService::class)->canBuyExtra($order)) {
-            return $this->sendTemporaryMessage('خرید حجم برای این سفارش امکان‌پذیر نیست.');
+            return ['status' => false, 'message' => 'خرید حجم برای این سفارش امکان‌پذیر نیست.'];
         }
 
         $adminMethod = 'toUser';
@@ -5335,7 +5549,7 @@ $codeText
             : optional(User::where('is_admin', 1)->first())->tel_id;
 
         if (!$channelId) {
-            return $this->sendTemporaryMessage('❌ مقصد ارسال رسید یافت نشد.');
+            return ['status' => false, 'message' => '❌ مقصد ارسال رسید یافت نشد.'];
         }
         if ($payment->method == 'cart-be-cart') {
             $remark = $this->escapeHtml($order->remark);
@@ -5347,6 +5561,7 @@ $codeText
                     'chat_id' => $channelId,
                     'message_id' => $this->messageId,
                     'caption' => $caption,
+                    'reply_markup' => $this->retryPaymentKeyboard($payment),
                     'parse_mode' => 'HTML',
                 ]);
             } else {
@@ -5354,6 +5569,7 @@ $codeText
                 $this->sendMessage([
                     'chat_id' => $channelId,
                     'text' => $caption,
+                    'reply_markup' => $this->retryPaymentKeyboard($payment),
                     'parse_mode' => 'HTML',
                 ], 'message');
             }
@@ -5376,7 +5592,7 @@ $codeText
         $panel = Panels::find($order->panel_id);
 
         if (!$targetUser || !$extra || !$panel) {
-            return $this->sendTemporaryMessage('اطلاعات لازم برای خرید حجم کامل نیست.');
+            return ['status' => false, 'message' => 'اطلاعات لازم برای خرید حجم کامل نیست.'];
         }
 
         return $this->ExtraClient($panel, $order, $extra, $targetUser, $payment, $adminMethod, $channelId);
@@ -5401,21 +5617,21 @@ $codeText
                 ];
             }
             $result = $pasarGuard->getUserById($order->uid);
+            if (!is_array($result) || ($result['status'] ?? null) === false
+                || empty($result['id']) || !is_numeric($result['data_limit'] ?? null)) {
+                return is_array($result) && ($result['status'] ?? null) === false
+                    ? $result : ['status' => false, 'message' => 'Invalid PasarGuard user response'];
+            }
 
-            $expire = is_array($result) && !empty($result['expire'])
-                ? Carbon::parse($result['expire'])->format('Y-m-d H:i:s')
-                : Carbon::parse($order->expire_at)->format('Y-m-d H:i:s');
             $band = gbToByte($extra->name);
             $data = [
-                'status' => 'active',
-                'expire' => $expire,
-                'data_limit' => (is_array($result) && is_numeric($result['data_limit'] ?? null)
-                    ? (float) $result['data_limit']
-                    : 0) + $band,
+                'data_limit' => (int) $result['data_limit'] + $band,
             ];
-            $result = $pasarGuard->updateUserById($order->uid, $data);
+            // Buying traffic must not move the expiry or start an on-hold service.
+            if (($result['status'] ?? '') !== 'on_hold') $data['status'] = 'active';
+            $result = app(PasarGuardPaymentService::class)->updateAccount($pasarGuard, $payment, (string) $order->uid, $result, $data, (int) $panel->id);
 
-            if (is_array($result) && ($result['status'] ?? true) !== false) {
+            if (is_array($result) && !empty($result['id']) && ($result['status'] ?? false) !== false) {
                 $order->status = Orders::STATUS_ACTIVE;
                 $order->reminded = 0;
                 $order->save();
@@ -5483,6 +5699,7 @@ $codeText
                         'chat_id' => $channelId,
                         'message_id' => $this->messageId,
                         'caption' => $caption,
+                        'reply_markup' => json_encode(['inline_keyboard' => []]),
                         'parse_mode' => 'HTML',
                     ]);
                 } else {
@@ -5490,50 +5707,15 @@ $codeText
                     $this->sendMessage([
                         'chat_id' => $channelId,
                         'text' => $caption,
+                        'reply_markup' => json_encode(['inline_keyboard' => []]),
                         'parse_mode' => 'HTML',
                     ], 'message');
                 }
             } else {
-
-                $this->refundPaymentToWallet($payment, $targetUser, 'extra_failed');
-
-                $caption = "❌ <b>خرید حجم ناموفق بود</b>
-
-متاسفانه عملیات خرید حجم شما با خطا مواجه شد.
-
-💰 مبلغ پرداختی شما به کیف پول بازگردانده شد.
-
-📄 <b>شماره تراکنش:</b> <code>{$payment->id}</code>
-💳 <b>مبلغ بازگشتی:</b> <code>{$payment->price}</code>
-
-✅ موجودی کیف پول شما با موفقیت شارژ شد.";
-
-                $this->method = 'toUser';
-                $this->sendMessage([
-                    'chat_id' => $targetUser->tel_id,
-                    'text' => $caption,
-                    'parse_mode' => 'HTML',
-                ], 'message');
-
-                $caption = "🚨 <b>خطا در پردازش سفارش</b>
-
-❌ خرید حجم ناموفق بود و سرویس ایجاد نشد.
-
-📄 شماره تراکنش: <code>{$payment->id}</code>
-💰 مبلغ: <code>{$payment->price}</code>
-
-🔄 مبلغ به کیف پول کاربر بازگردانده شد.
-✅ عملیات بازگشت وجه با موفقیت انجام شد.";
-                $this->method = $adminMethod;
-                return $this->sendMessage([
-                    'chat_id' => $channelId,
-                    'text' => $caption,
-                    'parse_mode' => 'HTML',
-                ], 'message');
-
+                $failure = is_array($result) && ($result['status'] ?? null) === false
+                    ? $result : ['status' => false, 'message' => 'Invalid PasarGuard update response'];
+                return $failure;
             }
-
-
         } else {
             $loginData = [
                 'username' => $panel->username,
@@ -6178,6 +6360,10 @@ $codeText
         |--------------------------------------------------------------------------
         */
 
+        $keyboard[] = [[
+            'text' => '📋 همه تراکنش‌ها / پیگیری تحویل',
+            'callback_data' => "type=adminUserPayments|id={$user->id}",
+        ]];
         if ((int) $user->is_seller !== 1) {
             $text .= app(CustomerLoyaltyService::class)->profileText($user);
             array_unshift($keyboard, [['text' => 'تخفیف ثابت حساب', 'callback_data' => 'type=adminCustomerDiscount|id='.$user->id]]);
