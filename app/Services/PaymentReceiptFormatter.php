@@ -16,6 +16,9 @@ use Illuminate\Support\Facades\Schema;
 
 class PaymentReceiptFormatter
 {
+    // A visible divider widens the caption's text block beneath receipt photos.
+    public const SEPARATOR = '────────────────────────────────';
+
     /** Preserve the purchased selection when plans or services are edited later. */
     public function snapshot(Payment $payment): array
     {
@@ -94,7 +97,7 @@ class PaymentReceiptFormatter
             '4' => 'شارژ کیف پول ربات',
             default => 'تراکنش ربات',
         };
-        $lines = ['🧾 <b>رسید آی پی ثابت — ربات</b>', ''];
+        $lines = ['🧾 <b>رسید آی پی ثابت — ربات</b>', self::SEPARATOR];
         $this->field($lines, 'نوع', $typeLabel);
         $this->field($lines, 'وضعیت', $status);
         // Payment ID is stable across retries; preorder IDs and service IDs can overlap.

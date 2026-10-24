@@ -1051,7 +1051,7 @@ class TelegramBotController extends Controller
         foreach ($parts as $part) {
             $this->telegramSdk->sendMessage([
                 'chat_id' => $channelId,
-                'text' => "🧾 ادامهٔ رسید #{$payment->id}\n\n" . $part,
+                'text' => "🧾 ادامهٔ رسید #{$payment->id}\n" . PaymentReceiptFormatter::SEPARATOR . "\n" . $part,
                 'parse_mode' => 'HTML',
             ]);
         }
