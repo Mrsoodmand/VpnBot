@@ -303,17 +303,15 @@ if (!function_exists('calculatePlanDiscount')) {
 if (!function_exists('headTitle')) {
     function headTitle($title)
     {
-//        $text = "━━━━━━━━━━━━━━━━━━\n";
-        $text = '<b>' . trim($title) . "</b>\n";
-//        $text .= "━━━━━━━━━━━━━━━━━━\n";
-        return $text;
+        $title = htmlspecialchars(trim((string) $title), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        return "\u{200F}<b>{$title}</b>\n────────────────────────────────\n";
     }
 }
 
 if (!function_exists('rtlMessage')) {
     function rtlMessage($text)
     {
-        return preg_replace('/^(?=\S)/mu', "\u{200F}", $text) ?? $text;
+        return preg_replace('/^(?!\x{200F})(?=\S)/mu', "\u{200F}", $text) ?? $text;
     }
 }
 

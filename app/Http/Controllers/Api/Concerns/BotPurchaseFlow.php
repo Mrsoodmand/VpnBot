@@ -51,7 +51,9 @@ trait BotPurchaseFlow
         $page = max(1, (int) ($type['page'] ?? 1));
         $ids = $catalog->routes($service->id)->with('panel')->get()->map(fn ($route) => $route->country_id ?? $route->panel->country_id)->filter()->unique();
         $list = Countries::where('type', $service->id)->where('status', 1)->whereIn('id', $ids)
-            ->orderBy('name')->paginate(10, ['*'], 'page', $page);
+            ->orderByRaw('CASE WHEN name LIKE ? OR name LIKE ? OR name LIKE ? OR LOWER(name) LIKE ? OR LOWER(name) LIKE ? THEN 0 ELSE 1 END',
+                ['%🇩🇪%', '%آلمان%', '%المان%', '%germany%', '%deutschland%'])
+            ->orderBy('name')->orderBy('id')->paginate(10, ['*'], 'page', $page);
         $keyboard = [];
         foreach ($list as $country) {
             $keyboard[] = [['text' => $country->name ?: 'بدون نام',

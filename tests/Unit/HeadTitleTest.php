@@ -6,11 +6,11 @@ use PHPUnit\Framework\TestCase;
 
 class HeadTitleTest extends TestCase
 {
-    public function test_title_and_body_are_separated_by_one_line_break(): void
+    public function test_title_and_body_are_separated_by_a_visible_divider(): void
     {
         $message = headTitle(' عنوان آزمایشی ') . 'متن پیام';
 
-        $this->assertSame("<b>عنوان آزمایشی</b>\nمتن پیام", $message);
+        $this->assertSame("\u{200F}<b>عنوان آزمایشی</b>\n────────────────────────────────\nمتن پیام", $message);
     }
 
     public function test_rtl_marker_is_added_to_each_non_empty_line(): void

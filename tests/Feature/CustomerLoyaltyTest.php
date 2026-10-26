@@ -382,7 +382,7 @@ class CustomerLoyaltyTest extends TestCase
         $user = User::find(1); $user->is_admin = 1; $user->save();
         $controller = new LoyaltyTestController($user);
         $controller->callback('type=adminCustomerDiscount|id=1');
-        $this->assertStringContainsString('تخفیف ثابت حساب: 0٪', end($controller->messages)['text']);
+        $this->assertStringContainsString('مقدار فعلی: 0٪', end($controller->messages)['text']);
         $this->assertSame('adminCustomerDiscountSave', $user->fresh()->path);
     }
 
@@ -462,7 +462,7 @@ class CustomerLoyaltyTest extends TestCase
         ]])]);
         $controller = new LoyaltyTestController(User::find(1)); $controller->call('profile', []);
         $text = end($controller->messages)['text'];
-        foreach (['👤 <b>حساب کاربری شما</b>', 'شناسه تلگرام: ۱۰۰۱', 'تخفیف این سطح: ۷٫۵٪',
+        foreach (['<b>👤 حساب کاربری شما</b>', 'شناسه تلگرام: ۱۰۰۱', 'تخفیف این سطح: ۷٫۵٪',
             '۳٬۰۰۰٬۰۰۰ تومان', '۳ ستاره و تخفیف ۱۲٫۵٪', '۲۶ اکتبر ۲۰۲۶، ساعت ۲۳:۴۸ به وقت تهران'] as $expected) {
             $this->assertStringContainsString($expected, $text);
         }

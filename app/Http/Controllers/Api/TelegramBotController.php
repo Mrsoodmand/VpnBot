@@ -22,6 +22,7 @@ use App\Models\Setting;
 use App\Models\TelegramData;
 use App\Models\User;
 use App\Services\OrderCountryResolver;
+use App\Services\BotKeyboardLayout;
 use App\Services\OrderPricingService;
 use App\Services\OrderLifecycleService;
 use App\Services\PasarGuardPaymentService;
@@ -987,6 +988,15 @@ class TelegramBotController extends Controller
 
     private function sendMessage($data, $messageMethod)
     {
+        if (isset($data['reply_markup'])) {
+            $markup = is_string($data['reply_markup'])
+                ? json_decode($data['reply_markup'], true)
+                : $data['reply_markup'];
+            if (is_array($markup) && isset($markup['inline_keyboard'])) {
+                $markup['inline_keyboard'] = app(BotKeyboardLayout::class)->compact($markup['inline_keyboard']);
+                $data['reply_markup'] = json_encode($markup);
+            }
+        }
         if (is_null($messageMethod)) {
             $messageMethod = 'message';
         }
@@ -1024,7 +1034,7 @@ class TelegramBotController extends Controller
     {
         $data = [
             'chat_id' => $this->chatId,
-            'text' => $text,
+            'text' => headTitle('نتیجهٔ درخواست').$text,
             'parse_mode' => 'HTML',
         ];
 
@@ -1101,7 +1111,7 @@ class TelegramBotController extends Controller
         foreach ($parts as $part) {
             $this->telegramSdk->sendMessage([
                 'chat_id' => $channelId,
-                'text' => "🧾 ادامهٔ رسید #{$payment->id}\n" . PaymentReceiptFormatter::SEPARATOR . "\n" . $part,
+                'text' => headTitle("🧾 ادامهٔ رسید #{$payment->id}") . $part,
                 'parse_mode' => 'HTML',
             ]);
         }
@@ -1543,7 +1553,7 @@ class TelegramBotController extends Controller
         }
         $data = [
             'chat_id' => $this->chatId,
-            'text' => $text,
+            'text' => headTitle('🏠 منوی اصلی').$text,
             'parse_mode' => 'HTML',
             'reply_markup' => json_encode([
                 'inline_keyboard' => $buttons
@@ -1573,7 +1583,7 @@ class TelegramBotController extends Controller
         $balance = number_format($this->user->balance);
         $data = [
             'chat_id' => $this->chatId,
-            'text' => "شارژ کیف پول \n موجودی کیف پول: {$balance}",
+            'text' => headTitle('💰 شارژ کیف پول')."موجودی کیف پول: {$balance} تومان",
             'parse_mode' => 'HTML',
             'reply_markup' => json_encode([
                 'inline_keyboard' => $buttons
@@ -1629,7 +1639,7 @@ class TelegramBotController extends Controller
 
         $data = [
             'chat_id' => $this->chatId,
-            'text' => "شارژ کیف پول",
+            'text' => headTitle('💰 انتخاب مبلغ شارژ')."مبلغ مورد نظر را انتخاب کنید.",
             'parse_mode' => 'HTML',
             'reply_markup' => json_encode($keyboard)
         ];
@@ -1672,7 +1682,7 @@ class TelegramBotController extends Controller
 
         $data = [
             'chat_id' => $this->chatId,
-            'text' => "لطفا مبلغ مورد نظر را به تومان وارد کنید.",
+            'text' => headTitle('💰 مبلغ دلخواه شارژ')."لطفا مبلغ مورد نظر را به تومان وارد کنید.",
             'parse_mode' => 'HTML',
             'reply_markup' => json_encode($keyboard)
         ];
@@ -1775,7 +1785,7 @@ class TelegramBotController extends Controller
         $amount = number_format($amount);
         $cardNumberLine = $this->cardNumberLine($card->cart);
         $cardShebaLine = $this->cardShebaLine($card->sheba);
-        $text = "🟩درخواست  شما ثبت شد!
+        $text = headTitle('💳 واریز برای شارژ کیف پول')."درخواست شما ثبت شد.
 
 👝 مبلغ سفارش : <code>{$amount}</code> تومان
 🔘 جهت تکمیل سفارش مبلغ فاکتور را به تومان به شماره کارت زیر واریز نموده و پس از واریز تصویر فیش را در همین مرحله برای ربات ارسال نمایید :
@@ -1866,7 +1876,7 @@ class TelegramBotController extends Controller
 
         $this->sendAdminPaymentReceipt($payment, 'approved', $channelId);
         $balance = number_format($targetUser->balance);
-        $userCaption = "✅ تراکنش شارژ کیف پول شما با موفقیت تایید شد.\n💰 موجودی فعلی شما: {$balance} تومان";
+        $userCaption = headTitle('✅ تأیید شارژ کیف پول')."✅ تراکنش شارژ کیف پول شما با موفقیت تایید شد.\n💰 موجودی فعلی شما: {$balance} تومان";
 
         $this->method = 'toUser';
         $this->sendMessage([
@@ -1911,7 +1921,7 @@ class TelegramBotController extends Controller
                 ], 'message');
             }
 
-            $text = "✅ حساب سایت و ربات با موفقیت متصل شد.\n\n";
+            $text = headTitle('✅ نتیجهٔ اتصال حساب')."✅ حساب سایت و ربات با موفقیت متصل شد.\n\n";
             $text .= "📱 شماره سایت: <code>{$result['phone']}</code>\n";
             $text .= "📦 سفارش های سایت وارد ربات شد: <code>{$result['orders_count']}</code> مورد\n\n";
             $text .= "از این به بعد سفارش های سایت و ربات و کیف پول بین هر دو بخش قابل مدیریت است.";
@@ -2013,12 +2023,12 @@ class TelegramBotController extends Controller
         $payment->save();
         $price = number_format($payment->price);
 
-        $text = headTitle("🌍 انتخاب نحوه پرداخت");
-        $text .= "📦 <b>نوع سرویس:</b> <code>{$this->escapeHtml($service->name)}</code>
-🌐 <b>کشور:</b> <code>{$countryName}</code>
-🌐 <b>تعرفه:</b> <code>{$this->escapeHtml($plan->name)}</code>
-🌐 <b>تعداد:</b><code>{$count} عدد</code>
-💵 <b>مبلغ کل:</b> <code>{$price} تومان</code>
+        $text = headTitle('🧾 پیش‌فاکتور خرید');
+        $text .= "📦 <b>نوع سرویس:</b> {$this->escapeHtml($service->name)}
+🌐 <b>کشور:</b> {$countryName}
+🌐 <b>تعرفه:</b> {$this->escapeHtml($plan->name)}
+🌐 <b>تعداد:</b> {$count} عدد
+💵 <b>مبلغ کل:</b> {$price} تومان
 💡 نحوه پرداخت را مشخص کنید:";
 
         $keyboard[] = [
@@ -2117,7 +2127,7 @@ class TelegramBotController extends Controller
 
         return $this->sendMessage([
             'chat_id' => $this->chatId,
-            'text' => $text,
+            'text' => headTitle('🧾 وضعیت رسید پرداخت').$text,
             'parse_mode' => 'HTML',
             'reply_markup' => json_encode([
                 'inline_keyboard' => [[[
@@ -2210,7 +2220,7 @@ class TelegramBotController extends Controller
             : '';
         $cardNumberLine = $this->cardNumberLine($cardNumber);
         $cardShebaLine = $this->cardShebaLine($cardSheba);
-        $text = "درخواست شما ثبت شد.
+        $text = headTitle('💳 واریز مبلغ سفارش')."درخواست شما ثبت شد.
 👝 مبلغ سفارش : <code>{$amount}</code> تومان
 {$remarkText}
 🔘 جهت تکمیل سفارش مبلغ فاکتور را به تومان به شماره کارت زیر واریز نموده و پس از واریز تصویر فیش را در همین مرحله برای ربات ارسال نمایید :
@@ -2502,7 +2512,7 @@ class TelegramBotController extends Controller
 
         return $this->sendMessage([
             'chat_id' => $this->chatId,
-            'text' => "✅ رسید شما با موفقیت ارسال شد.\n\n🔢 شماره تراکنش: <code>{$payment->id}</code>\nوضعیت: <b>{$statusLabel}</b>",
+            'text' => headTitle('🧾 ثبت رسید پرداخت')."✅ رسید شما با موفقیت ارسال شد.\n\n🔢 شماره تراکنش: <code>{$payment->id}</code>\nوضعیت: <b>{$statusLabel}</b>",
             'parse_mode' => 'HTML',
         ], 'message');
     }
@@ -2602,7 +2612,7 @@ class TelegramBotController extends Controller
             return;
         }
 
-        $userText = "❌ <b>پرداخت شما تایید نشد</b>\n\n";
+        $userText = headTitle('❌ پرداخت شما تایید نشد');
         $userText .= "🔢 شماره تراکنش: <code>{$payment->id}</code>\n";
         $userText .= "💰 مبلغ: <code>{$price}</code> تومان\n\n";
         $userText .= "در صورت نیاز با پشتیبانی ارتباط بگیرید.";
@@ -2792,8 +2802,9 @@ class TelegramBotController extends Controller
 
         // Old attempts have no saved target, so their remote outcome cannot be inferred safely.
         if (empty($payment->detail['fulfillment']['version']) && empty($data['legacy'])) {
-            $text = "⚠️ تراکنش قدیمی #{$payment->id}\nاطلاعات تلاش قبلی ذخیره نشده است. ابتدا در پنل بررسی کنید که سرویس ساخته نشده یا تمدید/حجم اعمال نشده باشد.\nپس از بررسی، دکمهٔ زیر فقط عملیات باقی‌مانده را اجرا می‌کند؛ مبلغ دوباره کسر نمی‌شود.";
+            $text = headTitle('🔄 تلاش مجدد تحویل')."⚠️ تراکنش قدیمی #{$payment->id}\nاطلاعات تلاش قبلی ذخیره نشده است. ابتدا در پنل بررسی کنید که سرویس ساخته نشده یا تمدید/حجم اعمال نشده باشد.\nپس از بررسی، دکمهٔ زیر فقط عملیات باقی‌مانده را اجرا می‌کند؛ مبلغ دوباره کسر نمی‌شود.";
             $params = ['chat_id' => $this->chatId, 'message_id' => $this->messageId,
+                'parse_mode' => 'HTML',
                 'reply_markup' => json_encode(['inline_keyboard' => [[[
                     'text' => 'پنل را بررسی کردم؛ تلاش مجدد',
                     'callback_data' => "type=adminRetryPayment|p_id={$payment->id}|legacy=1",
@@ -2812,7 +2823,7 @@ class TelegramBotController extends Controller
                 $this->messageId = $receipt['message_id'];
                 $this->isPhoto = $receipt['is_photo'];
             } elseif ((string) $this->chatId !== (string) $channelId) {
-                $notice = $this->telegramSdk->sendMessage(['chat_id' => $channelId, 'text' => "⏳ تلاش مجدد برای تراکنش #{$payment->id}"]);
+                $notice = $this->telegramSdk->sendMessage(['chat_id' => $channelId, 'text' => headTitle('🔄 تلاش مجدد تحویل')."تراکنش #{$payment->id} در حال بررسی است.", 'parse_mode' => 'HTML']);
                 if (empty($notice['ok'])) return $this->sendTemporaryMessage('ارسال پیام پیگیری به ادمین ناموفق بود.');
                 $this->chatId = $channelId;
                 $this->messageId = $notice['result']['message_id'];
@@ -2926,9 +2937,10 @@ class TelegramBotController extends Controller
         if ($telId) {
             $this->telegramSdk->sendMessage([
                 'chat_id' => $telId,
-                'text' => $refunded
+                'parse_mode' => 'HTML',
+                'text' => headTitle($refunded ? '↩️ بازگشت مبلغ سفارش' : '⏳ پیگیری تحویل سفارش').($refunded
                     ? "❌ عملیات انجام نشد و مبلغ {$payment->price} تومان به کیف پول شما بازگردانده شد.\nشماره تراکنش: {$payment->id}"
-                    : "⚠️ پرداخت شما ثبت شده، اما تکمیل سفارش نیاز به بررسی پشتیبانی دارد.\nشماره تراکنش: {$payment->id}\nلطفاً دوباره پرداخت نکنید.",
+                    : "⚠️ پرداخت شما ثبت شده، اما تکمیل سفارش نیاز به بررسی پشتیبانی دارد.\nشماره تراکنش: {$payment->id}\nلطفاً دوباره پرداخت نکنید."),
             ]);
         }
 
@@ -2959,7 +2971,7 @@ class TelegramBotController extends Controller
         }
         if ($payment->method == 'wallet') {
 
-            $caption = "✅ <b>تراکنش تایید شد</b>\n\n⏳ در حال پردازش سفارش هستیم...\nلطفاً چند لحظه صبر کنید.";
+            $caption = headTitle('✅ تأیید پرداخت و تحویل سفارش')."⏳ در حال پردازش سفارش هستیم...\nلطفاً چند لحظه صبر کنید.";
 
             $this->sendMessage([
                 'chat_id' => $targetUser->tel_id,
@@ -3144,10 +3156,7 @@ class TelegramBotController extends Controller
                 $photoParams = [
                     'chat_id' => $targetUser->tel_id,
                     'photo' => $photo,
-                    'caption' => "
-<b>✅ سفارش با موفقیت تکمیل شد</b>
-
-🧾 شماره سفارش:
+                    'caption' => headTitle('✅ تحویل سفارش')."🧾 شماره سفارش:
 <code>{$singleOrder['order-id']}</code>
 $codeText
 🔗 لینک ساب:
@@ -3202,7 +3211,7 @@ $codeText
                 $this->method = $userMethod;
                 return $this->sendMessage([
                     'chat_id' => $targetUser->tel_id,
-                    'text' => "❌ عملیات تحویل سفارش انجام نشد.\n\n💰 مبلغ <code>{$payment->price}</code> تومان به کیف پول شما بازگردانده شد.",
+                    'text' => headTitle('↩️ نتیجهٔ تحویل سفارش')."❌ عملیات تحویل سفارش انجام نشد.\n\n💰 مبلغ <code>{$payment->price}</code> تومان به کیف پول شما بازگردانده شد.",
                     'parse_mode' => 'HTML',
                 ], 'message');
             }
@@ -3326,10 +3335,7 @@ $codeText
                 $this->telegramSdk->sendPhoto([
                     'chat_id' => $targetUser->tel_id,
                     'photo' => $photo,
-                    'caption' => "
-<b>✅ سفارش با موفقیت تکمیل شد</b>
-
-🧾 شماره سفارش:
+                    'caption' => headTitle('✅ تحویل سفارش')."🧾 شماره سفارش:
 <code>{$singleOrder['order-id']}</code>
 
 🔑 کد کانفیگ:
@@ -3483,7 +3489,7 @@ $codeText
         if (!$id) {
             return $this->telegramSdk->sendMessage([
                 'chat_id' => $user->tel_id,
-                'text' => "❌ <b>سفارش نامعتبر است!</b>\n\nلطفا دوباره از بخش «سرویس های من» سفارش خود را انتخاب کنید.",
+                'text' => headTitle('❌ بررسی سفارش')."سفارش نامعتبر است.\nلطفا دوباره از بخش «سرویس های من» سفارش خود را انتخاب کنید.",
                 'parse_mode' => 'HTML',
             ]);
         }
@@ -3495,7 +3501,7 @@ $codeText
         if (is_null($order)) {
             return $this->telegramSdk->sendMessage([
                 'chat_id' => $user->tel_id,
-                'text' => "🚫 <b>سفارش یافت نشد</b>\n\nاین سفارش وجود ندارد یا متعلق به حساب شما نیست.",
+                'text' => headTitle('🚫 بررسی سفارش')."سفارش یافت نشد.\nاین سفارش وجود ندارد یا متعلق به حساب شما نیست.",
                 'parse_mode' => 'HTML',
             ]);
         }
@@ -3505,7 +3511,7 @@ $codeText
         if (is_null($panel)) {
             return $this->telegramSdk->sendMessage([
                 'chat_id' => $user->tel_id,
-                'text' => "⚠️ <b>خطا در دریافت اطلاعات سرویس</b>\n\nپنل مربوط به این سفارش پیدا نشد. لطفا با پشتیبانی در ارتباط باشید.",
+                'text' => headTitle('⚠️ دریافت اطلاعات سرویس')."پنل مربوط به این سفارش پیدا نشد. لطفا با پشتیبانی در ارتباط باشید.",
                 'parse_mode' => 'HTML',
             ]);
         }
@@ -3647,7 +3653,7 @@ $codeText
 
         $subUrlSafe = htmlspecialchars($subUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 
-        $message = "<b>✅ جزئیات سفارش #{$order->id}</b>\n\n";
+        $message = headTitle("📄 جزئیات سفارش #{$order->id}");
         $message .= "<b>وضعیت:</b> {$status['icon']} {$status['label']}\n";
         $message .= "<b>حجم کل:</b> {$totalGb} گیگ\n";
         $message .= "<b>حجم مصرف شده:</b> {$totalUsed} گیگ\n";
@@ -3675,7 +3681,7 @@ $codeText
         $photoParams = [
             'chat_id' => $user->tel_id,
             'photo' => $photo,
-            'caption' => $shortCaption ? $message : "✅ جزئیات سفارش #{$order->id}",
+            'caption' => $shortCaption ? $message : headTitle("📄 جزئیات سفارش #{$order->id}"),
             'parse_mode' => 'HTML',
         ];
         if ($shortCaption) {
@@ -3858,7 +3864,7 @@ $codeText
         $user->tel_detail = $telDetail;
         $user->save();
 
-        $text = "⚙️ <b>تغییر نام کانفیگ</b>\n\n";
+        $text = headTitle('✏️ تغییر نام کانفیگ');
         $text .= " مقدار قبلی : <b>" . $this->escapeHtml($order->remark) . "</b>\n\n";
 
         $buttons = [];
@@ -4193,7 +4199,7 @@ $codeText
         $payment->expired_at = Carbon::now()->addMinutes(10);
         $payment->save();
 
-        $text = headTitle("🌍انتخاب نحوه پرداخت");
+        $text = headTitle('🧾 پیش‌فاکتور تمدید');
         $remark = $this->escapeHtml($order->remark);
         $text .= "🏷 <b>ریمارک سرویس:</b> <code>{$remark}</code>
 🌐 <b>تعرفه:</b>
@@ -4272,7 +4278,7 @@ $codeText
         if ($payment->method == 'wallet') {
 
             $remark = $this->escapeHtml($order->remark);
-            $caption = "✅ <b>تراکنش تایید شد</b>\n\n🏷 <b>ریمارک سرویس:</b> <code>{$remark}</code>\n\n⏳ در حال پردازش سفارش هستیم...\nلطفاً چند لحظه صبر کنید.";
+            $caption = headTitle('✅ تأیید پرداخت و تحویل سفارش')."🏷 <b>ریمارک سرویس:</b> <code>{$remark}</code>\n\n⏳ در حال پردازش سفارش هستیم...\nلطفاً چند لحظه صبر کنید.";
 
             $this->sendMessage([
                 'chat_id' => $targetUser->tel_id,
@@ -4347,7 +4353,7 @@ $codeText
                 $order->detail = $orderDetail;
                 $order->save();
 
-                $caption = "تمدید سرویس با موفقیت انجام شد.\n\n{$remarkLine}";
+                $caption = headTitle('✅ نتیجهٔ تمدید سرویس')."تمدید سرویس با موفقیت انجام شد.\n\n{$remarkLine}";
 
                 $this->method = 'toUser';
                 $this->sendMessage([
@@ -4425,7 +4431,7 @@ $codeText
                 $order->detail = $orderDetail;
                 $order->save();
 
-                $caption = "تمدید سرویس با موفقیت انجام شد.\n\n{$remarkLine}";
+                $caption = headTitle('✅ نتیجهٔ تمدید سرویس')."تمدید سرویس با موفقیت انجام شد.\n\n{$remarkLine}";
 
                 $this->method = 'toUser';
                 $this->sendMessage([
@@ -4450,7 +4456,7 @@ $codeText
             } else {
                 $this->refundPaymentToWallet($payment, $targetUser, 'renew_failed');
 
-                $caption = "❌ <b>تمدید سرویس ناموفق بود</b>
+                $caption = headTitle('❌ نتیجهٔ تمدید سرویس')."تمدید سرویس ناموفق بود.
 
 متاسفانه عملیات تمدید سرویس شما با خطا مواجه شد.
 
@@ -4604,7 +4610,7 @@ $codeText
         $payment->expired_at = Carbon::now()->addMinutes(10);
         $payment->save();
 
-        $text = headTitle("💳 انتخاب روش پرداخت");
+        $text = headTitle('🧾 پیش‌فاکتور حجم اضافه');
         $remark = $this->escapeHtml($order->remark);
 
         $text .= "🛒 <b>خلاصه سفارش شما</b>
@@ -4697,7 +4703,7 @@ $codeText
         if ($payment->method == 'wallet') {
 
             $remark = $this->escapeHtml($order->remark);
-            $caption = "✅ <b>تراکنش تایید شد</b>\n\n🏷 <b>ریمارک سرویس:</b> <code>{$remark}</code>\n\n⏳ در حال پردازش سفارش هستیم...\nلطفاً چند لحظه صبر کنید.";
+            $caption = headTitle('✅ تأیید پرداخت و تحویل سفارش')."🏷 <b>ریمارک سرویس:</b> <code>{$remark}</code>\n\n⏳ در حال پردازش سفارش هستیم...\nلطفاً چند لحظه صبر کنید.";
 
             $this->sendMessage([
                 'chat_id' => $targetUser->tel_id,
@@ -4755,7 +4761,7 @@ $codeText
                 $order->status = Orders::STATUS_ACTIVE;
                 $order->reminded = 0;
                 $order->save();
-                $caption = "خرید حجم سرویس با موفقیت انجام شد.\n\n{$remarkLine}";
+                $caption = headTitle('✅ نتیجهٔ خرید حجم')."خرید حجم سرویس با موفقیت انجام شد.\n\n{$remarkLine}";
 
                 $this->method = 'toUser';
                 $this->sendMessage([
@@ -4821,7 +4827,7 @@ $codeText
                 $order->reminded = 0;
                 $order->save();
 
-                $caption = "خرید حجم سرویس با موفقیت انجام شد.\n\n{$remarkLine}";
+                $caption = headTitle('✅ نتیجهٔ خرید حجم')."خرید حجم سرویس با موفقیت انجام شد.\n\n{$remarkLine}";
 
                 $this->method = 'toUser';
                 $this->sendMessage([
@@ -4845,7 +4851,7 @@ $codeText
             } else {
                 $this->refundPaymentToWallet($payment, $targetUser, 'extra_failed');
 
-                $caption = "❌ <b>خرید حجم ناموفق بود</b>
+                $caption = headTitle('❌ نتیجهٔ خرید حجم')."خرید حجم ناموفق بود.
 
 متاسفانه عملیات خرید حجم شما با خطا مواجه شد.
 
@@ -4875,7 +4881,7 @@ $codeText
     {
         $user = $this->user;
         $balance = number_format($user->balance);
-        $text = "👤 <b>حساب کاربری شما</b>\n\n";
+        $text = headTitle('👤 حساب کاربری شما');
         $telId = htmlspecialchars(CustomerLoyaltyService::persianNumber((string) $user->tel_id), ENT_QUOTES, 'UTF-8');
         $text .= "🆔 شناسه تلگرام: {$telId}";
         $text .= app(CustomerLoyaltyService::class)->profileText($user);
@@ -5769,7 +5775,7 @@ $codeText
 
         $statusText = $value ? '🟢 فعال شد' : '🔴 غیرفعال شد';
 
-        $text = "🔔 <b>بروزرسانی دسترسی فروشنده</b>\n\n";
+        $text = headTitle('🔔 تغییر دسترسی فروشنده');
 
         $text .= "وضعیت دسترسی شما تغییر کرد:\n";
         $text .= "<b>{$statusText}</b>\n\n";
@@ -6017,7 +6023,7 @@ $codeText
         |--------------------------------------------------------------------------
         */
 
-        $notifyText = "🔔 <b>بروزرسانی وضعیت حساب</b>\n\n";
+        $notifyText = headTitle('🔔 تغییر وضعیت حساب');
         $notifyText .= "وضعیت حساب شما تغییر کرد:\n";
         $notifyText .= "<b>{$statusText}</b>";
 
@@ -6080,9 +6086,9 @@ $codeText
         }
         $lines = array_map(fn ($t) => ($t['min'] + $t['strict']).':'.$t['percent'], $data['customer']);
         $this->updatePath('adminCustomerLoyaltySave');
-        $text = "تخفیف پلکانی کاربران عادی\nمرجع مشترک: سایت | واحد: تومان\n\n".implode("\n", $lines);
+        $text = headTitle('⭐ تخفیف پلکانی کاربران عادی')."مرجع مشترک: سایت | واحد: تومان\n\n".implode("\n", $lines);
         $text .= "\n\nچهار خط به شکل مبلغ:درصد ارسال کنید. خط اول از صفر شروع شود؛ مرزها صعودی و درصدها غیرکاهشی باشند. مرز هر پله متعلق به همان پله است.";
-        return $this->sendMessage(['chat_id' => $this->chatId, 'text' => $text,
+        return $this->sendMessage(['chat_id' => $this->chatId, 'text' => $text, 'parse_mode' => 'HTML',
             'reply_markup' => json_encode(['inline_keyboard' => [[['text' => 'بازگشت', 'callback_data' => 'type=adminSetting']]]])], 'message');
     }
 
@@ -6131,7 +6137,8 @@ $codeText
         $this->updatePath('adminCustomerDiscountSave');
         $value = ($profile['manual_value'] ?? '') === '' ? 'خالی (پلکانی)' : $profile['manual_value'].'٪';
         return $this->sendMessage(['chat_id' => $this->chatId,
-            'text' => "تخفیف ثابت حساب: {$value}\nدرصد صفر تا صد را ارسال کنید. صفر یعنی بدون تخفیف. برای خالی‌کردن و بازگشت به پلکان، دکمه زیر را بزنید.",
+            'parse_mode' => 'HTML',
+            'text' => headTitle('🎁 تخفیف ثابت حساب')."مقدار فعلی: {$value}\nدرصد صفر تا صد را ارسال کنید. صفر یعنی بدون تخفیف. برای خالی‌کردن و بازگشت به پلکان، دکمه زیر را بزنید.",
             'reply_markup' => json_encode(['inline_keyboard' => [
                 [['text' => 'پاک‌کردن تخفیف ثابت', 'callback_data' => 'type=adminCustomerDiscountClear|id='.$target->id]],
                 [['text' => 'بازگشت', 'callback_data' => 'type=adminUserDetail|id='.$target->id]],
@@ -6388,7 +6395,7 @@ $codeText
         if (!$id) {
             return $this->telegramSdk->sendMessage([
                 'chat_id' => $this->chatId,
-                'text' => "❌ <b>سفارش نامعتبر است!</b>\n\nلطفا دوباره از بخش «سرویس های من» سفارش خود را انتخاب کنید.",
+                'text' => headTitle('❌ بررسی سفارش')."سفارش نامعتبر است.\nلطفا دوباره از بخش «سرویس های من» سفارش خود را انتخاب کنید.",
                 'parse_mode' => 'HTML',
             ]);
         }
@@ -6398,7 +6405,7 @@ $codeText
         if (is_null($order)) {
             return $this->telegramSdk->sendMessage([
                 'chat_id' => $this->chatId,
-                'text' => "🚫 <b>سفارش یافت نشد</b>\n\nاین سفارش وجود ندارد یا متعلق به حساب شما نیست.",
+                'text' => headTitle('🚫 بررسی سفارش')."سفارش یافت نشد.\nاین سفارش وجود ندارد یا متعلق به حساب شما نیست.",
                 'parse_mode' => 'HTML',
             ]);
         }
@@ -6505,7 +6512,7 @@ $codeText
 //        $configCode = htmlspecialchars($configCodeRaw, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 //        $subUrlSafe = htmlspecialchars($subUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 
-        $message = "<b>✅ جزئیات سفارش #{$order->id}</b>\n\n";
+        $message = headTitle("📄 جزئیات سفارش #{$order->id}");
         $status = $lifecycle->statusMeta($order->fresh());
         $message .= "<b>وضعیت:</b> {$status['icon']} {$status['label']}\n";
         $message .= "<b>ریمارک:</b> {$order->remark}\n";
@@ -6553,7 +6560,7 @@ $codeText
 
         $this->updatePath('adminOrderChangeBwSubmit');
 
-        $message = "<b>تغییر حجم</b>\n\n";
+        $message = headTitle('💾 تغییر حجم سرویس');
         $message .= "<b>حجم کل:</b> {$totalGb}\n";
         $message .= "<b>حجم مصرف شده:</b> {$totalUsed}\n";
         $message .= "<b>حجم باقی مانده:</b> {$left}\n";
@@ -6632,7 +6639,7 @@ $codeText
                 $this->method = 'toUser';
                 $this->sendMessage([
                     'chat_id' => $this->chatId,
-                    'text' => $caption,
+                    'text' => headTitle('💾 نتیجهٔ تغییر حجم').$caption,
                     'parse_mode' => 'HTML',
                     'reply_markup' => json_encode([
                         'inline_keyboard' => [
@@ -6652,7 +6659,7 @@ $codeText
                 $this->method = 'toUser';
                 $this->sendMessage([
                     'chat_id' => $this->chatId,
-                    'text' => $caption,
+                    'text' => headTitle('💾 نتیجهٔ تغییر حجم').$caption,
                     'parse_mode' => 'HTML',
                     'reply_markup' => json_encode([
                         'inline_keyboard' => [
@@ -6709,7 +6716,7 @@ $codeText
                 $this->method = 'toUser';
                 $this->sendMessage([
                     'chat_id' => $this->chatId,
-                    'text' => $caption,
+                    'text' => headTitle('💾 نتیجهٔ تغییر حجم').$caption,
                     'parse_mode' => 'HTML',
                     'reply_markup' => json_encode([
                         'inline_keyboard' => [
@@ -6727,7 +6734,7 @@ $codeText
                 $this->method = 'toUser';
                 $this->sendMessage([
                     'chat_id' => $this->chatId,
-                    'text' => $caption,
+                    'text' => headTitle('💾 نتیجهٔ تغییر حجم').$caption,
                     'parse_mode' => 'HTML',
                     'reply_markup' => json_encode([
                         'inline_keyboard' => [
@@ -6778,7 +6785,7 @@ $codeText
 
         $this->updatePath('adminOrderChangeTimeSubmit');
 
-        $message = "⏳ <b>تغییر زمان سرویس</b>\n\n";
+        $message = headTitle('⏳ تغییر زمان سرویس');
         $message .= "📦 <b>شماره سفارش:</b> <code>{$order->id}</code>\n";
         $message .= "📅 <b>تاریخ اتمام فعلی:</b> <code>{$expireTime}</code>\n\n";
         $message .= "برای تغییر زمان سرویس، تعداد روز مورد نظر را ارسال کنید.\n\n";
@@ -6860,7 +6867,7 @@ $codeText
                 $this->method = 'toUser';
                 $this->sendMessage([
                     'chat_id' => $this->chatId,
-                    'text' => $caption,
+                    'text' => headTitle('⏳ نتیجهٔ تغییر زمان').$caption,
                     'parse_mode' => 'HTML',
                     'reply_markup' => json_encode([
                         'inline_keyboard' => [
@@ -6880,7 +6887,7 @@ $codeText
                 $this->method = 'toUser';
                 $this->sendMessage([
                     'chat_id' => $this->chatId,
-                    'text' => $caption,
+                    'text' => headTitle('⏳ نتیجهٔ تغییر زمان').$caption,
                     'parse_mode' => 'HTML',
                     'reply_markup' => json_encode([
                         'inline_keyboard' => [
@@ -6938,7 +6945,7 @@ $codeText
                 $this->method = 'toUser';
                 $this->sendMessage([
                     'chat_id' => $this->chatId,
-                    'text' => $caption,
+                    'text' => headTitle('⏳ نتیجهٔ تغییر زمان').$caption,
                     'parse_mode' => 'HTML',
                     'reply_markup' => json_encode([
                         'inline_keyboard' => [
@@ -6956,7 +6963,7 @@ $codeText
                 $this->method = 'toUser';
                 $this->sendMessage([
                     'chat_id' => $this->chatId,
-                    'text' => $caption,
+                    'text' => headTitle('⏳ نتیجهٔ تغییر زمان').$caption,
                     'parse_mode' => 'HTML',
                     'reply_markup' => json_encode([
                         'inline_keyboard' => [
@@ -6991,7 +6998,7 @@ $codeText
         $configCode = htmlspecialchars($configCodeRaw, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
         $subUrlSafe = htmlspecialchars($subUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 
-        $message = "<b>✅ جزئیات سفارش #{$order->id}</b>\n\n";
+        $message = headTitle("📄 جزئیات سفارش #{$order->id}");
         $message .= "<b>کد کانفیگ:</b>
         <code>$configCode</code> \n";
         $message .= "<b>لینک ساب:</b>

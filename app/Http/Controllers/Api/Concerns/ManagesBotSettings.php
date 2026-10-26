@@ -257,11 +257,11 @@ trait ManagesBotSettings
         $parts = app(PaymentReceiptFormatter::class)->parts($payment, $state, 3300);
         // Send the saved receipt in the admin's current chat so its photo remains reviewable.
         if (! empty($detail['receipt_is_photo']) && ! empty($detail['value'])) {
-            $this->telegramSdk->sendPhoto(['chat_id' => $this->chatId, 'photo' => $detail['value'], 'caption' => 'تصویر رسید #'.$payment->id]);
+            $this->telegramSdk->sendPhoto(['chat_id' => $this->chatId, 'photo' => $detail['value'], 'caption' => headTitle('🧾 تصویر رسید #'.$payment->id), 'parse_mode' => 'HTML']);
         }
         $body = array_shift($parts);
         foreach ($parts as $part) {
-            $this->telegramSdk->sendMessage(['chat_id' => $this->chatId, 'text' => $part, 'parse_mode' => 'HTML']);
+            $this->telegramSdk->sendMessage(['chat_id' => $this->chatId, 'text' => headTitle('🧾 ادامهٔ جزئیات تراکنش #'.$payment->id).$part, 'parse_mode' => 'HTML']);
         }
         if (empty($detail['receipt_is_photo']) && ! empty($detail['value'])) {
             $body .= "\nرسید: ".$this->escapeHtml(mb_substr((string) $detail['value'], 0, 300));
