@@ -8,7 +8,7 @@ class Panels extends Model
 {
     public function inbounds()
     {
-        return $this->hasMany(Inbounds::class);
+        return $this->hasMany(Inbounds::class, 'panel_id');
     }
 
     protected function casts()

@@ -41,6 +41,10 @@ use Illuminate\Support\Str;
 
 class TelegramBotController extends Controller
 {
+    use Concerns\BotPurchaseFlow;
+    use Concerns\ManagesBotCatalog;
+    use Concerns\ManagesBotSettings;
+    use Concerns\LegacyBotAdminNavigation;
     protected $chatId;
     protected $panel;
     protected $messageId;
@@ -121,8 +125,11 @@ class TelegramBotController extends Controller
 
         $this->checkUser();
         $user = $this->user;
-        $this->isSeller = $user->is_seller;
-        $this->isAdmin = $user->is_admin;
+        $this->isSeller = (int) $user->is_seller === 1;
+        $this->isAdmin = (int) $user->is_admin === 1;
+        if ($user->path === 'adminCatalogSave' && ($user->tel_detail['catalog_edit']['k'] ?? '') === 'password') {
+            $this->text = $data['message']['text'] ?? $this->text;
+        }
     }
 
     public function index()
@@ -162,11 +169,23 @@ class TelegramBotController extends Controller
         if ($this->callbackData == 'ignore') {
             return $this->ignore();
         }
-        foreach ($data as $key => $item) {
-            list($name, $id) = explode('=', $item);
-            $type[$name] = $id;
+        $type = [];
+        foreach ($data as $item) {
+            $pair = explode('=', $item, 2);
+            if (count($pair) !== 2 || $pair[0] === '') continue;
+            $type[$pair[0]] = $pair[1];
+        }
+        if (empty($type['type'])) return $this->ignore();
+        if (in_array($type['type'], ['CSP', 'CSC', 'CLN'], true)) {
+            foreach (['s' => 's_id', 'c' => 'co_id', 'p' => 'p_id', 'l' => 'pl_id', 'n' => 'cu'] as $short => $full) {
+                if (isset($type[$short])) $type[$full] = $type[$short];
+            }
         }
 
+        if (($type['type'] ?? '') === 'adminC') {
+            $type['k'] = ['sys' => 'system_type', 'gb' => 'price_per_gb', 'sub' => 'sub_address', 'def' => 'is_default'][$type['k'] ?? ''] ?? ($type['k'] ?? '');
+            if ($type['k'] === 'system_type') $type['v'] = ['pg' => 'pasarguard', 'sx' => 'sanaie'][$type['v'] ?? ''] ?? ($type['v'] ?? '');
+        }
         $callbackType = (string) ($type['type'] ?? '');
         if (str_starts_with(strtolower($callbackType), 'admin') && !$this->isAdmin) {
             return $this->denyAdminAccess();
@@ -190,6 +209,15 @@ class TelegramBotController extends Controller
         $telData->types = json_encode($type);
         $telData->save();
         switch ($type['type']) {
+            case 'adminC': return $this->adminCatalog($type);
+            case 'adminN': return $this->adminNetwork($type);
+            case 'adminS': return $this->adminSettings($type);
+            case 'adminHealth': return $this->adminHealth($type);
+            case 'adminServiceHelp': return $this->adminServiceHelp($type);
+            case 'adminReceipts': return $this->adminReceipts($type);
+            case 'adminReceipt': return $this->adminReceipt($type);
+            case 'adminSI': return $this->adminUserSellerChangeInbound($type);
+            case 'adminPanels': return $this->adminPanels($type);
             case 'adminCustomerLoyalty': return $this->adminCustomerLoyalty($type);
             case 'adminCustomerDiscount': return $this->adminCustomerDiscount($type);
             case 'adminCustomerDiscountClear': return $this->adminCustomerDiscountSave($type);
@@ -206,6 +234,7 @@ class TelegramBotController extends Controller
             case 'clientSelectCountry':
                 return $this->clientSelectCountry($type);
                 break;
+            case 'CSP':
             case 'clientSelectPlan':
                 return $this->clientSelectPlan($type);
                 break;
@@ -590,6 +619,8 @@ class TelegramBotController extends Controller
             case "connectAccount":
                 return $this->connectAccount($type);
                 break;
+            default:
+                return $this->sendTemporaryMessage('این گزینه قدیمی یا نامعتبر است؛ منو را با /start دوباره باز کنید.');
         }
 
 //        } catch (\Exception $exception) {
@@ -620,7 +651,7 @@ class TelegramBotController extends Controller
         }
 
         $setting = Setting::where('key', 'channel-join')->first();
-        if (!is_null($setting) && $setting->value == 1) {
+        if (!$this->isAdmin && !is_null($setting) && $setting->value == 1) {
             $this->ifUserIsJoined();
             if (!$this->isJoined) {
                 return $this->joinFirst();
@@ -629,6 +660,7 @@ class TelegramBotController extends Controller
 
         switch ($this->text) {
             case '/start':
+                $this->updatePath('start');
                 if ($this->isAdmin) {
                     return $this->adminMenu(['id' => null]);
                 }
@@ -638,9 +670,11 @@ class TelegramBotController extends Controller
                 return $this->connectAccount();
                 break;
             case '/services':
-                return $this->services();
+                $this->updatePath('clientService');
+                return $this->clientService();
                 break;
             case "/profile":
+                $this->updatePath('profile');
                 $this->profile();
                 break;
             default:
@@ -653,7 +687,11 @@ class TelegramBotController extends Controller
     {
         $user = $this->user;
 
+        if (str_starts_with(strtolower((string) $user->path), 'admin') && !$this->isAdmin) return $this->denyAdminAccess();
         switch ($user->path) {
+            case 'adminCatalogSave': return $this->adminCatalogSave();
+            case 'adminSettingsSave': return $this->adminSettingsSave();
+            case 'adminAllCountryPercent': return $this->adminAllCountryPercent();
             case 'adminCustomerLoyaltySave': return $this->adminCustomerLoyaltySave();
             case 'adminCustomerDiscountSave': return $this->adminCustomerDiscountSave();
             case 'adminUpdatePanel':
@@ -720,7 +758,7 @@ class TelegramBotController extends Controller
                 break;
             case 'adminPasarGuardGroupUpdate':
                 $type['name'] = $this->text;
-                return $this->adminPasarGuardGroupUpdate($type);
+                return $this->adminNetwork([]);
                 break;
             case 'adminChargeAmountSubmit':
                 $type['text'] = $this->text;
@@ -956,7 +994,18 @@ class TelegramBotController extends Controller
         if ($messageMethod == 'message') {
             if ($this->method == 'edit') {
                 $data['message_id'] = $this->messageId;
-                return $this->telegramSdk->editMessage($data);
+                $result = $this->telegramSdk->editMessage($data);
+                if (empty($result['ok'])) {
+                    $description = strtolower((string) ($result['description'] ?? ''));
+                    if (str_contains($description, 'message is not modified')) return $this->telegramSdk->answerCallback(['callback_query_id' => $this->callbackId]);
+                    if (str_contains($description, 'message to edit not found') || str_contains($description, "message can't be edited")) {
+                        unset($data['message_id']);
+                        return $this->telegramSdk->sendMessage($data);
+                    }
+                    Log::warning('Telegram menu update failed', ['error_code' => $result['error_code'] ?? null, 'path' => $this->user->path]);
+                    if ($this->callbackId) $this->telegramSdk->answerCallback(['callback_query_id' => $this->callbackId, 'text' => 'نمایش منو انجام نشد؛ با /start دوباره باز کنید.', 'show_alert' => true]);
+                } elseif ($this->callbackId) $this->telegramSdk->answerCallback(['callback_query_id' => $this->callbackId]);
+                return $result;
             } elseif ($this->method == 'temp') {
                 return $this->telegramSdk->sendMessage($data);
             } elseif ($this->method == 'toUser') {
@@ -1359,12 +1408,7 @@ class TelegramBotController extends Controller
 
     private function ignore()
     {
-        return $this->telegramSdk->answerCallback([
-            'callback_query_id' => $this->callbackId,
-            'text' => "دکمه اشتباهی رو کلیک کردی!",
-            'show_alert' => true,
-            'cache_time' => 1,
-        ]);
+        return $this->telegramSdk->answerCallback(['callback_query_id' => $this->callbackId]);
     }
 
     private function clientFooterButtons($path = null)
@@ -1476,7 +1520,7 @@ class TelegramBotController extends Controller
         }
 
         if (!is_null($homePage) && !is_null($homePage->value)) {
-            $text = $homePage->value;
+            $text = $this->escapeHtml($homePage->value);
         } else {
             $text = "🚀 به ربات ما خوش آمدید
 
@@ -1519,12 +1563,6 @@ class TelegramBotController extends Controller
         }
 
         $cartBeCart = Setting::where('key', 'cart_be_cart')->first();
-        $gateway = Setting::where('key', 'gateway')->first();
-
-        if (!is_null($gateway) && $gateway->value == 1) {
-            $buttons[][] = ['text' => "📦 درگاه", 'callback_data' => 'type=addFundStepOne|value=Online'];
-        }
-
         if (!is_null($cartBeCart) && $cartBeCart->value == 1) {
             $buttons[][] = ['text' => "📦 کارت به کارت", 'callback_data' => 'type=addFundStepOne|value=Cart'];
         }
@@ -1667,11 +1705,14 @@ class TelegramBotController extends Controller
 
     private function addFundOnline($data)
     {
-
+        return $this->purchaseError('پرداخت آنلاین در این نسخه فعال نیست؛ از کارت به کارت استفاده کنید.');
     }
 
     private function addFundCart($data)
     {
+        if ((int) Setting::where('key', 'cart_be_cart')->value('value') !== 1) return $this->purchaseError('پرداخت کارت به کارت غیرفعال است.');
+        $amount = str_replace(',', '', (string) ($data['amount'] ?? ''));
+        if (!ctype_digit($amount) || (int) $amount < 1000 || (int) $amount > 2000000000) return $this->purchaseError('مبلغ شارژ باید عدد صحیح بین ۱٬۰۰۰ و ۲٬۰۰۰٬۰۰۰٬۰۰۰ تومان باشد.');
         $this->updatePath('sendCartBeCartReceipt');
 
         $amount = $data['amount'];
@@ -1688,7 +1729,7 @@ class TelegramBotController extends Controller
                 ->limit(100)
                 ->pluck('id');
 
-            $card = Carts::find($ids->random());
+            $card = $ids->isNotEmpty() ? Carts::find($ids->random()) : null;
         } else {
             $card = Carts::orderby('id', 'desc')
                 ->where('status', 1)
@@ -1700,6 +1741,7 @@ class TelegramBotController extends Controller
                 ->where('status', 1)
                 ->first();
         }
+        if (!$card) return $this->purchaseError('کارت فعالی برای واریز ثبت نشده است؛ با پشتیبانی تماس بگیرید.');
         $user = $this->user;
         $amount = (int)str_replace(',', '', $amount);
 
@@ -1709,7 +1751,7 @@ class TelegramBotController extends Controller
         $payment->price = $amount;
         $payment->status = 0;
         $payment->type = 4;
-        $payment->expired_at = Carbon::now();
+        $payment->expired_at = Carbon::now()->addMinutes(30);
         $payment->detail = [
             'cart-number' => $card->cart,
             'cart-sheba' => $card->sheba,
@@ -1901,445 +1943,33 @@ class TelegramBotController extends Controller
      * Client Area
      */
 
-    protected function clientService($type)
-    {
-        $page = $type['page'] ?? 1;
-
-        $setting = Setting::where('key', 'channel-join')->first();
-        if (!is_null($setting) && $setting->value == 1) {
-            $this->ifUserIsJoined();
-            if (!$this->isJoined) {
-                return $this->joinFirst();
-            }
-        }
-
-        $plan = Plans::where('type', '!=', null)->where('status', 1)->pluck('type')->toArray();
-        $panel = Panels::where('panel_type', '!=', null)->where('status', 1)->pluck('type')->toArray();
-
-        $serviceId = array_values(array_unique(array_merge(
-            $plan,
-            $panel
-        )));
-
-        $list = Service::orderByDesc('id')
-            ->wherein('id', $serviceId)
-            ->paginate(10, ['*'], 'page', $page);
-
-        $text = headTitle("انتخاب سرویس ");
-        $text .= "💡 لطفاً یکی از سرویس زیر را انتخاب کنید:";
-
-        $keyboard = [];
-        $row = [];
-
-        foreach ($list as $country) {
-            $name = !is_null($country->name) ? $country->name : 'بدون نام';
-            $row[] = [
-                'text' => "{$name}",
-                'callback_data' => "type=clientSelectCountry|s_id={$country->id}",
-            ];
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-
-        $pagination = $this->paginationFooterButton($list, $page, 'clientService');
-        if (!is_null($pagination)) {
-            $keyboard[] = $pagination;
-        }
-
-        $keyboard[] = $this->clientFooterButtons();
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function clientSelectCountry($type)
-    {
-        $service_id = $type['s_id'];
-        $page = $type['page'] ?? 1;
-
-        $user = $this->user;
-        $telDetail = $user->tel_detail;
-        $telDetail['order-pasarguard-id'] = 0;
-        $user->tel_detail = $telDetail;
-        $user->save();
-
-        $service = Service::find($service_id);
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('سرویس مورد نظر یافت نشد');
-        }
-        $panelIds = Panels::where('status', 1)
-            ->where('panel_type', $service_id)
-            ->pluck('id')
-            ->toArray();
-
-        $inboundCountryIds = Inbounds::whereIn('panel_id', $panelIds)
-            ->whereNotNull('country_id')
-            ->distinct()
-            ->pluck('country_id')
-            ->toArray();
-
-        $panelCountryIds = Panels::where('status', 1)
-            ->where('panel_type', $service_id)
-            ->whereNotNull('country_id')
-            ->distinct()
-            ->pluck('country_id')
-            ->toArray();
-
-        $planCountryIds = array_values(array_unique(array_merge(
-            $panelCountryIds,
-            $inboundCountryIds
-        )));
-
-        $pasarguard = Panels::where('status', 1)
-            ->where('panel_type', $service_id)
-            ->where('system_type', 'pasarguard')
-            ->where('status', 1)
-            ->first();
-
-        $list = Countries::where('type', $service_id)
-            ->where('status', 1)
-            ->whereIn('id', $planCountryIds)
-            ->orderBy('name')
-            ->paginate(10);
-
-
-        $text = headTitle("🌍انتخاب کشور ");
-        $text .= "📦 <b>نوع سرویس:</b>
-<code>{$service->name}</code>
-
-💡 لطفاً یکی از کشور زیر را انتخاب کنید:
-";
-
-
-        $keyboard = [];
-        $row = [];
-
-        if (count($list) > 0) {
-            foreach ($list as $country) {
-                $name = !is_null($country->name) ? $country->name : 'بدون نام';
-                $row[] = [
-                    'text' => "{$name}",
-                    'callback_data' => "type=clientSelectPlan|s_id={$service->id}|co_id={$country->id}",
-                ];
-                if (count($row) === 2) {
-                    $keyboard[] = $row;
-                    $row = [];
-                }
-            }
-
-            if (!empty($row)) {
-                $keyboard[] = $row;
-            }
-        }
-
-        if (!is_null($pasarguard)) {
-            $pasarguardDetail = $pasarguard->detail;
-            if (array_key_exists('status', $pasarguardDetail) && $pasarguardDetail['status'] == 1) {
-                $keyboard[][] = [
-                    'text' => "🌍 همه کشور ها",
-                    'callback_data' => "type=clientSelectPlan|s_id={$service->id}|co_id=0|p_id={$pasarguard->id}",
-                ];
-            }
-            $text .= "
-گزینه همه کشورها:
-با انتخاب این نوع سفارش شما دسترسی برای اتصال با تمام کشور ها رو بصورت لینک ساب اسکریپشن دارید.";
-        }
-
-
-        $pagination = $this->paginationFooterButton($list, $page, "clientSelectCountry|si_id=$service_id");
-
-        if (!is_null($pagination)) {
-            $keyboard[] = $pagination;
-        }
-
-        $keyboard[] = $this->clientFooterButtons("type=clientService");
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function clientSelectPlan($type)
-    {
-        $service_id = $type['s_id'];
-        $country_id = $type['co_id'];
-        $pasarGuard_id = $type['p_id'] ?? 0;
-        $page = $type['page'] ?? 1;
-
-        $service = Service::find($service_id);
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('سرویس مورد نظر یافت نشد');
-        }
-
-        $country = Countries::find($country_id);
-        if (is_null($country) && $pasarGuard_id == 0) {
-            return $this->sendTemporaryMessage('کشور مورد نظر یافت نشد');
-        }
-        if ($pasarGuard_id != 0) {
-            $countryName = 'همه کشور ها';
-        } else {
-            $countryName = $country->name;
-        }
-
-        $list = Plans::where('type', $service_id)->where('status', 1)->orderby('id')->paginate(10);
-
-        $text = headTitle("🌍انتخاب تعرفه سرویس");
-        $text .= "📦 <b>نوع سرویس:</b>
-<code>{$service->name}</code>
-🌐 <b>کشور:</b>
-<code>{$countryName}</code>
-💡 لطفاً یکی از تعرفه‌های زیر را انتخاب کنید:";
-
-        $keyboard = [];
-        $row = [];
-
-        if (count($list) > 0) {
-            $pricing = app(OrderPricingService::class);
-            $pricingPanel = $pasarGuard_id ? Panels::find($pasarGuard_id) : null;
-
-            foreach ($list as $item) {
-                $name = !is_null($item->name) ? $item->name : 'بدون نام';
-
-                $planPrice = $pricing->amount((float) $item->price, (float) $item->discount, $pricingPanel);
-
-                $discount = "";
-                if ($item->discount > 0) {
-                    $discount = "| تخفیف: {$item->discount}%";
-                }
-                try {
-                    $price = number_format(app(CustomerLoyaltyService::class)->quote($this->user, (int) $service->id, $planPrice)['amount']);
-                } catch (\RuntimeException $e) {
-                    return $this->sendTemporaryMessage($e->getMessage());
-                }
-                $keyboard[] = [
-                    [
-                        'text' => "{$name} | $price T $discount",
-                        'callback_data' => "type=clientSelectCount|s_id={$service->id}|co_id={$country?->id}|pl_id={$item->id}|p_id={$pasarGuard_id}",
-                    ],
-                ];
-            }
-        }
-
-        $pagination = $this->paginationFooterButton($list, $page, "clientSelectPlan|s_id=$service_id");
-
-        if (!is_null($pagination)) {
-            $keyboard[] = $pagination;
-        }
-
-        $keyboard[] = $this->clientFooterButtons("type=clientSelectCountry|s_id=$service_id");
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-
-    }
-
-    protected function clientSelectCount($type)
-    {
-        $service_id = $type['s_id'];
-        $country_id = $type['co_id'];
-        $plan_id = $type['pl_id'];
-        $pasarGuard_id = $type['p_id'] ?? null;
-        $count = $type['cu'] ?? 1;
-
-        if ($count <= 0) {
-            return $this->telegramSdk->answerCallback([
-                'callback_query_id' => $this->callbackId,
-                'text' => "حداقل خرید یک عدد می باشد.",
-                'show_alert' => true,
-                'cache_time' => 1,
-            ]);
-        }
-
-        $service = Service::find($service_id);
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('سرویس مورد نظر یافت نشد');
-        }
-
-        $country = Countries::find($country_id);
-        if (is_null($country) && $pasarGuard_id == 0) {
-            return $this->sendTemporaryMessage('کشور مورد نظر یافت نشد');
-        }
-        if ($pasarGuard_id != 0) {
-            $countryName = 'همه کشور ها';
-        } else {
-            $countryName = $country->name;
-        }
-
-        $plan = Plans::find($plan_id);
-        if (is_null($plan)) {
-            return $this->sendTemporaryMessage('تعرفه مورد نظر یافت نشد');
-        }
-        $text = headTitle("🌍انتخاب تعداد");
-        $text .= "📦 <b>نوع سرویس:</b>
-<code>{$service->name}</code>
-🌐 <b>کشور:</b>
-<code>{$countryName}</code>
-🌐 <b>تعرفه:</b>
-<code>{$plan->name} | حجم: {$plan->bandwidth} GB</code>
-💡 لطفاً تعداد را مشخص کنید:";
-
-        $decrement = max(1, $count - 1);
-        $increment = min(10, $count + 1);
-
-        $keyboard[] = [
-            [
-                'text' => '➖',
-                'callback_data' => $count <= 1
-                    ? 'ignore'
-                    : "type=CSC|s_id={$service_id}|co_id={$country?->id}|pl_id={$plan_id}|cu={$decrement}|p_id={$pasarGuard_id}",
-                'style' => 'danger',
-            ],
-            [
-                'text' => "🛒 {$count}",
-                'callback_data' => "ignore",
-            ],
-            [
-                'text' => '➕',
-                'callback_data' => $count >= 10
-                    ? 'ignore'
-                    : "type=CSC|s_id={$service_id}|co_id={$country?->id}|pl_id={$plan_id}|cu={$increment}|p_id={$pasarGuard_id}",
-                'style' => 'success',
-            ],
-        ];
-
-        $keyboard[] = [
-            [
-                'text' => 'مرحله بعد',
-                'callback_data' => "type=CLN|s_id={$service_id}|co_id={$country?->id}|pl_id={$plan_id}|cu={$count}|p_id={$pasarGuard_id}",
-            ],
-            [
-                'text' => '🔙 بازگشت',
-                'callback_data' => "type=clientSelectPlan|s_id=$service_id|co_id=$country_id|p_id={$pasarGuard_id}",
-            ],
-        ];
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function clientSelectName($type)
-    {
-        $service_id = $type['s_id'];
-        $country_id = $type['co_id'];
-        $plan_id = $type['pl_id'];
-        $pasarGuard_id = $type['p_id'] ?? 0;
-        $count = $type['cu'] ?? 1;
-
-        $user = $this->user;
-
-        $tel_detail = $user->tel_detail;
-
-        $tel_detail['order-service-id'] = $service_id;
-        $tel_detail['order-country-id'] = $country_id;
-        $tel_detail['order-plan-id'] = $plan_id;
-        $tel_detail['order-pasarguard-id'] = $pasarGuard_id;
-        $tel_detail['order-extra'] = null;
-        $tel_detail['order-count'] = $count;
-
-        $user->tel_detail = $tel_detail;
-        $user->save();
-
-        $this->updatePath('clientFinalStep');
-
-        $text = headTitle("🌍انتخاب نام کانفیگ");
-        $text .= "💡 لطفاً نام کانفیگ خود را وارد کنید در غیر اینصورت بر روی دکمه انتخاب خودکار کلیک کنید";
-
-
-        $keyboard[] = [
-            [
-                'text' => 'انتخاب خودکار',
-                'callback_data' => "type=clientFinalStep|name=random",
-            ],
-        ];
-        $keyboard[] = [
-            [
-                'text' => '🔙 بازگشت',
-                'callback_data' => "type=clientSelectCount|s_id={$service_id}|co_id={$country_id}|pl_id={$plan_id}|cu={$count}|p_id={$pasarGuard_id}",
-            ],
-        ];;
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
 
     protected function clientFinalStep($type)
     {
         $user = $this->user;
         $tel_detail = $user->tel_detail;
         $name = $type['name'] ?? $this->text;
-        if (!preg_match('/^[a-zA-Z]+$/', $name)) {
+        if (!preg_match('/^[a-zA-Z]{1,32}$/D', (string) $name)) {
             return $this->sendTemporaryMessage(
-                '❌ نام فقط باید شامل حروف انگلیسی باشد.'
+                'نام باید بین ۱ تا ۳۲ حرف انگلیسی باشد.'
             );
         }
 
-        $service_id = $tel_detail['order-service-id'];
-        $country_id = $tel_detail['order-country-id'];
-        $plan_id = $tel_detail['order-plan-id'];
+        $selection = $this->purchaseSelection([
+            's_id' => $tel_detail['order-service-id'] ?? 0,
+            'co_id' => $tel_detail['order-country-id'] ?? 0,
+            'p_id' => $tel_detail['order-pasarguard-id'] ?? 0,
+            'pl_id' => $tel_detail['order-plan-id'] ?? 0,
+            'cu' => $tel_detail['order-count'] ?? 0,
+        ], true);
+        if (!$selection) return;
+        ['service' => $service, 'country' => $country, 'panel' => $pricingPanel, 'plan' => $plan, 'count' => $count] = $selection;
+        $service_id = $service->id;
+        $country_id = $country?->id ?? 0;
+        $pasarGuard_id = $pricingPanel?->id ?? 0;
+        $plan_id = $plan->id;
         $extra = null;
-        $count = $tel_detail['order-count'];
-        $pasarGuard_id = $tel_detail['order-pasarguard-id'] ?? 0;
-
-        $service = Service::find($service_id);
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('سرویس مورد نظر یافت نشد');
-        }
-
-        $country = Countries::find($country_id);
-        if (is_null($country) && $pasarGuard_id == 0) {
-            return $this->sendTemporaryMessage('کشور مورد نظر یافت نشد');
-        }
-        if ($pasarGuard_id != 0) {
-            $countryName = 'همه کشور ها';
-        } else {
-            $countryName = $country->name;
-        }
-
-        $plan = Plans::find($plan_id);
-        if (is_null($plan)) {
-            return $this->sendTemporaryMessage('تعرفه مورد نظر یافت نشد');
-        }
-        $pricingPanel = $pasarGuard_id ? Panels::find($pasarGuard_id) : null;
+        $countryName = $this->escapeHtml($country?->name ?? 'همه کشورها');
         $planPrice = app(OrderPricingService::class)->amount((float) $plan->price, (float) $plan->discount, $pricingPanel);
         try {
             $loyaltyQuote = app(CustomerLoyaltyService::class)->quote($user, (int) $service->id, $planPrice);
@@ -2347,6 +1977,7 @@ class TelegramBotController extends Controller
             return $this->sendTemporaryMessage($e->getMessage());
         }
         $total = $loyaltyQuote['amount'] * $count;
+        if ($total < 0 || $total > 2147483647) return $this->purchaseError('مبلغ سفارش خارج از محدوده مجاز است؛ تعداد را کاهش دهید یا با پشتیبانی تماس بگیرید.');
         $loyaltyQuote['unit_amount'] = $loyaltyQuote['amount'];
         $loyaltyQuote['quantity'] = (int) $count;
         $loyaltyQuote['base_amount'] *= $count;
@@ -2378,14 +2009,14 @@ class TelegramBotController extends Controller
         $payment->detail = ['customer_loyalty_quote' => $loyaltyQuote];
         $payment->status = 0;
         $payment->type = 1;
-        $payment->expired_at = Carbon::now();
+        $payment->expired_at = Carbon::now()->addMinutes(30);
         $payment->save();
         $price = number_format($payment->price);
 
         $text = headTitle("🌍 انتخاب نحوه پرداخت");
-        $text .= "📦 <b>نوع سرویس:</b> <code>{$service->name}</code>
+        $text .= "📦 <b>نوع سرویس:</b> <code>{$this->escapeHtml($service->name)}</code>
 🌐 <b>کشور:</b> <code>{$countryName}</code>
-🌐 <b>تعرفه:</b> <code>{$plan->name}</code>
+🌐 <b>تعرفه:</b> <code>{$this->escapeHtml($plan->name)}</code>
 🌐 <b>تعداد:</b><code>{$count} عدد</code>
 💵 <b>مبلغ کل:</b> <code>{$price} تومان</code>
 💡 نحوه پرداخت را مشخص کنید:";
@@ -2410,7 +2041,7 @@ class TelegramBotController extends Controller
         $keyboard[] = [
             [
                 'text' => '🔙 بازگشت',
-                'callback_data' => "type=clientSelectName|s_id={$service_id}|co_id={$country?->id}|pl_id={$plan_id}|cu={$count}|p_id={$pasarGuard_id}",
+                'callback_data' => "type=CLN|s={$service_id}|c={$country_id}|l={$plan_id}|n={$count}|p={$pasarGuard_id}",
             ],
         ];
         $data = [
@@ -2656,7 +2287,7 @@ class TelegramBotController extends Controller
 
         $this->updatePath('sendCartBeCartReceipt');
         $text = headTitle('💳 پرداخت کارت به کارت');
-        $text .= "لطفا عکس رسید خود را ارسال کنید. \n";
+        $text .= $this->escapeHtml(Setting::where('key', 'cart_be_cart_text')->value('value') ?: 'لطفا عکس رسید خود را ارسال کنید.');
 
         $buttons[] = [
             [
@@ -3350,41 +2981,19 @@ class TelegramBotController extends Controller
 
         $orderDetail = $preOrder->data;
 
-        $plan = Plans::find($orderDetail['plan-id']);
-        $panel = Panels::where('country_id', $orderDetail['country-id'])
-            ->where('panel_type', $plan->type)
-            ->where('system_type', 'sanaie')
-            ->where('status', 1)
-            ->first();
-
-        if (!is_null($panel)) {
-            $activeInbound = Inbounds::where('panel_id', $panel->id)
-                ->where('status', 1)
-                ->first();
-
-            if (!is_null($activeInbound)) {
-                $data['panel'] = $panel;
-            } else {
-
-                $activeInbound = Inbounds::where('country_id', $orderDetail['country-id'])
-                    ->where('status', 1)
-                    ->first();
-                if (!is_null($activeInbound)) {
-                    $data['panel'] = Panels::find($activeInbound->panel_id);
-                }
-            }
+        $plan = Plans::find($orderDetail['plan-id'] ?? 0);
+        if (!$plan) return ['status' => false, 'message' => 'تعرفه سفارش پیدا نشد؛ مدیر باید آن را بررسی کند.'];
+        $catalog = app(\App\Services\BotCatalogService::class);
+        $activeInbound = null;
+        if ((int) ($orderDetail['pasarguard-id'] ?? 0) > 0) {
+            $panel = Panels::where('system_type', 'pasarguard')->find($orderDetail['pasarguard-id']);
         } else {
-            $activeInbound = Inbounds::where('country_id', $orderDetail['country-id'])
-                ->where('status', 1)
-                ->first();
-
-            if (!is_null($activeInbound)) {
-                $data['panel'] = Panels::find($activeInbound->panel_id);
-            }
+            $activeInbound = $catalog->routes((int) $plan->type, (int) ($orderDetail['country-id'] ?? 0))->with('panel')->orderBy('id')->first();
+            $panel = $activeInbound?->panel;
         }
-        if (array_key_exists('pasarguard-id', $orderDetail) && $orderDetail['pasarguard-id'] != 0) {
-            $data['panel'] = Panels::find($orderDetail['pasarguard-id']);
-        }
+        if (!$panel) return ['status' => false, 'message' => 'پنل یا اتصال سفارش در دسترس نیست؛ مدیر باید اتصال کشور را بررسی کند.'];
+        $data['panel'] = $panel;
+        $data['activeInbound'] = $activeInbound;
         $data['targetUser'] = $targetUser;
         $data['payment'] = $payment;
         $data['preOrder'] = $preOrder;
@@ -3469,10 +3078,10 @@ class TelegramBotController extends Controller
                 $prefix = trim(preg_replace('/[^a-zA-Z0-9]+/', '-', $remarkBase), '-');
                 $remark = substr($prefix ?: (string) $targetUser->tel_id, 0, 128 - strlen($suffix)) . $suffix;
 
-                $bandwidth = (int)$plan->bandwidth;
+                $bandwidth = (float)$plan->bandwidth;
 
                 if ($extra = ExtraBandwidth::find($orderDetail['extra'] ?? null)) {
-                    $bandwidth += (int)$extra->bandwidth;
+                    $bandwidth += (float)$extra->name;
                 }
 
 
@@ -3604,9 +3213,9 @@ $codeText
             |--------------------------------------------------------------------------
             */
 
-            $activeInbound = Inbounds::where('panel_id', $panel->id)
-                ->where('status', 1)
-                ->first();
+            $activeInbound = $data['activeInbound'] ?? app(\App\Services\BotCatalogService::class)
+                ->routes((int) $plan->type, $orderCountryId)->where('panel_id', $panel->id)->first();
+            if (!$activeInbound) return ['status' => false, 'message' => 'اینباند فعال برای کشور سفارش پیدا نشد.'];
 
             $inbound = json_decode($activeInbound->setting, true);
             if (!$inbound) {
@@ -3637,10 +3246,10 @@ $codeText
 
                 $remark = $remarkBase . '-' . rand(1111, 9999);
 
-                $bandwidth = (int)$plan->bandwidth;
+                $bandwidth = (float)$plan->bandwidth;
 
                 if ($extra = ExtraBandwidth::find($orderDetail['extra'] ?? null)) {
-                    $bandwidth += (int)$extra->bandwidth;
+                    $bandwidth += (float)$extra->name;
                 }
 
                 $expireTime = Carbon::now()
@@ -4461,6 +4070,8 @@ $codeText
 
     protected function clientRenewOrder($data)
     {
+        if (!app(\App\Services\BotCatalogService::class)->enabled('renew')) return $this->purchaseError('این قابلیت فعلاً از سمت مدیریت غیرفعال است.');
+
         $orderId = $data['id'] ?? null;
         $order = Orders::botManaged()->where('id', $orderId)
             ->where('user_id', $this->user->id)
@@ -4480,7 +4091,7 @@ $codeText
             return $this->sendTemporaryMessage('پنل مربوط به سفارش یافت نشد.');
         }
 
-        $plans = Plans::where('type', $panel->panel_type)->where('status', 1)->orderby('id')->get();
+        $plans = Plans::where('type', $panel->panel_type)->where('status', 1)->whereNull('deleted_at')->orderby('id')->get();
 
         if (count($plans) > 0) {
             $pricing = app(OrderPricingService::class);
@@ -4526,6 +4137,8 @@ $codeText
 
     protected function clientSubmitRenew($data)
     {
+        if (!app(\App\Services\BotCatalogService::class)->enabled('renew')) return $this->purchaseError('این قابلیت فعلاً از سمت مدیریت غیرفعال است.');
+
 
         $orderId = $data['o_id'];
         $planId = $data['pl_id'];
@@ -4533,7 +4146,7 @@ $codeText
         $order = Orders::botManaged()->where('id', $orderId)
             ->where('user_id', $user->id)
             ->first();
-        $plan = Plans::find($planId);
+        $plan = Plans::where('status', 1)->whereNull('deleted_at')->find($planId);
 
         if (!$order || !$plan) {
             return $this->sendTemporaryMessage('سفارش یا تعرفه مورد نظر یافت نشد.');
@@ -4562,6 +4175,7 @@ $codeText
             return $this->sendTemporaryMessage($e->getMessage());
         }
         $planPrice = $loyaltyQuote['amount'];
+        if ($planPrice < 0 || $planPrice > 2147483647) return $this->purchaseError('مبلغ تمدید خارج از محدوده مجاز است؛ با پشتیبانی تماس بگیرید.');
         $price = number_format($planPrice);
         $detail['customer_loyalty_quote'] = $loyaltyQuote;
 
@@ -4862,6 +4476,8 @@ $codeText
 
     protected function clientBuyExtra($data)
     {
+        if (!app(\App\Services\BotCatalogService::class)->enabled('extra')) return $this->purchaseError('این قابلیت فعلاً از سمت مدیریت غیرفعال است.');
+
         $order = Orders::botManaged()->where('id', $data['id'] ?? null)
             ->where('user_id', $this->user->id)
             ->first();
@@ -4935,6 +4551,8 @@ $codeText
 
     protected function clientSubmitExtra($data)
     {
+        if (!app(\App\Services\BotCatalogService::class)->enabled('extra')) return $this->purchaseError('این قابلیت فعلاً از سمت مدیریت غیرفعال است.');
+
         $orderId = $data['o_id'];
         $extraId = $data['ex_id'];
         $user = $this->user;
@@ -4946,7 +4564,7 @@ $codeText
             return $this->sendTemporaryMessage('خرید حجم برای این سفارش امکان‌پذیر نیست.');
         }
         $panel = Panels::find($order->panel_id);
-        $extra = ExtraBandwidth::find($extraId);
+        $extra = ExtraBandwidth::where('status', 1)->find($extraId);
         if (!$panel || !$extra) {
             return $this->sendTemporaryMessage('اطلاعات خرید حجم کامل نیست.');
         }
@@ -4969,6 +4587,7 @@ $codeText
             return $this->sendTemporaryMessage($e->getMessage());
         }
         $extraPrice = $loyaltyQuote['amount'];
+        if ($extraPrice < 0 || $extraPrice > 2147483647) return $this->purchaseError('مبلغ حجم اضافه خارج از محدوده مجاز است؛ با پشتیبانی تماس بگیرید.');
         $price = number_format($extraPrice);
         $detail['customer_loyalty_quote'] = $loyaltyQuote;
 
@@ -5284,7 +4903,6 @@ $codeText
     }
 
 
-
     /**
      * Client Area
      */
@@ -5293,85 +4911,7 @@ $codeText
     /**
      * Admin Area
      */
-    protected function adminMenu($type)
-    {
-        $buttons = [];
 
-        $buttons[] = [
-            [
-                'text' => "👥 لیست کاربران",
-                'callback_data' => 'type=adminUserList'],
-        ];
-
-//        $buttons[] = [
-//            ['text' => "🛒 سفارشات اخیر",
-//                'callback_data' => 'type=adminOrdersList'],
-//            [
-//                'text' => "💳 تراکنشات اخیر",
-//                'callback_data' => 'type=recent-transactions'],
-//        ];
-
-        $buttons[] = [
-            [
-                'text' => "🖥 پنل‌ها",
-                'callback_data' => 'type=adminPanelMenu',
-            ],
-        ];
-
-        $buttons[] = [
-            [
-                'text' => "📦 تعرفه ها",
-                'callback_data' => 'type=adminPlans',
-            ],
-            [
-                'text' => "📥 دریافت بکاپ",
-                'callback_data' => 'type=backup',
-            ],
-        ];
-
-        $buttons[] = [
-            ['text' => "🤖 پیام‌های ربات",
-                'callback_data' => 'type=bot-messages'],
-            ['text' => "📨 ارسال پیام",
-                'callback_data' => 'type=send-message'],
-        ];
-        $buttons[] = [
-            [
-                'text' => '⭐ تخفیف پلکانی کاربران عادی',
-                'callback_data' => 'type=adminCustomerLoyalty',
-            ],
-        ];
-        $buttons[] = [
-            [
-                'text' => "تنظیمات کلی",
-                'callback_data' => 'type=adminSetting',
-            ],
-        ];
-
-        $buttons[] = [
-            [
-                'text' => "🏠 پنل کاربر",
-                'style' => 'success',
-                'callback_data' => 'type=home',
-            ],
-        ];
-
-        $text = headTitle("👑 پنل مدیریت ربات");
-        $text .= "⚙️ مدیریت کاربران، سفارشات، سرویس‌ها،
-پنل‌ها، تراکنش‌ها و تنظیمات سیستم
-
-📌 لطفاً یکی از گزینه‌های زیر را انتخاب کنید.
-";
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => $text,
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ])
-        ];
-        return $this->sendMessage($data, 'message');
-    }
 
     // Users List
     protected function adminUserList($type)
@@ -5893,7 +5433,7 @@ $codeText
         }
 
         $validator = Validator::make(['amount' => $this->text], [
-            'amount' => ['required', 'integer', 'min:1'],
+            'amount' => ['required', 'integer', 'between:1,2000000000'],
         ], [
             'amount.required' => '❌ مبلغ را وارد کنید.',
             'amount.integer' => '❌ مبلغ باید یک عدد صحیح باشد.',
@@ -5907,8 +5447,8 @@ $codeText
 
         $user = $this->user;
 
-        $action = $user->tel_detail['user-action'];
-        $id = $user->tel_detail['user-id'];
+        $action = $user->tel_detail['user-action'] ?? '';
+        $id = $user->tel_detail['user-id'] ?? 0;
 
         $targetUser = User::find($id);
 
@@ -5921,13 +5461,23 @@ $codeText
         }
 
         $direction = $action === 'increment' ? 'credit' : 'debit';
-        $result = app(WpSyncService::class)->adminWalletAdjust(
-            $targetUser,
-            $direction,
-            $balance,
-            '',
-            ['admin_id' => $user->id]
-        );
+        $result = DB::transaction(function () use ($user, $targetUser, $direction, $balance, $action, $id) {
+            $admin = User::whereKey($user->id)->lockForUpdate()->first();
+            if (!$admin || (int) $admin->is_admin !== 1 || $admin->path !== 'adminUserBalanceActionBalance'
+                || ($admin->tel_detail['user-action'] ?? '') !== $action || (int) ($admin->tel_detail['user-id'] ?? 0) !== (int) $id) {
+                return ['ok' => false, 'message' => 'این مرحله قبلاً پردازش یا لغو شده است؛ کاربر را دوباره باز کنید.'];
+            }
+            $target = User::whereKey($targetUser->id)->lockForUpdate()->first();
+            if ($direction === 'credit' && (int) $target->balance + $balance > 2147483647) return ['ok' => false, 'message' => 'موجودی نهایی از محدوده مجاز بیشتر است.'];
+            $result = app(WpSyncService::class)->adminWalletAdjust($target, $direction, $balance, '', ['admin_id' => $admin->id]);
+            if ($result['ok'] ?? false) {
+                $detail = $admin->tel_detail ?? []; unset($detail['user-action'], $detail['user-id']);
+                // Only update input state, including when the admin adjusts their own wallet.
+                User::whereKey($admin->id)->update(['path' => 'start', 'tel_detail' => $detail]);
+            }
+            return $result;
+        });
+        $this->user->refresh();
         if (!($result['ok'] ?? false)) {
             return $this->sendTemporaryMessage($result['message'] ?? 'عملیات کیف پول انجام نشد.');
         }
@@ -6040,7 +5590,7 @@ $codeText
                     'style' => 'primary'
                 ],
                 [
-                    'text' => '🎁 اینبوند های فروشنده',
+                    'text' => 'اتصال‌های فروشنده (قدیمی)',
                     'callback_data' => "type=adminUserSellerInbounds|id={$id}",
                     'style' => 'primary'
                 ]
@@ -6095,8 +5645,11 @@ $codeText
 
     protected function adminUserIsAdmin($type)
     {
-        $id = $type['id'];
-        $value = $type['value'];
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        $id = $type['id'] ?? 0;
+        $value = (string) ($type['value'] ?? '');
+        if (!in_array($value, ['0', '1'], true)) return $this->sendTemporaryMessage('مقدار دسترسی معتبر نیست.');
+        $value = (int) $value;
 
         $user = User::find($id);
 
@@ -6163,8 +5716,11 @@ $codeText
 
     protected function adminUserIsSeller($type)
     {
-        $id = $type['id'];
-        $value = $type['value'];
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        $id = $type['id'] ?? 0;
+        $value = (string) ($type['value'] ?? '');
+        if (!in_array($value, ['0', '1'], true)) return $this->sendTemporaryMessage('مقدار دسترسی معتبر نیست.');
+        $value = (int) $value;
 
         $user = User::find($id);
 
@@ -6345,6 +5901,7 @@ $codeText
 
         $targetUser->tel_detail = $targetDetail;
         $targetUser->save();
+        $this->updatePath('start');
 
         /*
         |--------------------------------------------------------------------------
@@ -6384,219 +5941,45 @@ $codeText
 
     protected function adminUserSellerInbounds($type)
     {
-        $id = $type['id'];
-        $page = $type['page'] ?? 1;
-
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        $id = (int) ($type['id'] ?? 0);
+        $page = max(1, (int) ($type['page'] ?? 1));
         $user = User::find($id);
-
-        if (!$user) {
-            return $this->sendTemporaryMessage('کاربر پیدا نشد');
+        if (!$user || (int) $user->is_seller !== 1) return $this->adminPage('اتصال‌های فروشنده', 'ابتدا دسترسی فروشنده را در تنظیمات همین کاربر فعال کنید.', [], "type=adminUserSettings|id={$id}");
+        // Old releases stored active membership both with status=1 and with null status.
+        $selected = SellerInbound::where('user_id', $id)->where(fn ($q) => $q->where('status', 1)->orWhereNull('status'))->pluck('inbound_id')->all();
+        $list = Inbounds::with('panel')->whereHas('panel')->orderByDesc('id')->paginate(10, ['*'], 'page', $page);
+        $rows = [];
+        foreach ($list as $route) {
+            $active = in_array($route->id, $selected);
+            $rows[] = [$this->adminButton(($active ? '✅ ' : '❌ ').$route->remark.' · '.$route->panel->name,
+                "type=adminSI|id={$id}|i={$route->id}|v=".($active ? 0 : 1)."|page={$page}")];
         }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Seller Inbounds (NEW STRUCTURE)
-        |--------------------------------------------------------------------------
-        */
-
-        $selectedInboundIds = SellerInbound::where('user_id', $user->id)
-            ->pluck('inbound_id')
-            ->toArray();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Inbounds Pagination
-        |--------------------------------------------------------------------------
-        */
-
-        $inbounds = Inbounds::with(['panel'])
-            ->orderByDesc('id')
-            ->paginate(10, ['*'], 'page', $page);
-
-        /*
-        |--------------------------------------------------------------------------
-        | Text
-        |--------------------------------------------------------------------------
-        */
-
-        $username = $user->username ? "@{$user->username}" : '—';
-
-        $text = headTitle("🌐 اینباندهای فروشنده");
-
-        $text .= "👤 کاربر:\n<code>{$username}</code>\n\n";
-
-        $text .= "ℹ️ راهنما:\n";
-        $text .= "✅ فعال\n❌ غیرفعال\n\n";
-
-        $text .= "⚙️ برای تغییر وضعیت روی هر اینباند کلیک کنید.";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Keyboard
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard = [];
-
-        foreach ($inbounds as $inbound) {
-
-            $isActive = in_array($inbound->id, $selectedInboundIds);
-
-            $icon = $isActive ? '✅' : '❌';
-
-            $panelName = $inbound->panel->name ?? 'بدون پنل';
-
-            $btnText = "{$icon} {$panelName} | {$inbound->remark} | {$inbound->port}";
-
-            $keyboard[] = [
-                [
-                    'text' => $btnText,
-                    'callback_data' => "type=adminUserSellerChangeInbound|id={$id}|inbound_id={$inbound->id}",
-                ]
-            ];
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Pagination
-        |--------------------------------------------------------------------------
-        */
-
-        $pagination = [];
-
-        if ($inbounds->currentPage() > 1) {
-
-            $pagination[] = [
-                'text' => '⬅️ قبلی',
-                'callback_data' => 'type=adminUserSellerInbounds'
-                    . "|id={$id}|page=" . ($page - 1)
-            ];
-        }
-
-        $pagination[] = [
-            'text' => "📄 {$inbounds->currentPage()} / {$inbounds->lastPage()}",
-            'callback_data' => 'ignore',
-            'style' => 'primary'
-        ];
-
-        if ($inbounds->hasMorePages()) {
-
-            $pagination[] = [
-                'text' => 'بعدی ➡️',
-                'callback_data' => 'type=adminUserSellerInbounds'
-                    . "|id={$id}|page=" . ($page + 1)
-            ];
-        }
-
-        $keyboard[] = $pagination;
-
-        /*
-        |--------------------------------------------------------------------------
-        | Bottom Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard[] = [
-            [
-                'text' => '📂 بازگشت',
-                'callback_data' => "type=adminUserSettings|id={$id}"
-            ]
-        ];
-
-        $keyboard[] = [
-            [
-                'text' => '🏠 منو اصلی',
-                'callback_data' => 'type=admin-home'
-            ]
-        ];
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
+        if ($pagination = $this->paginationFooterButton($list, $page, "adminUserSellerInbounds|id={$id}")) $rows[] = $pagination;
+        return $this->adminPage('اتصال‌های فروشنده (قدیمی)', 'این فهرست داده‌های نسخه قبلی را مدیریت می‌کند. خرید فعلی فروشنده از کاتالوگ عمومی VIP استفاده می‌کند؛ این فهرست محدودیت فروش ایجاد نمی‌کند. کشورها و اتصال‌های قابل فروش از بخش کشورها مدیریت می‌شوند.', $rows, "type=adminUserSettings|id={$id}");
     }
 
     protected function adminUserSellerChangeInbound($type)
     {
-        $id = $type['id'];
-        $inbound_id = (int)$type['inbound_id'];
-
-        $seller = Seller::where('user_id', $id)->first();
-
-        if (!$seller) {
-            return $this->sendTemporaryMessage('تنظیمات فروشنده پیدا نشد');
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        $id = (int) ($type['id'] ?? 0);
+        $inboundId = (int) ($type['i'] ?? $type['inbound_id'] ?? 0);
+        $seller = User::where('is_seller', 1)->find($id);
+        $route = Inbounds::whereHas('panel')->find($inboundId);
+        if (!$seller || !$route) return $this->adminPage('اتصال فروشنده', 'فروشنده یا اتصال پیدا نشد.', [], "type=adminUserSettings|id={$id}");
+        // Old toggle buttons only reopen the list; new buttons carry an explicit target state.
+        if (isset($type['v']) && in_array((string) $type['v'], ['0', '1'], true)) {
+            $relation = SellerInbound::firstOrNew(['user_id' => $id, 'inbound_id' => $inboundId]);
+            $relation->status = (int) $type['v'] === 1 ? 1 : -1;
+            $relation->save();
         }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Check existing relation
-        |--------------------------------------------------------------------------
-        */
-
-        $exists = SellerInbound::where('user_id', $id)
-            ->where('inbound_id', $inbound_id)
-            ->first();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Toggle
-        |--------------------------------------------------------------------------
-        */
-
-        if ($exists) {
-
-            $exists->delete();
-
-            $message = '❌ اینباند غیرفعال شد';
-
-        } else {
-
-            SellerInbound::create([
-                'user_id' => $id,
-                'inbound_id' => $inbound_id
-            ]);
-
-            $message = '✅ اینباند فعال شد';
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Alert (non-blocking)
-        |--------------------------------------------------------------------------
-        */
-
-        $this->telegramSdk->answerCallback([
-            'callback_query_id' => $this->callbackId,
-            'text' => $message,
-            'show_alert' => false,
-            'cache_time' => 1,
-        ]);
-
-        /*
-        |--------------------------------------------------------------------------
-        | Reload UI
-        |--------------------------------------------------------------------------
-        */
-
-        return $this->adminUserSellerInbounds([
-            'id' => $id
-        ]);
+        return $this->adminUserSellerInbounds(['id' => $id, 'page' => $type['page'] ?? 1]);
     }
 
     protected function adminToggleUserStatus($type)
     {
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        if ((int) ($type['id'] ?? 0) === (int) $this->user->id || (string) ($type['id'] ?? '') === (string) env('SUPERADMIN')) return $this->sendTemporaryMessage('امکان غیرفعال کردن حساب خودتان یا مدیر اصلی وجود ندارد.');
         $id = $type['id'];
 
         $user = User::find($id);
@@ -6676,1190 +6059,12 @@ $codeText
 
     // Start Panels
 
-    protected function adminPanelMenu($type = null)
-    {
-        $buttons = [];
-
-        $buttons[] = [
-            [
-                'text' => "🧩 انواع سرویس‌ها",
-                'callback_data' => 'type=adminService',
-            ],
-            [
-                'text' => "🌍 کشورها",
-                'callback_data' => 'type=adminCountries',
-            ],
-        ];
-
-        $buttons[] = [
-            [
-                'text' => "📦 تعرفه‌ها",
-                'callback_data' => 'type=adminPlans',
-            ],
-            [
-                'text' => "🖥 پنل‌ها",
-                'callback_data' => 'type=admin-panels',
-            ],
-        ];
-
-        $buttons[] = [
-            [
-                'text' => "💾 حجم‌های اضافه",
-                'callback_data' => 'type=adminExtraBandwidths',
-            ],
-            [
-                'text' => "🌐 اینباندها",
-                'callback_data' => 'type=adminInbounds',
-            ],
-        ];
-
-        $buttons[] = [
-            [
-                'text' => "📘 راهنما و آموزش",
-                'callback_data' => 'type=adminServiceHelp',
-                'style' => 'primary'
-            ],
-        ];
-
-        $buttons[] = $this->adminFooterButtons();
-
-        $text = headTitle(" ⚙️ مدیریت سرویس‌ها");
-        $text .= "از این بخش می‌توانید:\n\n";
-
-        $text .= "🌍 کشورها را مدیریت کنید\n";
-        $text .= "🖥 پنل‌ها را تنظیم کنید\n";
-        $text .= "📦 تعرفه های فروش را مدیریت کنید\n";
-        $text .= "💾 حجم‌های اضافه را تنظیم کنید\n";
-        $text .= "🌐 اینباندها را مدیریت کنید\n\n";
-
-        $text .= "👇 لطفاً یکی از گزینه‌های زیر را انتخاب کنید.";
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ])
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminPanels($type)
-    {
-        $page = $type['page'] ?? 1;
-
-        $list = Panels::orderByDesc('id')
-            ->paginate(10, ['*'], 'page', $page);
-
-        /*
-        |--------------------------------------------------------------------------
-        | Keyboard
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard = ['inline_keyboard' => []];
-
-        foreach ($list as $panel) {
-            $status = match ((int)$panel->status) {
-                1 => '🟢 فعال',
-                0 => '🟡 در انتظار',
-                -1 => '🔴 غیرفعال',
-                default => '⚪ نامشخص',
-            };
-            $name = !is_null($panel->name) ? $panel->name : 'بدون نام';
-            $keyboard['inline_keyboard'][] = [
-                [
-                    'text' => "نام: {$name} | {$status}",
-                    'callback_data' => "type=adminPanelDetail|id={$panel->id}",
-                ]
-            ];
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Pagination
-        |--------------------------------------------------------------------------
-        */
-
-        $pagination = $this->paginationFooterButton($list, $page, 'adminPanels');
-
-        if (!empty($pagination)) {
-            $keyboard['inline_keyboard'][] = $pagination;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Actions
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard['inline_keyboard'][] = [
-            [
-                'text' => '➕ ایجاد پنل جدید',
-                'callback_data' => 'type=adminCreatePanel',
-                'style' => 'success'
-            ]
-        ];
-
-        $keyboard['inline_keyboard'][] = $this->adminFooterButtons("type=adminPanelMenu");
-
-        /*
-        |--------------------------------------------------------------------------
-        | Text
-        |--------------------------------------------------------------------------
-        */
-
-        $text = headTitle("🖥 مدیریت پنل‌ها");
-
-        $text .= "📌 وضعیت پنل‌ها:\n";
-        $text .= "🟢 فعال = پنل در حال کار و قابل استفاده\n";
-        $text .= "🟡 در انتظار = پنل ثبت شده ولی هنوز فعال نشده\n";
-        $text .= "🔴 غیرفعال = پنل خاموش یا غیرقابل استفاده\n\n";
-
-        $text .= "📍 برای مشاهده جزئیات یا ویرایش، روی هر پنل کلیک کنید.\n\n";
-
-        $text .= "📄 صفحه: {$list->currentPage()} از {$list->lastPage()}\n";
-        $text .= "📦 تعداد کل: {$list->total()} پنل";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send
-        |--------------------------------------------------------------------------
-        */
-
-        return $this->sendMessage([
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode($keyboard),
-        ], 'message');
-    }
-
-    protected function adminPanelDetail($type)
-    {
-        $id = $type['id'];
-
-        $panel = Panels::find($id);
-
-        if (is_null($panel)) {
-            return $this->sendTemporaryMessage('panel not found please try again');
-        }
-
-        $fields = [
-            'name' => ['label' => 'نام', 'value' => $panel->name],
-            'url' => ['label' => 'آدرس', 'value' => $panel->url],
-            'username' => ['label' => 'نام کاربری', 'value' => $panel->username],
-            'password' => ['label' => 'رمز عبور', 'value' => $panel->password],
-            'panel_type' => ['label' => 'نوع پنل', 'value' => $panel->panel_type],
-            'sub_address' => ['label' => 'لینک ساب', 'value' => $panel->sub_address],
-            'system_type' => ['label' => 'سیستم', 'value' => $panel->system_type],
-            'status' => ['label' => 'وضعیت', 'value' => $panel->status],
-        ];
-        if ($panel->system_type == 'sanaie') {
-            $fields['country_id'] = ['label' => 'کشور', 'value' => $panel->country_id];
-        }
-
-        $text = headTitle("📋 جزئیات پنل");
-
-        $keyboard = [];
-        $row = [];
-
-        foreach ($fields as $key => $field) {
-
-            $isEmpty = ($field['value'] === null || $field['value'] === '');
-
-            if ($key == 'status') {
-                $valueText = match ((int)$field['value']) {
-                    1 => 'فعال',
-                    -1 => 'غیرفعال',
-                    default => 'معلق',
-                };
-
-            } elseif ($key == 'country_id') {
-                $valueText = Countries::find($field['value'])->name ?? '—';
-
-            } elseif ($key == 'panel_type') {
-                $valueText = Service::find($field['value'])->name ?? '—';
-
-            } else {
-
-                $valueText = $isEmpty
-                    ? '—'
-                    : (string)$field['value'];
-
-                // 🔐 اسپویل برای فیلدهای حساس
-                if (in_array($key, ['username', 'password', 'url'])) {
-                    $valueText = "<tg-spoiler>{$valueText}</tg-spoiler>";
-                } else {
-                    $valueText = htmlspecialchars($valueText);
-                }
-            }
-
-            if (in_array($key, ['username', 'password', 'url'])) {
-                $text .= "▪️ <b>{$field['label']}</b>: {$valueText}\n";
-            } else {
-                $text .= "▪️ <b>{$field['label']}</b>: <code>{$valueText}</code>\n";
-
-            }
-
-
-            // دکمه‌ها
-            $textBtn = $isEmpty
-                ? "🔴 " . $field['label']
-                : "🟢 " . $field['label'];
-
-            $row[] = [
-                'text' => $textBtn,
-                'style' => $isEmpty ? 'danger' : '',
-                'callback_data' => "type=adminEditPanel|id={$id}|key={$key}"
-            ];
-
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-
-        if ($panel->system_type == 'pasarguard') {
-            $keyboard[] = [
-                [
-                    'text' => '📂 بررسی اتصال',
-                    'callback_data' => "type=adminConnectPanel|id=$panel->id"
-                ], [
-                    'text' => '📂دریافت گروه ها',
-                    'callback_data' => "type=adminGetInbounds|id=$panel->id"
-                ]
-            ];
-            $keyboard[] = [
-                [
-                    'text' => 'لیست گروه ها',
-                    'callback_data' => "type=adminPasarGuardGroups|id=$panel->id",
-                ]
-            ];
-            $keyboard[] = [
-                [
-                    'text' => 'فروش از چند کشور',
-                    'callback_data' => "type=adminPasarGuardSellSetting|id=$panel->id",
-                ]
-            ];
-        } else {
-            $keyboard[] = [
-                [
-                    'text' => '📂 بررسی اتصال',
-                    'callback_data' => "type=adminConnectPanel|id=$panel->id"
-                ], [
-                    'text' => '📂دریافت اینبوند ها',
-                    'callback_data' => "type=adminGetInbounds|id=$panel->id"
-                ]
-            ];
-        }
-
-        $keyboard[] = [
-            [
-                'text' => 'حذف پنل',
-                'callback_data' => "type=adminPanelDeleteDetail|id=$panel->id",
-                'style' => 'danger'
-            ]
-        ];
-
-        $text .= "\n⚠️ فیلدهای خالی با مقدار — مشخص شده‌اند.";
-
-
-        $keyboard[] = $this->adminFooterButtons('type=admin-panels');
-
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminCreatePanel($type)
-    {
-        $user = $this->user;
-
-        $newPanel = new Panels();
-        $newPanel->admin_id = $user->id;
-        $newPanel->status = -1;
-        $newPanel->save();
-
-        $type['id'] = $newPanel->id;
-        return $this->adminPanelDetail($type);
-    }
-
-    protected function adminEditPanel($type)
-    {
-        $id = $type['id'];
-        $key = $type['key'];
-        $user = $this->user;
-
-        $this->updatePath('adminUpdatePanel');
-        $telDetail = $user->tel_detail ?? [];
-        $telDetail['panel-key'] = $key;
-        $telDetail['panel-id'] = $id;
-        $user->tel_detail = $telDetail;
-        $user->save();
-
-        $fields = [
-            'name' => ['label' => 'نام'],
-            'url' => ['label' => 'آدرس'],
-            'username' => ['label' => 'نام کاربری'],
-            'country_id' => ['label' => 'کشور'],
-            'password' => ['label' => 'رمز عبور'],
-            'panel_type' => ['label' => 'نوع پنل'],
-            'system_type' => ['label' => 'سیستم'],
-            'sub_address' => ['label' => 'لینک ساب',],
-            'status' => ['label' => 'وضعیت'],
-
-        ];
-
-        $panel = Panels::find($id);
-
-        $oldValue = $panel->$key ?? '—';
-
-        $text = "✏️ لطفا مقدار <b>{$fields[$key]['label']}</b> را وارد کنید\n";
-
-        $customFiles = ['system_type', 'type', 'panel_type', 'status', 'country_id'];
-        if (in_array($key, $customFiles)) {
-
-            if ($key == 'system_type') {
-                $keyboard[] = [
-                    [
-                        'text' => 'X-Sanaie',
-                        'callback_data' => "type=adminUpdatePanel|id={$id}|value=sanaie",
-                    ],
-                    [
-                        'text' => 'PasarGuard',
-                        'callback_data' => "type=adminUpdatePanel|id={$id}|value=pasarguard",
-                    ]
-                ];
-            } elseif ($key == 'panel_type') {
-                $services = Service::where('status', 1)->get();
-
-                $keyboard = [];
-                $row = [];
-
-                foreach ($services as $service) {
-
-                    $row[] = [
-                        'text' => $service->name,
-                        'callback_data' => "type=adminUpdatePanel|id={$id}|value={$service->id}",
-                    ];
-
-                    // دو ستونه
-                    if (count($row) == 2) {
-                        $keyboard[] = $row;
-                        $row = [];
-                    }
-                }
-
-                if (!empty($row)) {
-                    $keyboard[] = $row;
-                }
-
-            } elseif ($key == 'status') {
-                $keyboard[] = [
-                    [
-                        'text' => 'فعال',
-                        'callback_data' => "type=adminUpdatePanel|id={$id}|value=1",
-                    ],
-                    [
-                        'text' => 'غیرفعال',
-                        'callback_data' => "type=adminUpdatePanel|id={$id}|value=-1",
-                    ],
-                ];
-            } elseif ($key == 'country_id') {
-                $country = Countries::get();
-                foreach ($country as $item) {
-
-                    $isSelected = ((int)$panel->country_id === (int)$item->id);
-
-                    if ($isSelected) {
-                        $oldValue = $item->name;
-                    }
-                    $keyboard[] = [
-                        [
-                            'text' => $item->name . ($isSelected ? ' ✅' : ''),
-                            'callback_data' => "type=adminUpdatePanel|id={$id}|value={$item->id}",
-                            'style' => $isSelected ? 'success' : ''
-                        ]
-                    ];
-                }
-            }
-        }
-        $text .= "📌 مقدار قبلی: <code>" . htmlspecialchars((string)$oldValue) . "</code>";
-
-
-        $keyboard[] = $this->adminFooterButtons("type=adminPanelDetail|id={$id}");
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-
-    }
-
-    protected function adminUpdatePanel($type = null)
-    {
-        $user = $this->user;
-        $key = $user->tel_detail['panel-key'];
-        $id = $user->tel_detail['panel-id'];
-
-        $fields = [
-            'name' => ['label' => 'نام'],
-            'url' => ['label' => 'آدرس'],
-            'country_id' => ['label' => 'کشور'],
-            'username' => ['label' => 'نام کاربری'],
-            'password' => ['label' => 'رمز عبور'],
-            'panel_type' => ['label' => 'نوع پنل'],
-            'system_type' => ['label' => 'سیستم'],
-            'status' => ['label' => 'وضعیت'],
-            'sub_address' => ['label' => 'لینک ساب',],
-
-        ];
-
-
-        $customFiles = ['system_type', 'type', 'panel_type', 'status', 'country_id'];
-        if (in_array($key, $customFiles)) {
-            $value = $type['value'];
-            Panels::where('id', $id)->update([$key => $value]);
-
-        } else {
-            $text = rtrim($this->text, '/');
-            Panels::where('id', $id)->update([$key => $text]);
-
-            if ($key == 'url') {
-                $checkSub = Panels::find($id);
-                if (is_null($checkSub->sub_address)) {
-                    $scheme = parse_url($text, PHP_URL_SCHEME) ?? 'https';
-                    $host = parse_url($text, PHP_URL_HOST);
-                    $result = $scheme . '://' . $host . ':2096/sub/';
-                    $checkSub->sub_address = $result;
-                    $checkSub->save();
-                }
-            }
-        }
-
-        $text = "فیلد `{$fields[$key]['label']}` با موفقیت ویرایش شد.";
-
-        $keyboard[] = $this->adminFooterButtons("type=adminPanelDetail|id={$id}");
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-
-    }
-
-    protected function adminConnectPanel($type)
-    {
-        $id = $type['id'];
-
-        $panel = Panels::find($id);
-
-
-        if ($panel->system_type == "pasarguard") {
-
-            $data = [
-                'url' => $panel->url,
-                'username' => $panel->username,
-                'password' => $panel->password,
-                'id' => $panel->id,
-            ];
-
-            $pasarGuard = new PasarGuard($data);
-            $result = $pasarGuard->checkConnection();
-
-            if (!is_null($result)) {
-                $Data = [
-                    'Domain' => $result,
-                ];
-                $panel->detail = $Data;
-                $panel->save();
-                $data = [
-                    'callback_query_id' => $this->callbackId,
-                    'text' => '✅ اتصال به سرور با موفقیت برقرار شد',
-                    'show_alert' => true,
-                    'cache_time' => 1,
-                ];
-            } else {
-                $data = [
-                    'callback_query_id' => $this->callbackId,
-                    'text' => '❌ اتصال به سرور برقرار نشد',
-                    'show_alert' => true,
-                    'cache_time' => 1,
-                ];
-            }
-        } else {
-            $data = [
-                'url' => $panel->url,
-                'username' => $panel->username,
-                'password' => $panel->password
-            ];
-            $session = loginToSanaie($data);
-            if (!empty($session['session'])) {
-                $data = [
-                    'callback_query_id' => $this->callbackId,
-                    'text' => '✅ اتصال به سرور با موفقیت برقرار شد',
-                    'show_alert' => true,
-                    'cache_time' => 1,
-                ];
-            } else {
-                $data = [
-                    'callback_query_id' => $this->callbackId,
-                    'text' => '❌ اتصال به سرور برقرار نشد',
-                    'show_alert' => true,
-                    'cache_time' => 1,
-                ];
-            }
-
-        }
-
-        return $this->telegramSdk->answerCallback($data);
-    }
-
-    protected function adminGetInbounds($type)
-    {
-        $id = $type['id'];
-
-        $panel = Panels::find($id);
-        if ($panel->system_type == "pasarguard") {
-
-            $data = [
-                'url' => $panel->url,
-                'username' => $panel->username,
-                'password' => $panel->password,
-                'id' => $panel->id,
-            ];
-            $pasarGuard = new PasarGuard($data);
-            $result = $pasarGuard->getGroups();
-
-            foreach ($result['groups'] as $item) {
-                $newInbound = Inbounds::where('panel_id', $panel->id)->where('inbound_id', $item['id'])->first();
-                if (is_null($newInbound)) {
-                    $newInbound = new Inbounds();
-                    $newInbound->status = -1;
-                }
-                $newInbound->panel_id = $panel->id;
-                $newInbound->inbound_id = $item['id'];
-                $newInbound->remark = $item['name'];
-                $newInbound->save();
-            }
-
-            $newInbound = Inbounds::where('panel_id', $panel->id)->pluck('remark')->implode(',');
-
-            $data = [
-                'callback_query_id' => $this->callbackId,
-                'text' => "✅ گروه ها با موفقیت دریافت شدند.
-گروه های دریافت شده: $newInbound",
-                'show_alert' => true,
-                'cache_time' => 1,
-            ];
-
-        } else {
-            $data = [
-                'url' => $panel->url,
-                'username' => $panel->username,
-                'password' => $panel->password
-            ];
-
-            $session = loginToSanaie($data);
-
-            if (!empty($session['session'])) {
-                $data = [
-                    'session' => $session['session'],
-                    'url' => $panel->url
-                ];
-                $inbounds = getInbounds($data);
-                if (!empty($inbounds)) {
-                    foreach ($inbounds['inbounds'] as $item) {
-                        $newInbound = Inbounds::where('panel_id', $panel->id)->where('inbound_id', $item['id'])->first();
-                        if (is_null($newInbound)) {
-                            $newInbound = new Inbounds();
-                            $newInbound->status = $item['enable'] ? 1 : 0;
-                        }
-                        $newInbound->panel_id = $panel->id;
-                        $newInbound->inbound_id = $item['id'];
-                        $newInbound->port = $item['port'];
-                        $newInbound->remark = $item['remark'];
-                        $newInbound->setting = $item;
-                        $newInbound->save();
-                    }
-                    $newInbound = Inbounds::where('panel_id', $panel->id)->where('inbound_id', $item['id'])->pluck('remark')->implode(',');
-
-                    $data = [
-                        'callback_query_id' => $this->callbackId,
-                        'text' => "✅ اینبوند ها با موفقیت دریافت شدند.
-گروه های دریافت شده: $newInbound",
-                        'show_alert' => true,
-                        'cache_time' => 1,
-                    ];
-                } else {
-                    $data = [
-                        'callback_query_id' => $this->callbackId,
-                        'text' => '❌ اینبوندی بر روی سرور یافت نشد',
-                        'show_alert' => true,
-                        'cache_time' => 1,
-                    ];
-                }
-            } else {
-                $data = [
-                    'callback_query_id' => $this->callbackId,
-                    'text' => '❌ اتصال به سرور برقرار نشد',
-                    'show_alert' => true,
-                    'cache_time' => 1,
-                ];
-            }
-        }
-        return $this->telegramSdk->answerCallback($data);
-
-    }
-
-    protected function adminPanelDeleteDetail($type)
-    {
-        $id = $type['id'];
-
-        $service = Panels::find($id);
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('❌ پنل موردنظر پیدا نشد.');
-        }
-
-        $status = match ((int)$service->status) {
-            1 => '🟢 فعال',
-            -1 => '🔴 غیرفعال',
-            default => '🟡 معلق'
-        };
-
-        $text = "╔════════════════════╗\n";
-        $text .= "      🗑 حذف پنل\n";
-        $text .= "╚════════════════════╝\n\n";
-
-        $text .= "⚠️ آیا از حذف این پنل اطمینان دارید؟\n\n";
-
-        $text .= "📦 نام پنل:\n";
-        $text .= "<code>{$service->name}</code>\n\n";
-
-        $text .= "📊 وضعیت:\n";
-        $text .= "<code>{$status}</code>\n\n";
-
-        $text .= "❗ پس از حذف، امکان بازگردانی تعرفه وجود نخواهد داشت.\n\n";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard = [];
-
-        $keyboard[] = [
-            [
-                'text' => '🗑 بله، حذف شود',
-                'callback_data' => "type=adminPanelDeleteSubmit|id={$id}",
-                'style' => 'danger'
-            ]
-        ];
-
-        $keyboard[] = $this->adminFooterButtons(
-            "type=adminPlanDetail|id={$id}"
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send Message
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminPanelDeleteSubmit($type)
-    {
-        $id = $type['id'];
-
-        $service = Panels::find($id);
-
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('پنل پیدا نشد');
-        }
-
-        $service->delete();
-
-        $this->telegramSdk->answerCallback([
-            'callback_query_id' => $this->callbackId,
-            'text' => "پنل با موفقیت حذف شد.",
-            'show_alert' => true,
-            'cache_time' => 1,
-        ]);
-
-
-        return $this->adminPanels(['page' => 1]);
-    }
 
     // End Panels
 
 
     // Start Plans
-    protected function adminPlans($type)
-    {
-        $page = $type['page'] ?? 1;
 
-        $list = Plans::orderByDesc('id')
-            ->paginate(10, ['*'], 'page', $page);
-
-        $text = "📦 <b>لیست تعرفه ها</b>\n";
-        $text .= "📄 صفحه: <code>{$list->currentPage()}</code>\n";
-        $text .= "📊 تعداد: <code>{$list->total()}</code>\n\n";
-
-        $keyboard = [];
-        $row = [];
-
-
-        foreach ($list as $plan) {
-
-            // نوع پلن
-            $planType = Service::find($plan->type);
-            if (!is_null($planType)) {
-                $planType = $planType->name;
-            } else {
-                $planType = '--';
-            }
-
-            // وضعیت
-            $status = ((int)$plan->status === 1)
-                ? '🟢 فعال'
-                : '🔴 غیرفعال';
-
-            $row[] = [
-                'text' => "نام:{$plan->name} | {$planType} | {$status}",
-                'callback_data' => "type=adminPlanDetail|id={$plan->id}"
-            ];
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-
-        // صفحه‌بندی
-        $pagination = $this->paginationFooterButton($list, $page, 'adminPlans');
-        if (!is_null($pagination)) {
-            $keyboard[] = $pagination;
-        }
-
-        // ایجاد پلن
-        $keyboard[] = [
-            [
-                'text' => '➕ ایجاد پلن جدید',
-                'callback_data' => 'type=adminPlanCreate',
-                'style' => 'success'
-            ]
-        ];
-
-        // برگشت
-
-        $keyboard[] = $this->adminFooterButtons('type=adminPanelMenu');
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminPlanCreate($type)
-    {
-        $user = $this->user;
-
-        $newPanel = new Plans();
-        $newPanel->admin_id = $user->id;
-        $newPanel->status = 0;
-        $newPanel->save();
-
-        $type['id'] = $newPanel->id;
-        return $this->adminPlanDetail($type);
-    }
-
-    protected function adminPlanDetail($type)
-    {
-        $id = $type['id'];
-
-        $plan = Plans::find($id);
-
-        if (is_null($plan)) {
-            return $this->sendTemporaryMessage('پلن پیدا نشد، دوباره تلاش کنید');
-        }
-
-        $fields = [
-            'name' => ['label' => 'نام پلن', 'value' => $plan->name],
-            'bandwidth' => ['label' => 'حجم', 'value' => $plan->bandwidth],
-            'days' => ['label' => 'مدت زمان', 'value' => $plan->days],
-            'price' => ['label' => 'قیمت (تومان)', 'value' => $plan->price],
-            'type' => ['label' => 'نوع', 'value' => $plan->type],
-            'status' => ['label' => 'وضعیت', 'value' => $plan->status],
-            'discount' => ['label' => 'درصد تخفیف', 'value' => $plan->discount],
-        ];
-
-        $text = "📦 <b>جزئیات پلن</b>\n\n";
-
-        $keyboard = [];
-        $row = [];
-
-        foreach ($fields as $key => $field) {
-
-            $isEmpty = ($field['value'] === null || $field['value'] === '');
-
-            // نمایش وضعیت در متن
-            $valueText = $isEmpty
-                ? '—'
-                : htmlspecialchars((string)$field['value']);
-
-            if ($key == 'type') {
-
-                $service = Service::find($field['value']);
-                if (!is_null($service)) {
-                    $valueText = htmlspecialchars($service->name);
-                } else {
-                    $valueText = "--";
-                }
-            } elseif ($key == 'price') {
-                $valueText = number_format($plan->price) . ' تومان ';
-            } elseif ($key == 'status') {
-                $valueText = match ((int)$field['value']) {
-                    1 => '🟢 فعال',
-                    -1 => '🔴 غیرفعال',
-                    0 => '🟡 معلق',
-                    default => '⚪ نامشخص',
-                };
-            }
-
-            $text .= "▪️ <b>{$field['label']}</b>: <code>{$valueText}</code>\n";
-
-            // دکمه‌ها
-            $btnText = $isEmpty
-                ? "🔴 " . $field['label']
-                : $field['label'];
-
-            $row[] = [
-                'text' => $btnText,
-                'callback_data' => "type=adminEditPlan|id={$id}|key={$key}"
-            ];
-
-            // هر دو دکمه یک ردیف
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-
-        $price = number_format(calculatePlanDiscount($plan)['price']);
-        $text .= "▪️ <b>قیمت نهایی</b>: <code>{$price}</code>\n";
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-
-        $keyboard[] = [
-            [
-                'text' => 'حذف پلن',
-                'callback_data' => "type=adminPlanDeleteDetail|id={$id}",
-                'style' => 'danger'
-            ]
-        ];
-
-        $keyboard[] = $this->adminFooterButtons('type=adminPlans');
-
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminEditPlan($type)
-    {
-        $id = $type['id'];
-        $key = $type['key'];
-        $user = $this->user;
-
-        $this->updatePath('adminUpdatePlan');
-        $telDetail = $user->tel_detail ?? [];
-        $telDetail['plan-key'] = $key;
-        $telDetail['plan-id'] = $id;
-        $user->tel_detail = $telDetail;
-        $user->save();
-
-        $plan = Plans::find($id);
-
-        $fields = [
-            'name' => ['label' => 'نام پلن', 'value' => $plan->name],
-            'bandwidth' => ['label' => 'حجم', 'value' => $plan->bandwidth],
-            'days' => ['label' => 'مدت زمان', 'value' => $plan->days],
-            'price' => ['label' => 'قیمت (تومان)', 'value' => $plan->price],
-            'type' => ['label' => 'نوع', 'value' => $plan->type],
-            'status' => ['label' => 'وضعیت', 'value' => $plan->status],
-            'discount' => ['label' => 'درصد تخفیف', 'value' => $plan->discount],
-        ];
-        $oldValue = $plan->$key ?? '—';
-
-        $text = "✏️ لطفا مقدار <b>{$fields[$key]['label']}</b> را وارد کنید\n";
-        if ($key == 'bandwidth') {
-            $text .= "📌 حجم را به گیگ وارد کنید";
-        }
-        if ($key == 'price') {
-            $text .= "📌 مبلغ را به تومان وارد کنید";
-        }
-
-        $customFiles = ['type', 'status'];
-        if (in_array($key, $customFiles)) {
-
-            if ($key == 'type') {
-                $services = Service::where('status', 1)->get();
-
-                $keyboard = [];
-                $row = [];
-
-                foreach ($services as $service) {
-
-                    if ($service->id == $plan->type) {
-                        $oldValue = $service->name;
-                    }
-
-                    $row[] = [
-                        'text' => $service->name,
-                        'callback_data' => "type=adminUpdatePlan|id={$id}|value={$service->id}",
-                    ];
-
-                    // دو ستونه
-                    if (count($row) == 2) {
-                        $keyboard[] = $row;
-                        $row = [];
-                    }
-                }
-
-                if (!empty($row)) {
-                    $keyboard[] = $row;
-                }
-            } elseif ($key == 'status') {
-                $keyboard[] = [
-                    [
-                        'text' => 'غیرفعال',
-                        'callback_data' => "type=adminUpdatePlan|id={$id}|value=-1",
-                    ],
-                    [
-                        'text' => 'فعال',
-                        'callback_data' => "type=adminUpdatePlan|id={$id}|value=1",
-                    ],
-                ];
-            }
-
-        }
-        $text .= "📌 مقدار قبلی: <code>" . htmlspecialchars((string)$oldValue) . "</code> \n";
-
-
-        $keyboard[] = $this->adminFooterButtons("type=adminPlanDetail|id={$id}");
-
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminUpdatePlan($type = null)
-    {
-        $this->updatePath('start');
-
-        $user = $this->user;
-        $key = $user->tel_detail['plan-key'];
-        $id = $user->tel_detail['plan-id'];
-
-        $fields = [
-            'name' => ['label' => 'نام پلن'],
-            'bandwidth' => ['label' => 'حجم'],
-            'days' => ['label' => 'مدت زمان'],
-            'price' => ['label' => 'قیمت'],
-            'type' => ['label' => 'نوع'],
-            'status' => ['label' => 'وضعیت'],
-            'discount' => ['label' => 'درصد تخفیف'],
-
-        ];
-
-        $customFiles = ['type', 'status'];
-        if (in_array($key, $customFiles)) {
-            $value = $type['value'];
-            Plans::where('id', $id)->update([$key => $value]);
-
-        } else {
-            Plans::where('id', $id)->update([$key => $this->text]);
-        }
-
-        $text = "فیلد `{$fields[$key]['label']}` با موفقیت ویرایش شد.";
-
-        $keyboard[] = $this->adminFooterButtons("type=adminPlanDetail|id={$id}");
-
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminPlanDeleteDetail($type)
-    {
-        $id = $type['id'];
-
-        $service = Plans::find($id);
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('❌ تعرفه موردنظر پیدا نشد.');
-        }
-
-
-        /*
-        |--------------------------------------------------------------------------
-        | Service Details
-        |--------------------------------------------------------------------------
-        */
-
-
-        $status = match ((int)$service->status) {
-            1 => '🟢 فعال',
-            -1 => '🔴 غیرفعال',
-            default => '🟡 معلق'
-        };
-
-        $text = "╔════════════════════╗\n";
-        $text .= "      🗑 حذف تعرفه\n";
-        $text .= "╚════════════════════╝\n\n";
-
-        $text .= "⚠️ آیا از حذف این تعرفه اطمینان دارید؟\n\n";
-
-        $text .= "📦 نام تعرفه:\n";
-        $text .= "<code>{$service->name}</code>\n\n";
-
-        $text .= "📊 وضعیت:\n";
-        $text .= "<code>{$status}</code>\n\n";
-
-        $text .= "❗ پس از حذف، امکان بازگردانی تعرفه وجود نخواهد داشت.\n\n";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard = [];
-
-        $keyboard[] = [
-            [
-                'text' => '🗑 بله، حذف شود',
-                'callback_data' => "type=adminPlanDeleteSubmit|id={$id}",
-                'style' => 'danger'
-            ]
-        ];
-
-        $keyboard[] = $this->adminFooterButtons(
-            "type=adminPlanDetail|id={$id}"
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send Message
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminPlanDeleteSubmit($type)
-    {
-        $id = $type['id'];
-
-        $service = Plans::find($id);
-
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('تعرفه پیدا نشد');
-        }
-
-        $service->delete();
-
-        $this->telegramSdk->answerCallback([
-            'callback_query_id' => $this->callbackId,
-            'text' => "تعرفه با موفقیت حذف شد.",
-            'show_alert' => true,
-            'cache_time' => 1,
-        ]);
-
-
-        return $this->adminPlans(['page' => 1]);
-    }
 
     // End Plans
 
@@ -7952,3482 +6157,22 @@ $codeText
         return $this->sendTemporaryMessage('تخفیف ثابت حساب ذخیره شد.');
     }
 
-    protected function adminSetting($type)
-    {
-        $keys = ['join-bot', 'join-with-referral', 'channel-join'];
-        $settings = Setting::whereIn('key', $keys)->get();
-        $buttons = [[['text' => 'تخفیف پلکانی کاربران عادی', 'callback_data' => 'type=adminCustomerLoyalty']]];
-
-        foreach ($settings as $setting) {
-            $buttons[] = [
-                [
-                    'text' => ($setting->value != 1 ? "✅" : null) . "غیرفعال",
-                    'callback_data' => "type=adminSettingChangeValue|key={$setting->key}|value=-1"
-                ], [
-                    'text' => ($setting->value == 1 ? "✅" : null) . "فعال",
-                    'callback_data' => "type=adminSettingChangeValue|key={$setting->key}|value=1"
-                ],
-                [
-                    'text' => "{$setting->name}:",
-                    'callback_data' => 'type=adminSettingSell',
-                    'style' => 'primary'
-                ],
-            ];
-        }
-        $buttons[] = [
-            [
-                'text' => "═══════════════════",
-                'callback_data' => 'type=adminSettingSell',
-                'style' => 'danger'
-            ],
-        ];
-
-        $buttons[] = [
-
-            [
-                'text' => "مشاهده تنظمیات",
-                'callback_data' => 'type=adminSettingSell'
-            ],
-            [
-                'text' => "تنظیمات فروش",
-                'callback_data' => 'type=adminSettingSell',
-                'style' => 'primary'
-            ],
-        ];
-
-        $buttons[] = [
-
-            [
-                'text' => "مشاهده تنظمیات",
-                'callback_data' => 'type=adminPaymentSetting'
-            ],
-            [
-                'text' => "تنظیمات پرداخت",
-                'callback_data' => 'type=adminPaymentSetting',
-                'style' => 'primary'
-            ],
-        ];
-        $buttons[] = [
-
-            [
-                'text' => "مشاهده تنظمیات",
-                'callback_data' => 'type=adminBotSetting'
-            ],
-            [
-                'text' => "تنظیمات ربات",
-                'callback_data' => 'type=adminBotSetting',
-                'style' => 'primary'
-            ],
-        ];
-
-
-        $buttons[] = $this->adminFooterButtons();
-
-        $text = headTitle('⚙️ تنظیمات سیستم');
-        $text .= "🔧 مدیریت تنظیمات ثبت‌نام، فروش،
-پرداخت، رفرال و امکانات ربات
-
-📌 لطفاً یکی از گزینه‌های زیر را انتخاب کنید.
-";
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => $text,
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ])
-        ];
-        return $this->sendMessage($data, 'message');
-
-    }
-
-    protected function adminSettingChangeValue($data)
-    {
-        $key = $data['key'];
-        $value = $data['value'];
-
-        $setting = Setting::where('key', $key)->first();
-        $setting->value = $value;
-        $setting->save();
-
-        return $this->adminSetting($data);
-    }
-
-    protected function adminSettingSell()
-    {
-        /*
-        |--------------------------------------------------------------------------
-        | Load or create settings
-        |--------------------------------------------------------------------------
-        */
-
-        $settings = [
-            'sell' => 'وضعیت فروش',
-            'renew' => 'وضعیت تمدید',
-            'extra' => 'وضعیت خرید حجم اضافه',
-            'referral' => 'وضعیت پورسانت',
-        ];
-
-        $dataMap = [];
-
-        foreach ($settings as $key => $label) {
-
-            $row = Setting::firstOrCreate(
-                ['key' => $key],
-                [
-                    'name' => $label,
-                    'value' => 0
-                ]
-            );
-
-            $dataMap[$key] = $row;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Text
-        |--------------------------------------------------------------------------
-        */
-
-        $text = "⚙️ <b>تنظیمات فروش</b>\n\n";
-        $text .= "در این بخش می‌توانید تنظیمات فروش را مدیریت کنید.\n";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Keyboard
-        |--------------------------------------------------------------------------
-        */
-
-        $buttons = [];
-
-        foreach ($dataMap as $key => $setting) {
-
-            $isActive = ((int)$setting->value === 1);
-
-            $statusText = $isActive ? '🟢 فعال' : '🔴 غیرفعال';
-
-            $buttons[] = [
-                [
-                    'text' => "{$setting->name} ({$statusText})",
-                    'callback_data' => "type=adminToggleSetting|key={$key}",
-                    'style' => $isActive ? 'success' : 'danger'
-                ]
-            ];
-        }
-        $buttons[] = [
-            [
-                'text' => '💰  درصد پورسانت',
-                'callback_data' => 'type=adminSettingCommission',
-            ],
-            [
-                'text' => '📝 متن پورسانت',
-                'callback_data' => 'type=adminSettingCommissionText',
-            ],
-        ];
-
-        /*
-        |--------------------------------------------------------------------------
-        | Home button
-        |--------------------------------------------------------------------------
-        */
-        $buttons[] = [
-            [
-                'text' => '🔙 بازگشت',
-                'callback_data' => 'type=adminSetting',
-            ]
-        ];
-
-        $buttons[] = [
-            [
-                'text' => '🏠 منو اصلی',
-                'callback_data' => 'type=admin-home',
-                'style' => 'primary'
-            ]
-        ];
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send message
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ])
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminToggleSetting($type)
-    {
-        $key = $type['key'] ?? null;
-
-        if (!$key) {
-            return $this->sendTemporaryMessage('کلید تنظیمات نامعتبر است');
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Find or create setting
-        |--------------------------------------------------------------------------
-        */
-
-        $setting = Setting::firstOrCreate(
-            ['key' => $key],
-            [
-                'name' => $key,
-                'value' => 0
-            ]
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Toggle value
-        |--------------------------------------------------------------------------
-        */
-
-        $setting->value = ((int)$setting->value === 1) ? 0 : 1;
-        $setting->save();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Message
-        |--------------------------------------------------------------------------
-        */
-
-        $statusText = $setting->value == 1 ? 'فعال شد 🟢' : 'غیرفعال شد 🔴';
-
-        /*
-        |--------------------------------------------------------------------------
-        | Alert
-        |--------------------------------------------------------------------------
-        */
-
-        $this->telegramSdk->answerCallback([
-            'callback_query_id' => $this->callbackId,
-            'text' => $statusText,
-            'show_alert' => true,
-            'cache_time' => 1,
-        ]);
-
-        /*
-        |--------------------------------------------------------------------------
-        | Reload page
-        |--------------------------------------------------------------------------
-        */
-
-        return $this->adminSettingSell();
-    }
-
-    protected function adminSettingCommission()
-    {
-
-        /*
-        |--------------------------------------------------------------------------
-        | Get or create setting
-        |--------------------------------------------------------------------------
-        */
-
-        $setting = Setting::firstOrCreate(
-            ['key' => 'commission'],
-            [
-                'name' => 'درصد پورسانت',
-                'value' => 0
-            ]
-        );
-
-        $value = (int)$setting->value;
-
-        /*
-        |--------------------------------------------------------------------------
-        | Text
-        |--------------------------------------------------------------------------
-        */
-
-        $text = "⚙️ <b>تنظیم درصد پورسانت</b>\n\n";
-
-        $text .= "💰 مقدار فعلی پورسانت: <b>{$value}%</b>\n\n";
-
-        $text .= "✏️ لطفا درصد جدید را وارد کنید.\n";
-        $text .= "این مقدار روی تمام محاسبات فروش اعمال خواهد شد.";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Keyboard
-        |--------------------------------------------------------------------------
-        */
-
-        $buttons = [];
-
-        $buttons[] = [
-            [
-                'text' => '🔙 بازگشت',
-                'callback_data' => 'type=adminSettingSell',
-                'style' => 'danger'
-            ]
-        ];
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminSettingCommissionEdit()
-    {
-        /*
-        |--------------------------------------------------------------------------
-        | Get or create setting
-        |--------------------------------------------------------------------------
-        */
-
-        $setting = Setting::firstOrCreate(
-            ['key' => 'commission'],
-            [
-                'name' => 'درصد پورسانت',
-                'value' => 0
-            ]
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Input
-        |--------------------------------------------------------------------------
-        */
-
-        $value = trim($this->text);
-
-        /*
-        |--------------------------------------------------------------------------
-        | Validation
-        |--------------------------------------------------------------------------
-        */
-
-        if ($value === '' || !is_numeric($value)) {
-            return $this->sendTemporaryMessage('❌ لطفا فقط عدد وارد کنید');
-        }
-
-        $value = (float)$value;
-
-        if ($value < 0 || $value > 100) {
-            return $this->sendTemporaryMessage('❌ درصد باید بین 0 تا 100 باشد');
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Save
-        |--------------------------------------------------------------------------
-        */
-
-        $setting->value = $value;
-        $setting->save();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Success message
-        |--------------------------------------------------------------------------
-        */
-
-        $text = "✅ <b>درصد پورسانت بروزرسانی شد</b>\n\n";
-        $text .= "💰 مقدار جدید: <b>{$value}%</b>";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Keyboard
-        |--------------------------------------------------------------------------
-        */
-
-        $buttons = [];
-
-        $buttons[] = [
-            [
-                'text' => '⚙️ بازگشت به تنظیمات پورسانت',
-                'callback_data' => 'type=adminSettingSell',
-                'style' => 'primary'
-            ]
-        ];
-
-        $buttons[] = [
-            [
-                'text' => '🏠 منو اصلی',
-                'callback_data' => 'type=admin-home',
-                'style' => 'danger'
-            ]
-        ];
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send message
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminSettingCommissionText()
-    {
-        /*
-        |--------------------------------------------------------------------------
-        | Get or create setting
-        |--------------------------------------------------------------------------
-        */
-
-
-        $this->updatePath('adminSettingCommissionTextEdit');
-        $setting = Setting::firstOrCreate(
-            ['key' => 'commission_text'],
-            [
-                'name' => 'متن پورسانت',
-                'value' => 'درصد پورسانت به صورت پیش‌فرض اعمال می‌شود.'
-            ]
-        );
-
-        $value = $setting->value;
-
-        /*
-        |--------------------------------------------------------------------------
-        | Text
-        |--------------------------------------------------------------------------
-        */
-
-        $text = "📝 <b>تنظیم متن پورسانت</b>\n\n";
-
-        $text .= "📌 متن فعلی:\n";
-        $text .= "<code>{$value}</code>\n\n";
-
-        $text .= "✏️ لطفا متن جدید را ارسال کنید.\n";
-        $text .= "این متن در بخش فروش و توضیحات نمایش داده می‌شود.";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Keyboard
-        |--------------------------------------------------------------------------
-        */
-
-        $buttons = [];
-
-
-        $buttons[] = [
-            [
-                'text' => '🔙 بازگشت',
-                'callback_data' => 'type=adminSettingSell',
-                'style' => 'danger'
-            ]
-        ];
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send message
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminSettingCommissionTextEdit()
-    {
-        /*
-        |--------------------------------------------------------------------------
-        | Get setting (or create fallback)
-        |--------------------------------------------------------------------------
-        */
-
-        $setting = Setting::firstOrCreate(
-            ['key' => 'commission_text'],
-            [
-                'name' => 'متن پورسانت',
-                'value' => ''
-            ]
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | New value from user
-        |--------------------------------------------------------------------------
-        */
-
-        $newText = trim($this->text);
-
-        if (empty($newText)) {
-            return $this->sendTemporaryMessage('❌ متن نمی‌تواند خالی باشد');
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Save
-        |--------------------------------------------------------------------------
-        */
-
-        $setting->value = $newText;
-        $setting->save();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Success message
-        |--------------------------------------------------------------------------
-        */
-
-        $text = "✅ <b>متن پورسانت با موفقیت بروزرسانی شد</b>\n\n";
-
-        $text .= "📌 متن جدید:\n";
-        $text .= "<code>{$newText}</code>";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Keyboard
-        |--------------------------------------------------------------------------
-        */
-
-        $buttons = [];
-
-        $buttons[] = [
-            [
-                'text' => '⚙️ بازگشت به تنظیمات',
-                'callback_data' => 'type=adminSettingSell',
-                'style' => 'primary'
-            ]
-        ];
-
-        $buttons[] = [
-            [
-                'text' => '🏠 منو اصلی',
-                'callback_data' => 'type=admin-home',
-                'style' => 'danger'
-            ]
-        ];
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send message
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ]),
-        ];
-
-        /*
-        |--------------------------------------------------------------------------
-        | Clear user state (اگر داری state system)
-        |--------------------------------------------------------------------------
-        */
-
-        // $this->clearPath(); // اگر سیستم مسیر داری
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminPaymentSetting()
-    {
-        $buttons = [];
-
-        $buttons[] = [
-
-            [
-                'text' => "مشاهده تنظمیات",
-                'callback_data' => 'ignore'
-            ],
-            [
-                'text' => "تنظیمات درگاه",
-                'callback_data' => 'ignore',
-                'style' => 'primary'
-            ],
-        ];
-
-        $buttons[] = [
-
-            [
-                'text' => "مشاهده تنظمیات",
-                'callback_data' => 'type=adminCartSetting'
-            ],
-            [
-                'text' => "تنظیمات کارت به کارت",
-                'callback_data' => 'type=adminCartSetting',
-                'style' => 'primary'
-            ],
-        ];
-
-        $buttons[] = [
-            [
-                'text' => "مشاهده تنظمیات",
-                'callback_data' => 'type=adminChargeAmount'
-            ],
-            [
-                'text' => "مبالغ شارژ کیف پول",
-                'callback_data' => 'ignore',
-                'style' => 'primary'
-            ],
-        ];
-
-
-        $buttons[] = $this->adminFooterButtons("type=adminSetting");
-
-        $text = "تنظیمات پرداخت";
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => $text,
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ])
-        ];
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminCartSetting()
-    {
-
-
-        /*
-        |--------------------------------------------------------------------------
-        | Text
-        |--------------------------------------------------------------------------
-        */
-
-        $text = headTitle("تنظیمات پرداخت");
-        $text .= "در این بخش می‌توانید تنظیمات پرداخت را مدیریت کنید.\n";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Keyboard
-        |--------------------------------------------------------------------------
-        */
-
-        $buttons = [];
-
-        $cartBeCart = Setting::firstOrCreate(
-            ['key' => 'cart_be_cart'],
-            [
-                'name' => 'وضعیت کارت به کارت',
-                'value' => 0,
-            ]
-        );
-
-        $cartBeCartRandom = Setting::firstOrCreate(
-            ['key' => 'cart_be_cart_random'],
-            [
-                'name' => 'نمایش تصادفی کارت‌ها',
-                'value' => 0,
-            ]
-        );
-
-        $cartBeCartStatus = (int)$cartBeCart->value;
-        $cartBeCartRandomStatus = (int)$cartBeCartRandom->value;
-
-        /*
-        |--------------------------------------------------------------------------
-        | وضعیت کارت به کارت
-        |--------------------------------------------------------------------------
-        */
-
-        $buttons[] = [
-            [
-                'text' => "💳 وضعیت کارت به کارت",
-                'callback_data' => "ignore",
-                'style' => 'primary'
-            ]
-        ];
-
-        $buttons[] = [
-            [
-                'text' => ($cartBeCartStatus === 1 ? '✅ ' : '') . "فعال",
-                'callback_data' => "type=adminCartBeCartStatus|status=1",
-            ],
-            [
-                'text' => ($cartBeCartStatus === 0 ? '✅ ' : '') . "غیرفعال",
-                'callback_data' => "type=adminCartBeCartStatus|status=0",
-            ],
-        ];
-
-        /*
-        |--------------------------------------------------------------------------
-        | نمایش تصادفی کارت‌ها
-        |--------------------------------------------------------------------------
-        */
-
-        $buttons[] = [
-            [
-                'text' => "🎲 نمایش تصادفی کارت‌ها",
-                'callback_data' => "ignore",
-                'style' => 'primary'
-            ]
-        ];
-
-        $buttons[] = [
-            [
-                'text' => ($cartBeCartRandomStatus === 1 ? '✅ ' : '') . "فعال",
-                'callback_data' => "type=adminCartBeCartRandom|status=1",
-            ],
-            [
-                'text' => ($cartBeCartRandomStatus === 0 ? '✅ ' : '') . "غیرفعال",
-                'callback_data' => "type=adminCartBeCartRandom|status=0",
-            ],
-        ];
-
-//        $buttons[] = [
-//            [
-//                'text' => "متن صفحه کارت به کارت",
-//                'callback_data' => "type=adminCartBeCartText",
-//            ]
-//        ];
-
-        $buttons[] = [
-            [
-                'text' => "شماره کارت‌ها و شباها",
-                'callback_data' => "type=adminCartList",
-            ]
-        ];
-
-
-        $buttons[] = $this->adminFooterButtons('type=adminSetting');
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send message
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ])
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminCartBeCartStatus($type)
-    {
-        $status = $type['status'] ?? 0;
-
-        Setting::where('key', 'cart_be_cart')
-            ->update([
-                'value' => $status
-            ]);
-
-        return $this->adminCartSetting();
-    }
-
-    protected function adminCartBeCartRandom($type)
-    {
-        $status = $type['status'] ?? 0;
-
-        Setting::where('key', 'cart_be_cart_random')
-            ->update([
-                'value' => $status
-            ]);
-
-        return $this->adminCartSetting();
-    }
-
-    protected function adminCartBeCartText($type)
-    {
-        $this->updatePath('adminCartBeCartTextUpdate');
-
-        $setting = Setting::firstOrCreate(
-            ['key' => 'cart_be_cart_text'],
-            ['value' => '']
-        );
-
-        $oldValue = $setting->value ?? '—';
-
-        $text = headTitle("💳 متن کارت به کارت");
-        $text .= "✏️ لطفا متن کارت به کارت را وارد کنید.\n\n";
-        $text .= "📌 متن فعلی:\n";
-        $text .= "<code>" . htmlspecialchars($oldValue) . "</code>";
-
-        $keyboard[] = $this->adminFooterButtons('type=adminCartSetting');
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminCartBeCartTextUpdate()
-    {
-        $setting = Setting::firstOrCreate(
-            ['key' => 'cart_be_cart_text'],
-            ['value' => '']
-        );
-
-        if (empty($this->text)) {
-            return $this->sendTemporaryMessage('❌ متن نمی‌تواند خالی باشد');
-        }
-
-        $setting->value = $this->text;
-        $setting->save();
-
-        return $this->adminCartSetting();
-    }
-
-    protected function adminCartList()
-    {
-
-        $page = $type['page'] ?? 1;
-
-        $list = Carts::orderbyDesc('id')
-            ->paginate(10, ['*'], 'page', $page);
-
-
-        $text = "🌍 <b>لیست کارت ها</b>\n";
-
-
-        $keyboard = [];
-        $row = [];
-        foreach ($list as $country) {
-
-            $row[] = [
-                'text' => "{$country->cart}",
-                'callback_data' => "type=adminCartDetail|id={$country->id}",
-            ];
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-        /*
-        |--------------------------------------------------------------------------
-        | Pagination
-        |--------------------------------------------------------------------------
-        */
-
-        $pagination = $this->paginationFooterButton($list, $page, 'adminCountries');
-
-        if (!empty($pagination)) {
-            $keyboard[] = $pagination;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Bottom Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard[] = [
-            [
-                'text' => '➕ ایجاد کارت جدید',
-                'callback_data' => 'type=adminCartCreate',
-                'style' => 'success'
-            ]
-        ];
-
-        $keyboard[] = $this->adminFooterButtons('type=adminCartSetting');
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminCartCreate()
-    {
-        $user = $this->user;
-
-        $country = new Carts();
-        $country->status = 0;
-        $country->admin_id = $user->id;
-        $country->save();
-
-        $type['id'] = $country->id;
-
-        return $this->adminCartDetail($type);
-
-
-    }
-
-    protected function adminCartDetail($type)
-    {
-        $id = $type['id'];
-
-        $country = Carts::find($id);
-
-        if (is_null($country)) {
-            return $this->sendTemporaryMessage('کارت پیدا نشد');
-        }
-
-        $fields = [
-            'name' => [
-                'label' => 'نام صاحب کارت',
-                'value' => $country->name
-            ],
-            'cart' => [
-                'label' => 'شماره کارت',
-                'value' => $country->cart
-            ],
-            'sheba' => [
-                'label' => 'شماره شبا',
-                'value' => $country->sheba
-            ],
-            'status' => [
-                'label' => 'وضعیت',
-                'value' => $country->status
-            ],
-            'is_default' => [
-                'label' => 'کارت پیشفرض',
-                'value' => $country->is_default
-            ],
-        ];
-
-        $text = "🌍 <b>جزئیات کارت</b>\n\n";
-
-        $keyboard = [];
-        $row = [];
-
-        foreach ($fields as $key => $field) {
-
-            $isEmpty = (
-                $field['value'] === null ||
-                $field['value'] === ''
-            );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Value Text
-            |--------------------------------------------------------------------------
-            */
-
-            if ($key == 'status' || $key == 'is_default') {
-
-                $valueText = match ((int)$field['value']) {
-                    1 => '🟢 فعال',
-                    -1 => '🔴 غیرفعال',
-                    default => '⚪️ نامشخص'
-                };
-
-            } else {
-
-                $valueText = $isEmpty
-                    ? '—'
-                    : htmlspecialchars((string)$field['value']);
-            }
-
-            $text .= "▪️ <b>{$field['label']}</b>: <code>{$valueText}</code>\n";
-
-            /*
-            |--------------------------------------------------------------------------
-            | Buttons
-            |--------------------------------------------------------------------------
-            */
-
-            $btnText = $isEmpty
-                ? "🔴 {$field['label']}"
-                : "{$field['label']}";
-
-            $row[] = [
-                'text' => $btnText,
-                'callback_data' => "type=adminCartEdit|id={$id}|key={$key}"
-            ];
-
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Bottom Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard[] = $this->adminFooterButtons('type=adminCartList');
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminCartEdit($type)
-    {
-        $id = $type['id'];
-        $key = $type['key'];
-
-        $user = $this->user;
-
-        $this->updatePath('adminCartUpdate');
-
-        $telDetail = $user->tel_detail ?? [];
-
-        $telDetail['cart-key'] = $key;
-        $telDetail['cart-id'] = $id;
-
-        $user->tel_detail = $telDetail;
-        $user->save();
-
-        $country = Carts::find($id);
-
-        if (!$country) {
-            return $this->sendTemporaryMessage('کشور پیدا نشد');
-        }
-
-        $fields = [
-            'name' => ['label' => 'نام صاحب حساب'],
-            'cart' => ['label' => 'شماره کارت'],
-            'sheba' => ['label' => 'شماره شبا'],
-            'status' => ['label' => 'وضعیت'],
-            'is_default' => ['label' => 'کارت پیشفرض'],
-        ];
-
-        if (!array_key_exists($key, $fields)) {
-            return $this->sendTemporaryMessage('فیلد کارت معتبر نیست');
-        }
-
-        $oldValue = $country->$key ?? '—';
-
-        /*
-        |--------------------------------------------------------------------------
-        | Status Text
-        |--------------------------------------------------------------------------
-        */
-
-
-        $customFiles = ['status', 'is_default'];
-        if (in_array($key, $customFiles)) {
-
-            if ($key == 'status' || $key == 'is_default') {
-                $keyboard[] = [
-                    [
-                        'text' => 'غیرفعال',
-                        'callback_data' => "type=adminCartUpdate|id={$id}|value=-1",
-                    ],
-                    [
-                        'text' => 'فعال',
-                        'callback_data' => "type=adminCartUpdate|id={$id}|value=1",
-                    ],
-                ];
-            }
-
-        }
-
-        if ($key === 'sheba' && !empty($country->sheba)) {
-            $keyboard[] = [
-                [
-                    'text' => '🗑 خالی کردن شماره شبا',
-                    'callback_data' => "type=adminCartUpdate|id={$id}|clear=1",
-                    'style' => 'danger',
-                ],
-            ];
-        }
-
-
-        if ($key == 'status' || $key == 'is_default') {
-
-            $oldValue = match ((int)$oldValue) {
-                1 => 'فعال',
-                -1 => 'غیرفعال',
-                default => 'نامشخص'
-            };
-        }
-
-        $text = "✏️ لطفا مقدار <b>{$fields[$key]['label']}</b> را وارد کنید\n";
-        $text .= "📌 مقدار قبلی: <code>{$oldValue}</code>";
-        if ($key === 'sheba') {
-            $text .= "\nℹ️ شماره شبا اختیاری است.";
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Bottom Buttons
-        |--------------------------------------------------------------------------
-        */
-        $keyboard[] = $this->adminFooterButtons("type=adminCartDetail|id={$id}");
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminCartUpdate($type = null)
-    {
-        $user = $this->user;
-
-        $key = $user->tel_detail['cart-key'];
-        $id = $user->tel_detail['cart-id'];
-
-        $fields = [
-            'name' => ['label' => 'نام صاحب کارت'],
-            'status' => ['label' => 'وضعیت'],
-            'cart' => ['label' => 'شماره کارت'],
-            'sheba' => ['label' => 'شماره شبا'],
-            'is_default' => ['label' => 'کارت پیشفرض'],
-        ];
-
-        if (!array_key_exists($key, $fields)) {
-            return $this->sendTemporaryMessage('فیلد کارت معتبر نیست');
-        }
-
-        if ($key === 'sheba' && !Schema::hasColumn('carts', 'sheba')) {
-            $text = "❌ ستون شماره شبا هنوز به دیتابیس اضافه نشده است.\n"
-                . "ابتدا migrationهای پروژه را اجرا کنید و سپس همین مقدار را دوباره ارسال کنید.";
-
-            return $this->sendMessage([
-                'chat_id' => $this->chatId,
-                'text' => $text,
-                'parse_mode' => 'HTML',
-                'reply_markup' => json_encode([
-                    'inline_keyboard' => [
-                        $this->adminFooterButtons("type=adminCartDetail|id={$id}"),
-                    ],
-                ]),
-            ], 'message');
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Custom Fields
-        |--------------------------------------------------------------------------
-        */
-
-        $customFields = ['status', 'is_default'];
-
-        if (in_array($key, $customFields)) {
-            $value = $type['value'];
-        } elseif ($key === 'sheba' && !empty($type['clear'])) {
-            $value = null;
-        } else {
-            // Text fields, including cart and sheba, follow the exact same
-            // update path and are stored exactly as the admin entered them.
-            $value = $this->text;
-        }
-
-        try {
-            Carts::where('id', $id)
-                ->update([$key => $value]);
-        } catch (\Throwable $exception) {
-            Log::error('Failed to update card payment field.', [
-                'cart_id' => $id,
-                'field' => $key,
-                'error' => $exception->getMessage(),
-            ]);
-
-            return $this->sendMessage([
-                'chat_id' => $this->chatId,
-                'text' => '❌ ذخیره اطلاعات کارت انجام نشد. خطا در گزارش‌های سیستم ثبت شد.',
-                'parse_mode' => 'HTML',
-                'reply_markup' => json_encode([
-                    'inline_keyboard' => [
-                        $this->adminFooterButtons("type=adminCartDetail|id={$id}"),
-                    ],
-                ]),
-            ], 'message');
-        }
-
-        $this->updatePath('start');
-
-        $text = "✅ فیلد <b>{$fields[$key]['label']}</b> با موفقیت بروزرسانی شد.";
-
-        $keyboard[] = $this->adminFooterButtons("type=adminCartDetail|id={$id}");
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminBotSetting()
-    {
-
-        $text = headTitle("⚙️ تنظیمات ربات");
-        $text .= "📌 در این بخش می‌توانید تنظیمات اصلی ربات را مدیریت کنید.\n\n";
-
-
-        /*
-        |--------------------------------------------------------------------------
-        | Keyboard
-        |--------------------------------------------------------------------------
-        */
-
-        $buttons = [];
-
-        $buttons[] = [
-            [
-                'text' => "=====  آیدی کانال ها  =====",
-                'callback_data' => "ignore",
-                'style' => 'danger'
-            ]
-        ];
-        $buttons[] = [
-            [
-                'text' => "✅ تراکنشات",
-                'callback_data' => "type=adminChangeSetting|k=cart_be_cart_id|p_path=adminBotSetting",
-            ]
-            , [
-                'text' => "📊 گزارشات",
-                'callback_data' => "type=adminChangeSetting|k=report_id|p_path=adminBotSetting",
-            ]
-        ];
-
-        $buttons[] = [
-            [
-                'text' => "💳 پشتیبانی",
-                'callback_data' => "type=adminChangeSetting|k=support_id|p_path=adminBotSetting",
-            ], [
-                'text' => "✅ کانال",
-                'callback_data' => "type=adminChangeSetting|k=channel_id|p_path=adminBotSetting",
-            ]
-        ];
-
-        $buttons[] = $this->adminFooterButtons('type=adminSetting');
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send
-        |--------------------------------------------------------------------------
-        */
-
-        return $this->sendMessage([
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ])
-        ], 'message');
-    }
-
-    protected function adminChangeSetting($type)
-    {
-        $key = $type['k'] ?? null;
-        $prevPath = $type['p_path'] ?? "adminSetting";
-
-        if (!$key) {
-            return $this->sendTemporaryMessage('⚠️ کلید تنظیمات مشخص نشده است.');
-        }
-
-        $this->updatePath('adminChangeSettingSubmit');
-
-        $user = $this->user;
-        $tel_detail = $user->tel_detail ?? [];
-
-        $tel_detail['setting-key'] = $key;
-        $tel_detail['setting-prev-path'] = $prevPath;
-
-        $user->tel_detail = $tel_detail;
-        $user->save();
-
-        $setting = Setting::where('key', $key)->first();
-
-        if (!$setting) {
-            return $this->sendTemporaryMessage('⚠️ تنظیم مورد نظر یافت نشد.');
-        }
-        $currentValue = $setting->value ?? '—';
-
-        $text = "✏️ <b>ویرایش تنظیم</b>\n\n";
-        $text .= "⚙️ <b>{$setting->name}</b>\n";
-        $text .= "📌 مقدار فعلی: <code>{$currentValue}</code>\n\n";
-        $text .= "✍️ لطفا مقدار جدید را ارسال کنید.";
-
-        $buttons = [];
-        $buttons[] = $this->adminFooterButtons("type={$prevPath}");
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ])
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminChangeSettingSubmit($type = null)
-    {
-        $user = $this->user;
-        $tel_detail = $user->tel_detail ?? [];
-
-        $key = $tel_detail['setting-key'] ?? null;
-        $prevPath = $tel_detail['setting-prev-path'] ?? 'adminSetting';
-
-        if (!$key) {
-            return $this->sendTemporaryMessage('⚠️ کلید تنظیمات یافت نشد.');
-        }
-
-        $setting = Setting::where('key', $key)->first();
-
-        if (!$setting) {
-            return $this->sendTemporaryMessage('⚠️ تنظیم مورد نظر یافت نشد.');
-        }
-
-        // مقدار جدید
-        $value = $type['value'] ?? $this->text;
-
-        if ($key == 'support_id' || $key == 'report_id' || $key == 'cart_be_cart_id') {
-            $value = str_replace(['https://t.me/', '@'], '', $value);
-        }
-
-        if ($value === null || $value === '') {
-            return $this->sendTemporaryMessage('❌ مقدار وارد شده معتبر نیست.');
-        }
-
-        // ذخیره مقدار
-        $setting->value = $value;
-        $setting->save();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Response
-        |--------------------------------------------------------------------------
-        */
-
-        $text = "✅ تنظیم با موفقیت بروزرسانی شد\n\n";
-        $text .= "⚙️ <b>{$setting->name}</b>\n";
-        $text .= "📌 مقدار جدید: <code>{$setting->value}</code>";
-
-        $buttons[] = $this->adminFooterButtons("type={$prevPath}");
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $buttons
-            ])
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
 
     //Country
 
-    protected function adminCountries($type)
-    {
-        $page = $type['page'] ?? 1;
-
-        $list = Countries::orderByRaw("CASE WHEN status = '1' THEN 0 ELSE 1 END")
-            ->orderByDesc('id')
-            ->with('Service')
-            ->paginate(10, ['*'], 'page', $page);
-
-        $text = "🌍 <b>لیست کشورها</b>\n";
-        $text .= "📄 صفحه: <code>{$list->currentPage()}</code>\n";
-        $text .= "📊 تعداد: <code>{$list->total()}</code>\n\n";
-
-        $keyboard = [];
-        $row = [];
-        foreach ($list as $country) {
-
-            $status = ((int)$country->status === 1) ? '🟢' : '🔴';
-
-            $name = !is_null($country->Service) ? $country->Service->name : '-';
-            $row[] = [
-                'text' => "{$status} {$country->name} | {$name}",
-                'callback_data' => "type=adminCountriesDetail|id={$country->id}",
-            ];
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-        /*
-        |--------------------------------------------------------------------------
-        | Pagination
-        |--------------------------------------------------------------------------
-        */
-
-        $pagination = $this->paginationFooterButton($list, $page, 'adminCountries');
-
-        if (!empty($pagination)) {
-            $keyboard[] = $pagination;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Bottom Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard[] = [
-            [
-                'text' => '➕ ایجاد کشور جدید',
-                'callback_data' => 'type=adminCountriesCreate',
-                'style' => 'success'
-            ]
-        ];
-
-        $keyboard[] = $this->adminFooterButtons('type=adminPanelMenu');
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminCountriesCreate($type)
-    {
-        $user = $this->user;
-
-        $country = new Countries();
-        $country->status = -1;
-        $country->save();
-
-        $type['id'] = $country->id;
-
-        return $this->adminCountriesDetail($type);
-    }
-
-    protected function adminCountriesDetail($type)
-    {
-        $id = $type['id'];
-
-        $country = Countries::find($id);
-
-        if (is_null($country)) {
-            return $this->sendTemporaryMessage('کشور پیدا نشد');
-        }
-
-        $fields = [
-            'name' => [
-                'label' => 'نام کشور',
-                'value' => $country->name
-            ],
-            'status' => [
-                'label' => 'وضعیت',
-                'value' => $country->status
-            ],
-            'type' => [
-                'label' => 'نوع',
-                'value' => $country->type
-            ],
-        ];
-
-        $text = "🌍 <b>جزئیات کشور</b>\n\n";
-
-        $keyboard = [];
-        $row = [];
-
-        foreach ($fields as $key => $field) {
-
-            $isEmpty = (
-                $field['value'] === null ||
-                $field['value'] === ''
-            );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Value Text
-            |--------------------------------------------------------------------------
-            */
-
-            if ($key == 'status') {
-
-                $valueText = match ((int)$field['value']) {
-                    1 => '🟢 فعال',
-                    -1 => '🔴 غیرفعال',
-                    default => '⚪️ نامشخص'
-                };
-
-            } elseif ($key == 'type') {
-                $service = Service::find($field['value']);
-
-                $valueText = !is_null($service) ? $service->name : '-';
-            } else {
-
-                $valueText = $isEmpty
-                    ? '—'
-                    : htmlspecialchars((string)$field['value']);
-            }
-
-            $text .= "▪️ <b>{$field['label']}</b>: <code>{$valueText}</code>\n";
-
-            /*
-            |--------------------------------------------------------------------------
-            | Buttons
-            |--------------------------------------------------------------------------
-            */
-
-            $btnText = $isEmpty
-                ? "🔴 {$field['label']}"
-                : "🟢 {$field['label']}";
-
-            $row[] = [
-                'text' => $btnText,
-                'callback_data' => "type=adminCountriesEdit|id={$id}|key={$key}"
-            ];
-
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Bottom Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard[] = $this->adminFooterButtons('type=adminCountries');
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminCountriesEdit($type)
-    {
-        $id = $type['id'];
-        $key = $type['key'];
-
-        $user = $this->user;
-
-        $this->updatePath('adminCountriesUpdate');
-
-        $telDetail = $user->tel_detail ?? [];
-
-        $telDetail['country-key'] = $key;
-        $telDetail['country-id'] = $id;
-
-        $user->tel_detail = $telDetail;
-        $user->save();
-
-        $country = Countries::find($id);
-
-        if (!$country) {
-            return $this->sendTemporaryMessage('کشور پیدا نشد');
-        }
-
-        $fields = [
-            'name' => ['label' => 'نام کشور'],
-            'status' => ['label' => 'وضعیت'],
-            'type' => [
-                'label' => 'نوع',
-            ],
-        ];
-
-        $oldValue = $country->$key ?? '—';
-
-        /*
-        |--------------------------------------------------------------------------
-        | Status Text
-        |--------------------------------------------------------------------------
-        */
-
-
-        $customFiles = ['type', 'status'];
-        if (in_array($key, $customFiles)) {
-
-            if ($key == 'type') {
-                $services = Service::where('status', 1)->get();
-
-                $keyboard = [];
-                $row = [];
-
-                foreach ($services as $service) {
-
-                    if ($service->id == $country->type) {
-                        $oldValue = $service->name;
-                    }
-
-                    $row[] = [
-                        'text' => $service->name,
-                        'callback_data' => "type=adminCountriesUpdate|id={$id}|value={$service->id}",
-                    ];
-
-                    // دو ستونه
-                    if (count($row) == 2) {
-                        $keyboard[] = $row;
-                        $row = [];
-                    }
-                }
-
-                if (!empty($row)) {
-                    $keyboard[] = $row;
-                }
-            } elseif ($key == 'status') {
-                $keyboard[] = [
-                    [
-                        'text' => 'غیرفعال',
-                        'callback_data' => "type=adminCountriesUpdate|id={$id}|value=-1",
-                    ],
-                    [
-                        'text' => 'فعال',
-                        'callback_data' => "type=adminCountriesUpdate|id={$id}|value=1",
-                    ],
-                ];
-            }
-
-        }
-
-
-        if ($key == 'status') {
-
-            $oldValue = match ((int)$oldValue) {
-                1 => 'فعال',
-                -1 => 'غیرفعال',
-                default => 'نامشخص'
-            };
-        }
-
-        $text = "✏️ لطفا مقدار <b>{$fields[$key]['label']}</b> را وارد کنید\n";
-        $text .= "📌 مقدار قبلی: <code>{$oldValue}</code>";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Bottom Buttons
-        |--------------------------------------------------------------------------
-        */
-        $keyboard[] = $this->adminFooterButtons("type=adminCountriesDetail|id={$id}");
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminCountriesUpdate($type = null)
-    {
-        $this->updatePath('start');
-
-        $user = $this->user;
-
-        $key = $user->tel_detail['country-key'];
-        $id = $user->tel_detail['country-id'];
-
-        $fields = [
-            'name' => ['label' => 'نام کشور'],
-            'status' => ['label' => 'وضعیت'],
-            'type' => ['label' => 'نوع'],
-        ];
-
-        /*
-        |--------------------------------------------------------------------------
-        | Custom Fields
-        |--------------------------------------------------------------------------
-        */
-
-        $customFields = ['status', 'type'];
-
-        if (in_array($key, $customFields)) {
-
-            $value = $type['value'];
-
-            Countries::where('id', $id)
-                ->update([$key => $value]);
-
-        } else {
-
-            Countries::where('id', $id)
-                ->update([$key => $this->text]);
-        }
-
-        $text = "✅ فیلد <b>{$fields[$key]['label']}</b> با موفقیت بروزرسانی شد.";
-
-        $keyboard[] = $this->adminFooterButtons("type=adminCountriesDetail|id={$id}");
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
 
     // Admin Service
-    protected function adminService($type)
-    {
-        $page = $type['page'] ?? 1;
-
-        $list = Service::orderByDesc('id')
-            ->paginate(10, ['*'], 'page', $page);
-
-        $text = "🌍 <b>لیست سرویس ها</b>\n";
-        $text .= "📄 صفحه: <code>{$list->currentPage()}</code>\n";
-        $text .= "📊 تعداد: <code>{$list->total()}</code>\n\n";
-
-        $keyboard = [];
-        $row = [];
-
-
-        foreach ($list as $country) {
-
-            $status = ((int)$country->status === 1)
-                ? '🟢 فعال'
-                : '🔴 غیرفعال';
-
-            $name = !is_null($country->name) ? $country->name : 'بدون نام';
-            $row[] = [
-                'text' => "{$name} | {$status}",
-                'callback_data' => "type=adminServiceDetail|id={$country->id}",
-            ];
-
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-        /*
-        |--------------------------------------------------------------------------
-        | Pagination
-        |--------------------------------------------------------------------------
-        */
-
-        $pagination = $this->paginationFooterButton($list, $page, 'adminService');
-
-        if (!is_null($pagination)) {
-            $keyboard[] = $pagination;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Bottom Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard[] = [
-            [
-                'text' => '➕ ایجاد سرویس جدید',
-                'callback_data' => 'type=adminServiceCreate',
-                'style' => 'success'
-            ]
-        ];
-
-        $keyboard[] = $this->adminFooterButtons('type=adminPanelMenu');
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminServiceCreate($type)
-    {
-        $user = $this->user;
-
-        $country = new Service();
-        $country->status = 0;
-        $country->save();
-
-        $type['id'] = $country->id;
-
-        return $this->adminServiceDetail($type);
-    }
-
-    protected function adminServiceDetail($type)
-    {
-        $id = $type['id'];
-
-        $country = Service::find($id);
-
-        if (is_null($country)) {
-            return $this->sendTemporaryMessage('سرویس پیدا نشد');
-        }
-
-        $fields = [
-            'name' => [
-                'label' => 'نام سرویس',
-                'value' => $country->name
-            ],
-            'status' => [
-                'label' => 'وضعیت',
-                'value' => $country->status
-            ],
-            'price_per_gb' => [
-                'label' => 'قیمت هر گیگ',
-                'value' => $country->price_per_gb
-            ],
-        ];
-
-        $text = "🌍 <b>جزئیات سرویس</b>\n\n";
-
-        $keyboard = [];
-        $row = [];
-
-        foreach ($fields as $key => $field) {
-
-            $isEmpty = (
-                $field['value'] === null ||
-                $field['value'] === ''
-            );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Value Text
-            |--------------------------------------------------------------------------
-            */
-
-            if ($key == 'status') {
-
-                $valueText = match ((int)$field['value']) {
-                    1 => '🟢 فعال',
-                    -1 => '🔴 غیرفعال',
-                    default => '⚪️ نامشخص'
-                };
-
-            } elseif ($key == 'price_per_gb') {
-                $valueText = number_format($field['value']) . ' تومان ';
-            } else {
-
-                $valueText = $isEmpty
-                    ? '—'
-                    : htmlspecialchars((string)$field['value']);
-            }
-
-            $text .= "▪️ <b>{$field['label']}</b>: <code>{$valueText}</code>\n";
-
-            /*
-            |--------------------------------------------------------------------------
-            | Buttons
-            |--------------------------------------------------------------------------
-            */
-
-            $btnText = $isEmpty
-                ? "🔴"
-                : "🟢";
-
-            $row[] = [
-                'text' => $btnText,
-                'callback_data' => "type=adminServiceEdit|id={$id}|key={$key}"
-            ];
-
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-        $text .= "راهنما: \n قیمت هر گیگ فقط برای فروش حجم اضافه محاسبه می شود . بر روی تعرفه ها هیچ تاثیری ندارد.\n\n";
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Bottom Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard[] = [
-            ['text' => 'حذف سرویس',
-                'callback_data' => "type=adminServiceDeleteDetail|id={$id}",
-                'style' => 'danger']
-        ];
-
-        $keyboard[] = $this->adminFooterButtons('type=adminService');
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminServiceEdit($type)
-    {
-        $id = $type['id'];
-        $key = $type['key'];
-
-        $user = $this->user;
-
-        $this->updatePath('adminServiceUpdate');
-
-        $telDetail = $user->tel_detail ?? [];
-
-        $telDetail['service-key'] = $key;
-        $telDetail['service-id'] = $id;
-
-        $user->tel_detail = $telDetail;
-        $user->save();
-
-        $country = Service::find($id);
-
-        if (!$country) {
-            return $this->sendTemporaryMessage('کشور پیدا نشد');
-        }
-
-        $fields = [
-            'name' => ['label' => 'نام سرویس'],
-            'status' => ['label' => 'وضعیت'],
-            'price_per_gb' => [
-                'label' => 'قیمت هر گیگ',
-            ],
-        ];
-
-        $oldValue = $country->$key ?? '—';
-
-        /*
-        |--------------------------------------------------------------------------
-        | Status Text
-        |--------------------------------------------------------------------------
-        */
-
-        if ($key == 'status') {
-
-            $oldValue = match ((int)$oldValue) {
-                1 => 'فعال',
-                -1 => 'غیرفعال',
-                default => 'نامشخص'
-            };
-        }
-
-        $text = "✏️ لطفا مقدار <b>{$fields[$key]['label']}</b> را وارد کنید\n";
-        $text .= "📌 مقدار قبلی: <code>{$oldValue}</code>";
-
-        /*
-        |--------------------------------------------------------------------------
-        | Status Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        if ($key == 'status') {
-
-            $keyboard[] = [
-                [
-                    'text' => '🟢 فعال',
-                    'callback_data' => "type=adminServiceUpdate|id={$id}|value=1",
-                    'style' => 'success'
-                ],
-                [
-                    'text' => '🔴 غیرفعال',
-                    'callback_data' => "type=adminServiceUpdate|id={$id}|value=-1",
-                    'style' => 'danger'
-                ]
-            ];
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Bottom Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard[] = $this->adminFooterButtons("type=adminServiceDetail|id={$id}");
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminServiceUpdate($type = null)
-    {
-        $this->updatePath('start');
-
-        $user = $this->user;
-
-        $key = $user->tel_detail['service-key'];
-        $id = $user->tel_detail['service-id'];
-
-        $fields = [
-            'name' => ['label' => 'نام سرویس'],
-            'status' => ['label' => 'وضعیت'],
-            'price_per_gb' => [
-                'label' => 'قیمت هر گیگ',
-            ],
-        ];
-
-        /*
-        |--------------------------------------------------------------------------
-        | Custom Fields
-        |--------------------------------------------------------------------------
-        */
-
-        $customFields = ['status'];
-
-        if (in_array($key, $customFields)) {
-
-            $value = $type['value'];
-
-            Service::where('id', $id)
-                ->update([$key => $value]);
-
-        } else {
-
-            Service::where('id', $id)
-                ->update([$key => $this->text]);
-        }
-
-        $text = "✅ فیلد <b>{$fields[$key]['label']}</b> با موفقیت بروزرسانی شد.";
-
-        $keyboard[] = $this->adminFooterButtons("type=adminServiceDetail|id={$id}");
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminServiceDeleteDetail($type)
-    {
-        $id = $type['id'];
-
-        $service = Service::find($id);
-
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('❌ سرویس موردنظر پیدا نشد.');
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Check Usage
-        |--------------------------------------------------------------------------
-        */
-
-        if ($service->is_used) {
-            return $this->sendTemporaryMessage('⚠️ این سرویس در حال استفاده است و امکان حذف آن وجود ندارد.');
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Service Details
-        |--------------------------------------------------------------------------
-        */
-
-        $plansUsed = Plans::where('type', $service->id)
-            ->pluck('name')
-            ->toArray();
-        $plansUsed = !empty($plansUsed) ? implode(',', $plansUsed) : '—';
-        $panelUsed = Panels::where('panel_type', $service->id)
-            ->pluck('name')
-            ->toArray();
-
-        $panelUsed = !empty($panelUsed) ? implode(',', $panelUsed) : '—';
-
-        $status = match ((int)$service->status) {
-            1 => '🟢 فعال',
-            -1 => '🔴 غیرفعال',
-            default => '🟡 معلق'
-        };
-
-        $text = "╔════════════════════╗\n";
-        $text .= "      🗑 حذف سرویس\n";
-        $text .= "╚════════════════════╝\n\n";
-
-        $text .= "⚠️ آیا از حذف این سرویس اطمینان دارید؟\n\n";
-
-        $text .= "📦 نام سرویس:\n";
-        $text .= "<code>{$service->name}</code>\n\n";
-
-        $text .= "📊 وضعیت:\n";
-        $text .= "<code>{$status}</code>\n\n";
-
-        $text .= "📊 پنل های فعال:\n";
-        $text .= "<code>{$panelUsed}</code>\n\n";
-
-        $text .= "📊 پلن های فعال:\n";
-        $text .= "<code>{$plansUsed}</code>\n\n";
-
-        $text .= "❗ پس از حذف، امکان بازگردانی سرویس وجود نخواهد داشت.\n\n";
-
-        if (!empty($panelUsed) || !empty($plansUsed)) {
-            $text .= "❗ تازمانی که این سرویس٬ پنل یا پلن فعالی داشته باشد امکان حذف آن وجود ندارد";
-
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard = [];
-
-        $keyboard[] = [
-            [
-                'text' => '🗑 بله، حذف شود',
-                'callback_data' => "type=adminServiceDeleteSubmit|id={$id}",
-                'style' => 'danger'
-            ]
-        ];
-
-        $keyboard[] = $this->adminFooterButtons(
-            "type=adminServiceDetail|id={$id}"
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send Message
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminServiceDeleteSubmit($type)
-    {
-        $id = $type['id'];
-
-        $service = Service::find($id);
-
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('سرویس پیدا نشد');
-        }
-
-        $plansUsed = Plans::where('type', $service->id)->first();
-        $panelUsed = Panels::where('panel_type', $service->id)->first();
-
-        if (!is_null($plansUsed) || !is_null($panelUsed)) {
-            return $this->sendTemporaryMessage('این سرویس در حال استفاده می باشد.');
-        }
-
-        $service->delete();
-
-        $this->telegramSdk->answerCallback([
-            'callback_query_id' => $this->callbackId,
-            'text' => "سرویس با موفقیت حذف شد.",
-            'show_alert' => true,
-            'cache_time' => 1,
-        ]);
-
-
-        return $this->adminService(['page' => 1]);
-    }
 
 
     // Extra Bandwidth
-    protected function adminExtraBandwidths($type)
-    {
-        $page = $type['page'] ?? 1;
-
-        $list = ExtraBandwidth::orderByDesc('id')
-            ->paginate(10, ['*'], 'page', $page);
-
-        $text = "📦 <b>لیست حجم های اضافه</b>\n";
-        $text .= "مبلغ هر حجم اضافه به ازای هر گیگ محاسبه میشود.\n\n";
-        $text .= "قیمت به ازای هر گیگ  میاشد. قیمت هر گیگ در قسمت تنظیمات همین صفحه قابل تنظیم می باشد.\n\n";
-        $text .= "حهت فعال یا غیرفعال کردن فروش حجم اضافه از طریق تنظمیات اقدام نمایید.\n\n.";
-
-        $keyboard = [];
-        $row = [];
-
-
-        foreach ($list as $plan) {
-
-            // نوع پلن
-            $planType = Service::find($plan->type);
-            if (!is_null($planType)) {
-                $planType = $planType->name;
-            } else {
-                $planType = '--';
-            }
-
-            // وضعیت
-            $status = ((int)$plan->status === 1)
-                ? '🟢 فعال'
-                : '🔴 غیرفعال';
-
-            $row[] = [
-                'text' => "حجم:{$plan->name} گیگ| {$planType} | {$status}",
-                'callback_data' => "type=adminExtraBandwidthsDetail|id={$plan->id}"
-            ];
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-
-        // صفحه‌بندی
-        $pagination = $this->paginationFooterButton($list, $page, 'adminExtraBandwidths');
-        if (!is_null($pagination)) {
-            $keyboard[] = $pagination;
-        }
-
-        // ایجاد پلن
-        $keyboard[] = [
-            [
-                'text' => 'تنظیمات',
-                'callback_data' => 'type=adminPlanCreate',
-                'style' => 'primary'
-            ],
-            [
-                'text' => '➕ ایجاد حجم اضافه جدید',
-                'callback_data' => 'type=adminExtraBandwidthsCreate',
-                'style' => 'success'
-            ],
-
-        ];
-
-        // برگشت
-
-        $keyboard[] = $this->adminFooterButtons('type=adminPanelMenu');
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminExtraBandwidthsCreate($type)
-    {
-        $user = $this->user;
-
-        $newPanel = new ExtraBandwidth();
-        $newPanel->admin_id = $user->id;
-        $newPanel->status = 0;
-        $newPanel->save();
-
-        $type['id'] = $newPanel->id;
-        return $this->adminExtraBandwidthsDetail($type);
-    }
-
-    protected function adminExtraBandwidthsDetail($type)
-    {
-        $id = $type['id'];
-
-        $plan = ExtraBandwidth::find($id);
-
-        if (is_null($plan)) {
-            return $this->sendTemporaryMessage('حجم اضافه پیدا نشد، دوباره تلاش کنید');
-        }
-
-        $fields = [
-            'name' => ['label' => 'مقدار حجم', 'value' => $plan->name],
-            'type' => ['label' => 'نوع', 'value' => $plan->type],
-            'status' => ['label' => 'وضعیت', 'value' => $plan->status],
-            'discount' => ['label' => 'درصد تخفیف', 'value' => $plan->discount],
-        ];
-
-        $text = "📦 <b>جزئیات حجم اضافه</b>\n\n";
-
-        $keyboard = [];
-        $row = [];
-        $pricePerGb = null;
-        foreach ($fields as $key => $field) {
-
-            $isEmpty = ($field['value'] === null || $field['value'] === '');
-
-            // نمایش وضعیت در متن
-            $valueText = $isEmpty
-                ? '—'
-                : htmlspecialchars((string)$field['value']);
-
-            if ($key == 'type') {
-
-                $service = Service::find($field['value']);
-                if (!is_null($service)) {
-                    $pricePerGb = $service->price_per_gb;
-                    $valueText = htmlspecialchars($service->name);
-                } else {
-                    $valueText = "--";
-                }
-            } elseif ($key == 'price') {
-                $valueText = number_format($field['value']) . ' تومان ';
-            } elseif ($key == 'status') {
-                $valueText = match ((int)$field['value']) {
-                    1 => '🟢 فعال',
-                    -1 => '🔴 غیرفعال',
-                    0 => '🟡 معلق',
-                    default => '⚪ نامشخص',
-                };
-            }
-
-            $text .= "▪️ <b>{$field['label']}</b>: <code>{$valueText}</code>\n";
-
-            // دکمه‌ها
-            $btnText = $isEmpty
-                ? "🔴 " . $field['label']
-                : $field['label'];
-
-            $row[] = [
-                'text' => $btnText,
-                'callback_data' => "type=adminExtraBandwidthsEdit|id={$id}|key={$key}"
-            ];
-
-            // هر دو دکمه یک ردیف
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-
-        if (is_null($plan->name)) {
-            $text .= "▪️ <b>برای محاسبه مبلغ لطفا حجم را وارد نمایید</b>\n\n";
-        } elseif (isset($service) && $pricePerGb == 0 && is_null($pricePerGb)) {
-
-            $keyboard[] = [
-                [
-                    'text' => 'تنظیم قیمت هر گیگ',
-                    'callback_data' => "type=adminServiceDetail|id={$service->id}",
-                    'style' => 'primary'
-                ]
-            ];
-        } elseif (!isset($service)) {
-            $text .= "▪️ <b>برای محاسبه مبلغ لطفا نوع را انتخاب نمایید</b>\n\n";
-        } else {
-            $price = calculateExtraDiscount($plan, $pricePerGb);
-            $basePrice = number_format($price['base-price']);
-            $price = number_format($price['price']);
-
-            $text .= "▪️ <b>مبلغ</b>: <code>{$basePrice}</code> تومان\n";
-            $text .= "▪️ <b>مبلغ با احتساب تخفیف</b>: <code>{$price}</code> تومان\n";
-        }
-
-        $keyboard[] = [
-            [
-                'text' => 'حذف آیتم',
-                'callback_data' => "type=adminExtraBandwidthsDelete|id={$id}",
-                'style' => 'danger'
-            ]
-        ];
-
-        $keyboard[] = $this->adminFooterButtons('type=adminExtraBandwidths');
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminExtraBandwidthsEdit($type)
-    {
-        $id = $type['id'];
-        $key = $type['key'];
-        $user = $this->user;
-
-        $this->updatePath('adminExtraBandwidthsUpdate');
-        $telDetail = $user->tel_detail ?? [];
-        $telDetail['extra-key'] = $key;
-        $telDetail['extra-id'] = $id;
-        $user->tel_detail = $telDetail;
-        $user->save();
-
-        $plan = ExtraBandwidth::find($id);
-
-        $fields = [
-            'name' => ['label' => 'مقدار حجم', 'value' => $plan->name],
-            'type' => ['label' => 'نوع', 'value' => $plan->type],
-            'status' => ['label' => 'وضعیت', 'value' => $plan->status],
-            'discount' => ['label' => 'درصد تخفیف', 'value' => $plan->discount],
-        ];
-        $oldValue = $plan->$key ?? '—';
-
-        $text = "✏️ لطفا مقدار <b>{$fields[$key]['label']}</b> را وارد کنید\n";
-        if ($key == 'name') {
-            $text .= "📌 حجم را به گیگ وارد کنید";
-        }
-
-        $customFiles = ['type', 'status'];
-        if (in_array($key, $customFiles)) {
-
-            if ($key == 'type') {
-                $services = Service::where('status', 1)->get();
-
-                $keyboard = [];
-                $row = [];
-
-                foreach ($services as $service) {
-
-                    if ($service->id == $plan->type) {
-                        $oldValue = $service->name;
-                    }
-
-                    $row[] = [
-                        'text' => $service->name,
-                        'callback_data' => "type=adminExtraBandwidthsUpdate|id={$id}|value={$service->id}",
-                    ];
-
-                    // دو ستونه
-                    if (count($row) == 2) {
-                        $keyboard[] = $row;
-                        $row = [];
-                    }
-                }
-
-                if (!empty($row)) {
-                    $keyboard[] = $row;
-                }
-            } elseif ($key == 'status') {
-                $keyboard[] = [
-                    [
-                        'text' => 'غیرفعال',
-                        'callback_data' => "type=adminExtraBandwidthsUpdate|id={$id}|value=-1",
-                    ],
-                    [
-                        'text' => 'فعال',
-                        'callback_data' => "type=adminExtraBandwidthsUpdate|id={$id}|value=1",
-                    ],
-                ];
-            }
-
-        }
-        $text .= "📌 مقدار قبلی: <code>" . htmlspecialchars((string)$oldValue) . "</code> \n";
-
-
-        $keyboard[] = $this->adminFooterButtons("type=adminExtraBandwidthsDetail|id={$id}");
-
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminExtraBandwidthsUpdate($type = null)
-    {
-        $this->updatePath('start');
-
-        $user = $this->user;
-        $key = $user->tel_detail['extra-key'];
-        $id = $user->tel_detail['extra-id'];
-
-        $fields = [
-            'name' => ['label' => 'مقدار حجم'],
-            'type' => ['label' => 'نوع'],
-            'status' => ['label' => 'وضعیت'],
-            'discount' => ['label' => 'درصد تخفیف'],
-        ];
-
-        $customFiles = ['type', 'status'];
-        if (in_array($key, $customFiles)) {
-            $value = $type['value'];
-            ExtraBandwidth::where('id', $id)->update([$key => $value]);
-
-        } else {
-            ExtraBandwidth::where('id', $id)->update([$key => $this->text]);
-        }
-
-        $text = "فیلد `{$fields[$key]['label']}` با موفقیت ویرایش شد.";
-
-        $keyboard[] = $this->adminFooterButtons("type=adminExtraBandwidthsDetail|id={$id}");
-
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminExtraBandwidthsDelete($type)
-    {
-        $id = $type['id'];
-
-        $service = ExtraBandwidth::find($id);
-
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('❌ سرویس موردنظر پیدا نشد.');
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Check Usage
-        |--------------------------------------------------------------------------
-        */
-
-        $status = match ((int)$service->status) {
-            1 => '🟢 فعال',
-            -1 => '🔴 غیرفعال',
-            default => '🟡 معلق'
-        };
-
-        $text = "╔════════════════════╗\n";
-        $text .= "      🗑 حذف آیتم\n";
-        $text .= "╚════════════════════╝\n\n";
-
-        $text .= "⚠️ آیا از حذف این آیتم اطمینان دارید؟\n\n";
-
-        $text .= "📦 مقدار حجم (گیگ):\n";
-        $text .= "<code>{$service->name}</code>\n\n";
-
-        $text .= "📊 وضعیت:\n";
-        $text .= "<code>{$status}</code>\n\n";
-
-
-        $text .= "❗ پس از حذف، امکان بازگردانی سرویس وجود نخواهد داشت.\n\n";
-
-
-        /*
-        |--------------------------------------------------------------------------
-        | Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard = [];
-
-        $keyboard[] = [
-            [
-                'text' => '🗑 بله، حذف شود',
-                'callback_data' => "type=adminExtraBandwidthsDeleteSubmit|id={$id}",
-                'style' => 'danger'
-            ]
-        ];
-
-        $keyboard[] = $this->adminFooterButtons(
-            "type=adminExtraBandwidthsDetail|id={$id}"
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send Message
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminExtraBandwidthsDeleteSubmit($type)
-    {
-        $id = $type['id'];
-
-        $service = ExtraBandwidth::find($id);
-
-        if (is_null($service)) {
-            return $this->sendTemporaryMessage('سرویس پیدا نشد');
-        }
-
-        $service->delete();
-
-        $this->telegramSdk->answerCallback([
-            'callback_query_id' => $this->callbackId,
-            'text' => "سرویس با موفقیت حذف شد.",
-            'show_alert' => true,
-            'cache_time' => 1,
-        ]);
-
-        return $this->adminExtraBandwidths(['page' => 1]);
-    }
 
 
     // Inbounds
-    protected function adminInbounds($data)
-    {
-        $keyboard = [];
-        $keyboard[] = [
-            [
-                'text' => "اینبوند های ثنایی",
-                'callback_data' => "type=adminInboundList|value=sanaie"
-            ], [
-                'text' => "اینبوند های پاسارگاد",
-                'callback_data' => "type=adminPasarGuardGroups|value=pasarguard"
-            ],
-        ];
-        $keyboard[] = $this->adminFooterButtons('type=adminPanelMenu');
 
-        $text = headTitle('لیست اینبوند ها');
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminInboundList($data)
-    {
-        $type = $data['value'];
-        $page = $data['page'] ?? 1;
-
-        /*
-        |--------------------------------------------------------------------------
-        | Panels
-        |--------------------------------------------------------------------------
-        */
-
-        $panels = Panels::where('system_type', $type)
-            ->pluck('id')
-            ->toArray();
-        /*
-        |--------------------------------------------------------------------------
-        | Inbounds List
-        |--------------------------------------------------------------------------
-        */
-
-        $list = Inbounds::wherein('panel_id', $panels)
-            ->with(['panel'])
-            ->orderByDesc('id')
-            ->paginate(20, ['*'], 'page', $page);
-        /*
-        |--------------------------------------------------------------------------
-        | Text
-        |--------------------------------------------------------------------------
-        */
-
-        $text = headTitle('لیست اینبوند های ثنایی');
-
-        if ($list->count() == 0) {
-            $text .= "❌ هیچ اینبوندی یافت نشد.";
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Keyboard
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard = [];
-
-        foreach ($list as $inbound) {
-            $name = $inbound?->panel?->name;
-            $statusIcon = $inbound->status ? '🟢' : '🔴';
-            $keyboard[][] = [
-                'text' => "{$statusIcon} {$inbound->remark}:{$inbound->port} - نام پنل: {$name}",
-                'callback_data' => "type=adminToggleInboundStatus|id={$inbound->id}|value={$type}"
-            ];
-        }
-
-
-        /*
-        |--------------------------------------------------------------------------
-        | Pagination
-        |--------------------------------------------------------------------------
-        */
-
-        $pagination = $this->paginationFooterButton(
-            $list,
-            $page,
-            "adminInboundList|value={$type}"
-        );
-
-        if (!empty($pagination)) {
-            $keyboard[] = $pagination;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Footer Buttons
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard[] = $this->adminFooterButtons('type=adminInbounds');
-
-        /*
-        |--------------------------------------------------------------------------
-        | Send Message
-        |--------------------------------------------------------------------------
-        */
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminToggleInboundStatus($data)
-    {
-        $id = $data['id'];
-
-        $inbound = Inbounds::find($id);
-        if ($inbound->status == 0) {
-            $inbound->status = 1;
-            $message = ' `فعال` ';
-        } else {
-            $inbound->status = 0;
-            $message = ' `غیر فعال` ';
-        }
-        $inbound->save();
-
-
-        $this->telegramSdk->answerCallback([
-            'callback_query_id' => $this->callbackId,
-            'text' => "وضعیت اینبوند با موفقیت به {$message}تغییر پیدا کرد. ",
-            'show_alert' => true,
-            'cache_time' => 1,
-        ]);
-
-        return $this->adminInboundList($data);
-
-    }
-
-    protected function adminPasarGuardGroups($data)
-    {
-        $type = $data['value'] ?? 'pasarguard';
-        $id = $data['id'] ?? null;
-        $page = $data['page'] ?? 1;
-
-
-        $path = null;
-        if (!is_null($id)) {
-            $panels = [$id];
-            $path = "|b=true|v_id=$id";
-        } else {
-            $panels = Panels::where('system_type', 'pasarguard');
-            $panels = $panels->pluck('id')->toArray();
-        }
-
-        $list = Inbounds::wherein('panel_id', $panels)
-            ->with(['panel'])
-            ->orderByDesc('id')
-            ->paginate(20, ['*'], 'page', $page);
-
-        $text = headTitle('لیست گروه های پاسارگاد');
-
-        if ($list->count() == 0) {
-            $text .= "❌ هیچ اینبوندی یافت نشد.";
-        }
-
-        $keyboard = [];
-        foreach ($list as $inbound) {
-            $name = $inbound?->panel?->name;
-            $statusIcon = $inbound->status == 1 ? '🟢' : '🔴';
-            $keyboard[][] = [
-                'text' => "{$statusIcon} {$inbound->remark}:{$inbound->port} - نام پنل: {$name}",
-                'callback_data' => "type=AdminPGGDA|id={$inbound->id}|value={$type}{$path}"
-            ];
-        }
-
-
-        $pagination = $this->paginationFooterButton(
-            $list,
-            $page,
-            "adminInboundList|value={$type}"
-        );
-
-        if (!empty($pagination)) {
-            $keyboard[] = $pagination;
-        }
-        if (!is_null($id)) {
-            $keyboard[] = $this->adminFooterButtons("type=adminPanelDetail|id=$id");
-        } else {
-            $keyboard[] = $this->adminFooterButtons('type=adminInbounds');
-        }
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminPasarGuardGroupDetail($data)
-    {
-        $id = $data['id'];
-        $back = $data['b'] ?? null;
-        $value = $data['v_id'] ?? null;
-
-        $plan = Inbounds::find($id);
-
-        if (is_null($plan)) {
-            return $this->sendTemporaryMessage('گروه پیدا نشد، دوباره تلاش کنید');
-        }
-
-        $fields = [
-            'country_id' => ['label' => 'نام کشور', 'value' => $plan->country_id],
-            'status' => ['label' => 'وضعیت', 'value' => $plan->status],
-
-        ];
-
-        $text = "📦 <b>جزئیات گروه</b>\n\n";
-
-        $keyboard = [];
-        $row = [];
-
-        foreach ($fields as $key => $field) {
-
-            $isEmpty = ($field['value'] === null || $field['value'] === '');
-
-            // نمایش وضعیت در متن
-            $valueText = $isEmpty
-                ? '—'
-                : htmlspecialchars((string)$field['value']);
-
-            if ($key == 'status') {
-                $valueText = match ((int)$field['value']) {
-                    1 => '🟢 فعال',
-                    -1 => '🔴 غیرفعال',
-                    0 => '🟡 معلق',
-                    default => '⚪ نامشخص',
-                };
-            } elseif ($key == 'country_id') {
-                $valueText = Countries::find($field['value'])->name ?? '—';
-            }
-
-            $text .= "▪️ <b>{$field['label']}</b>: <code>{$valueText}</code>\n";
-
-            // دکمه‌ها
-            $btnText = $isEmpty
-                ? "🔴 " . $field['label']
-                : $field['label'];
-
-            $row[] = [
-                'text' => $btnText,
-                'callback_data' => "type=adminPasarGuardGroupsEdit|id={$id}|key={$key}"
-            ];
-
-            // هر دو دکمه یک ردیف
-            if (count($row) === 2) {
-                $keyboard[] = $row;
-                $row = [];
-            }
-        }
-
-        if (!empty($row)) {
-            $keyboard[] = $row;
-        }
-
-        $keyboard[] = [
-            [
-                'text' => 'حذف پلن',
-                'callback_data' => "type=adminPlanDeleteDetail|id={$id}",
-                'style' => 'danger'
-            ]
-        ];
-
-        if (is_null($back)) {
-            $keyboard[] = $this->adminFooterButtons('type=adminPasarGuardGroups');
-        } else {
-            $keyboard[] = $this->adminFooterButtons("type=adminPasarGuardGroups|id={$value}");
-        }
-
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminPasarGuardGroupsEdit($type)
-    {
-        $id = $type['id'];
-        $key = $type['key'];
-        $user = $this->user;
-
-        $this->updatePath('adminPasarGuardGroupUpdate');
-        $telDetail = $user->tel_detail ?? [];
-        $telDetail['inbound-key'] = $key;
-        $telDetail['inbound-id'] = $id;
-        $user->tel_detail = $telDetail;
-        $user->save();
-
-        $fields = [
-            'country_id' => ['label' => 'کشور'],
-            'status' => ['label' => 'وضعیت'],
-        ];
-
-        $panel = Inbounds::find($id);
-
-        $oldValue = $panel->$key ?? '—';
-
-        $text = "✏️ لطفا مقدار <b>{$fields[$key]['label']}</b> را وارد کنید\n";
-
-        $customFiles = ['system_type', 'type', 'panel_type', 'status', 'country_id'];
-        if (in_array($key, $customFiles)) {
-
-            if ($key == 'status') {
-                $keyboard[] = [
-                    [
-                        'text' => 'فعال',
-                        'callback_data' => "type=adminPasarGuardGroupsUpdate|id={$id}|value=1",
-                    ],
-                    [
-                        'text' => 'غیرفعال',
-                        'callback_data' => "type=adminPasarGuardGroupsUpdate|id={$id}|value=-1",
-                    ],
-                ];
-            } elseif ($key == 'country_id') {
-                $parentPanel = Panels::find($panel->panel_id);
-                $country = Countries::where('type', $parentPanel->panel_type)->get();
-                foreach ($country as $item) {
-
-                    $isSelected = ((int)$panel->country_id === (int)$item->id);
-
-                    if ($isSelected) {
-                        $oldValue = $item->name;
-                    }
-                    $keyboard[] = [
-                        [
-                            'text' => $item->name . ($isSelected ? ' ✅' : ''),
-                            'callback_data' => "type=adminPasarGuardGroupsUpdate|id={$id}|value={$item->id}",
-                            'style' => $isSelected ? 'success' : ''
-                        ]
-                    ];
-                }
-            }
-        }
-        $text .= "📌 مقدار قبلی: <code>" . htmlspecialchars((string)$oldValue) . "</code>";
-
-
-        $keyboard[] = $this->adminFooterButtons("type=AdminPGGDA|id={$id}");
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-
-    }
-
-    protected function adminPasarGuardGroupsUpdate($type = null)
-    {
-        $user = $this->user;
-        $key = $user->tel_detail['inbound-key'];
-        $id = $user->tel_detail['inbound-id'];
-
-        $fields = [
-            'country_id' => ['label' => 'کشور'],
-            'status' => ['label' => 'وضعیت'],
-        ];
-
-
-        $customFiles = ['status', 'country_id'];
-        if (in_array($key, $customFiles)) {
-            $value = $type['value'];
-            Inbounds::where('id', $id)->update([$key => $value]);
-
-        } else {
-            $text = rtrim($this->text, '/');
-            Inbounds::where('id', $id)->update([$key => $text]);
-
-            if ($key == 'url') {
-                $checkSub = Panels::find($id);
-                if (is_null($checkSub->sub_address)) {
-                    $scheme = parse_url($text, PHP_URL_SCHEME) ?? 'https';
-                    $host = parse_url($text, PHP_URL_HOST);
-                    $result = $scheme . '://' . $host . ':2096/sub/';
-                    $checkSub->sub_address = $result;
-                    $checkSub->save();
-                }
-            }
-        }
-
-        $text = "فیلد `{$fields[$key]['label']}` با موفقیت ویرایش شد.";
-
-        $keyboard[] = $this->adminFooterButtons("type=AdminPGGDA|id={$id}");
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-
-    }
-
-    protected function adminPasarGuardSellSetting($type)
-    {
-        $id = $type['id'];
-        $panel = Panels::find($id);
-        if (is_null($panel)) {
-            return $this->sendTemporaryMessage('panel not found please try again');
-        }
-        $text = headTitle("📋 تنظیمات فروش چند کشور");
-        $planDetail = $panel->detail;
-        $multiSellStatus = 0;
-        if (array_key_exists('status', $planDetail) && $planDetail['status'] == 1) {
-            $multiSellStatus = 1;
-        }
-        $keyboard[] = [
-            [
-                'text' => "وضعیت فروش:" . ($multiSellStatus == 1 ? ' فعال ' : ' غیرفعال '),
-                'callback_data' => "type=adminPGSellChangeStatus|id=$panel->id|status={$multiSellStatus}",
-            ]
-        ];
-        $keyboard[] = [
-            [
-                'text' => 'درصد افزایش مبلغ',
-                'callback_data' => "type=adminPGSellChangePercent|id=$panel->id",
-            ]
-        ];
-        $keyboard[] = $this->adminFooterButtons("type=adminPanelDetail|id=$panel->id");
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminPGSellChangeStatus($data)
-    {
-        $id = $data['id'];
-        $status = $data['status'];
-        $panel = Panels::find($id);
-        $detail = $panel->detail;
-        if ($status == 1) {
-            $status = 0;
-        } else {
-            $status = 1;
-        }
-        $detail['status'] = $status;
-
-        $panel->detail = $detail;
-        $panel->save();
-
-        return $this->adminPasarGuardSellSetting($data);
-    }
-
-    protected function adminPGSellChangePercent($data)
-    {
-        $id = $data['id'];
-        $user = $this->user;
-        $telDetail = $user->tel_detail;
-        $telDetail['panel-id'] = $id;
-        $user->tel_detail = $telDetail;
-        $user->save();
-
-        $panel = Panels::find($id);
-        $discount = $panel->detail;
-
-        $oldValue = $discount['percent'] ?? '—';
-
-        $text = "✏️ درصد مورد نظر را وارد کنید\n";
-        $text .= "📌 مقدار قبلی: <code>" . htmlspecialchars((string)$oldValue) . "</code> \n";
-
-        $keyboard[] = $this->adminFooterButtons("type=adminPanelDetail|id={$id}");
-
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        $this->updatePath('adminPGSellChangePercentSubmit');
-
-        return $this->sendMessage($data, 'message');
-    }
-
-    protected function adminPGSellChangePercentSubmit()
-    {
-        $user = $this->user;
-        $telDetail = $user->tel_detail;
-        $id = $telDetail['panel-id'];
-
-        $panel = Panels::find($id);
-        $detail = $panel->detail;
-
-        $detail['percent'] = $this->text;
-        $panel->detail = $detail;
-        $panel->save();
-
-        $text = "فیلد درصد با موفقیت ویرایش شد.";
-
-        $keyboard[] = $this->adminFooterButtons("type=adminPanelDetail|id={$id}");
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-        return $this->sendMessage($data, 'message');
-
-    }
-
-    protected function adminChargeAmount($data)
-    {
-        $setting = Setting::where('key', 'charge_amount')->first();
-
-        $keyboard = [
-            'inline_keyboard' => []
-        ];
-
-        if (!is_null($setting) && !empty($setting->value)) {
-
-            $amounts = explode(',', $setting->value);
-
-            $row = [];
-
-            foreach ($amounts as $key => $amount) {
-
-                $amount = number_format(trim($amount));
-
-                if ($amount === '') {
-                    continue;
-                }
-
-                $row[] = [
-                    'text' => "💰 {$amount} T",
-                    'callback_data' => "type=adminChargeAmountDelete|amount={$amount}|key=$key",
-                ];
-
-                // دو ستون در هر ردیف
-                if (count($row) == 2) {
-                    $keyboard['inline_keyboard'][] = $row;
-                    $row = [];
-                }
-            }
-
-            // اگر تعداد فرد بود
-            if (!empty($row)) {
-                $keyboard['inline_keyboard'][] = $row;
-            }
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | دکمه بازگشت
-        |--------------------------------------------------------------------------
-        */
-
-        $keyboard['inline_keyboard'][][] = [
-            'text' => "افزودن مبلغ",
-            'callback_data' => "type=adminChargeAmountAdd",
-        ];
-
-        $keyboard['inline_keyboard'][] = $this->adminFooterButtons("type=adminPaymentSetting");
-
-        $text = "
-💳 <b>مدیریت مبالغ شارژ</b>
-
-یکی از مبالغ زیر را برای مدیریت یا تنظیم انتخاب کنید.
-";
-
-        return $this->sendMessage([
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode($keyboard),
-        ], 'message');
-    }
-
-    protected function adminChargeAmountAdd()
-    {
-        $this->updatePath('adminChargeAmountSubmit');
-
-        $keyboard['inline_keyboard'][] = $this->adminFooterButtons("type=adminPaymentSetting");
-
-        $text = "لطفا مبلع مورد نظر را به تومان وارد نمایید";
-
-        return $this->sendMessage([
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode($keyboard),
-        ], 'message');
-    }
-
-    protected function adminChargeAmountSubmit($data)
-    {
-        $input = trim($this->text);
-
-
-        $validator = Validator::make(
-            ['amount' => PersianNumToEn($input)],
-            [
-                'amount' => 'required|numeric|min:0',
-            ],
-            [
-                'amount.required' => 'مبلغ الزامی است',
-                'amount.numeric' => 'فقط عدد مجاز است',
-                'amount.min' => 'مبلغ نمی‌تواند منفی باشد',
-            ]
-        );
-        if ($validator->fails()) {
-            return $this->sendTemporaryMessage($validator->errors()->first());
-        }
-
-        $amounts = [];
-
-        $setting = Setting::where('key', 'charge_amount')->first();
-        if (!is_null($setting) && !empty($setting->value)) {
-            $amounts = explode(',', $setting->value);
-        }
-        $amounts[] = $this->text;
-        $amounts = array_map('trim', $amounts);
-        $amounts = array_filter($amounts, fn($v) => $v !== '');
-
-        $amounts = array_map('floatval', $amounts);
-
-        sort($amounts, SORT_NUMERIC);
-
-        $setting->value = implode(',', $amounts);
-        $setting->save();
-
-
-        $keyboard['inline_keyboard'][] = $this->adminFooterButtons("type=adminChargeAmount");
-
-        $text = "مبلغ مورد نظر با موفقیت ثبت شد.";
-
-        return $this->sendMessage([
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode($keyboard),
-        ], 'message');
-
-    }
-
-    protected function adminChargeAmountDelete($data)
-    {
-        $key = $data['key'];
-        $setting = Setting::where('key', 'charge_amount')->first();
-
-        if (!is_null($setting) && !empty($setting->value)) {
-            $amounts = explode(',', $setting->value);
-            unset($amounts[$key]);
-
-            $setting->value = implode(',', $amounts);
-            $setting->save();
-        }
-
-        $this->telegramSdk->answerCallback([
-            'callback_query_id' => $this->callbackId,
-            'text' => "مبلغ با موفقیت حذف شد.",
-            'show_alert' => true,
-            'cache_time' => 1,
-        ]);
-
-        return $this->adminChargeAmount($data);
-    }
 
     protected function adminMessage($data)
     {
-        $page = $data['page'] ?? 1;
-
-        $messages = Message::ordebyDesc('id')
-            ->paginate(10, ['*'], 'page', $page);
-
-        $keyboard = [];
-        foreach ($messages as $message) {
-
-            $btnText = $message->status == 1 ? " 🟢" : ($message->status == -1 ? " 🔴" : " 🟡");
-            $btnText .= $message->title;
-            $row[] = [
-                'text' => $btnText,
-                'callback_data' => "type=adminMessageSingle|$message->id"
-            ];
-            $keyboard[] = $row;
-        }
-
-        $text = headTitle('لیست پیام های ارسالی');
-        $text .= 'لیست پیام های ارسالی به کاربر';
-
-
-        $keyboard[] = [
-            [
-                'text' => 'افزودن',
-                'callback_data' => 'type=adminOrderSearch'
-            ],
-        ];
-
-        $pagination = $this->paginationFooterButton(
-            $messages,
-            $page,
-            "adminMessage"
-        );
-
-        if (!empty($pagination)) {
-            $keyboard[] = $pagination;
-        }
-
-
-        $data = [
-            'chat_id' => $this->chatId,
-            'text' => trim($text),
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode([
-                'inline_keyboard' => $keyboard
-            ]),
-        ];
-
-
-        return $this->sendMessage($data, 'message');
+        return $this->adminPage('پیام‌های همگانی', 'ارسال پیام همگانی در سورس فعلی پیاده‌سازی نشده است. تنظیم متن خوش‌آمدگویی و راهنمای رسید از بخش متن‌های ربات در دسترس است.', [[$this->adminButton('متن‌های ربات', 'type=adminS|g=texts')]]);
     }
 
     // Orders
@@ -11835,19 +6580,22 @@ $codeText
 
     protected function adminOrderChangeBwSubmit($data)
     {
-        $text = intval($data['text']);
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        $text = filter_var($data['text'] ?? '', FILTER_VALIDATE_INT);
+        if ($text === false || $text === 0 || abs($text) > 1000000) return $this->sendTemporaryMessage('مقدار حجم باید یک عدد صحیح غیرصفر در بازه مجاز باشد.');
         $user = $this->user;
-        $order = Orders::botManaged()->find($user->tel_detail['order-bw']);
-        $panel = Panels::find($order->panel_id);
+        $order = Orders::botManaged()->find($user->tel_detail['order-bw'] ?? 0);
+        $panel = $order ? Panels::find($order->panel_id) : null;
+        if (!$order || !$panel) return $this->sendTemporaryMessage('سفارش یا پنل پیدا نشد؛ سفارش را دوباره باز کنید.');
 
         $data = getConfigDetail($order);
 
-        if ($data['status']) {
+        if ($data['status'] ?? false) {
             $totalGb = $data['data']['totalGb'];
             $totalUsed = $data['data']['totalUsed'];
             $left = $data['data']['left'];
         } else {
-            return $this->sendTemporaryMessage($data['msg']);
+            return $this->sendTemporaryMessage($data['msg'] ?? 'دریافت اطلاعات سرویس انجام نشد.');
         }
 
 
@@ -11860,6 +6608,8 @@ $codeText
             $txtType = ' عملیات کاهش حجم';
         }
 
+        if ($totalGb <= 0 || $totalGb < $totalUsed) return $this->sendTemporaryMessage('حجم نهایی باید مثبت و کمتر از حجم مصرف‌شده نباشد.');
+
         if ($panel->system_type == 'pasarguard') {
             $pasarGuard = new PasarGuard([
                 'url' => $panel->url,
@@ -11868,23 +6618,15 @@ $codeText
                 'id' => $panel->id,
             ]);
             if (!$pasarGuard->checkConnection()) {
-                return [
-                    'status' => false,
-                    'message' => $pasarGuard->getLoginStatus()['message'],
-                ];
+                return $this->sendTemporaryMessage('اتصال به پنل برقرار نشد؛ تغییری ارسال نشد.');
             }
             $result = $pasarGuard->getUserById($order->uid);
-
-            $expire = Carbon::parse($result['expire'])->format('Y-m-d H:i:s');
-            $band = gbToByte($totalGb);
-            $data = [
-                'status' => 'active',
-                'expire' => $expire,
-                'data_limit' => $band,
-            ];
+            if (!is_array($result) || empty($result['id']) || ($result['status'] ?? false) === false) return $this->sendTemporaryMessage('اطلاعات سرویس از پنل دریافت نشد؛ تغییری ارسال نشد.');
+            $data = ['data_limit' => gbToByte($totalGb)];
+            $this->updatePath('start');
             $result = $pasarGuard->updateUserById($order->uid, $data);
 
-            if ($result['status'] != false) {
+            if (is_array($result) && !empty($result['id']) && ($result['status'] ?? false) !== false) {
                 $caption = "$txtType با موفقیت انجام شد.";
 
                 $this->method = 'toUser';
@@ -11905,7 +6647,7 @@ $codeText
                 ], 'message');
 
             } else {
-                $caption = "خطا در انجام عملیات";
+                $caption = "پاسخ موفقیت از پنل دریافت نشد؛ پیش از اقدام مجدد، وضعیت سرویس را در پنل بررسی کنید.";
 
                 $this->method = 'toUser';
                 $this->sendMessage([
@@ -11933,6 +6675,7 @@ $codeText
                 'url' => $panel->url,
             ];
             $session = loginToSanaie($loginData);
+            if (empty($session['session'])) return $this->sendTemporaryMessage('اتصال پنل برقرار نشد.');
 
             $clientRequestData = [
                 'sessionCookie' => $session['session'],
@@ -11940,7 +6683,9 @@ $codeText
                 'uuid' => $order->uid,
             ];
 
-            $clientData = getClient($clientRequestData)['obj'][0];
+            $clientResponse = getClient($clientRequestData);
+            $clientData = $clientResponse['obj'][0] ?? null;
+            if (!is_array($clientData)) return $this->sendTemporaryMessage('اطلاعات سرویس دریافت نشد.');
             $band = gbToByte($totalGb);
 
 
@@ -11957,8 +6702,9 @@ $codeText
                 'totalGB' => $band,
             ];
 
+            $this->updatePath('start');
             $result = updateClient($result);
-            if ($result['success']) {
+            if ($result['success'] ?? false) {
                 $caption = "$txtType با موفقیت انجام شد.";
                 $this->method = 'toUser';
                 $this->sendMessage([
@@ -11977,7 +6723,7 @@ $codeText
                     ]),
                 ], 'message');
             } else {
-                $caption = "خطا در انجام عملیات";
+                $caption = "پاسخ موفقیت از پنل دریافت نشد؛ پیش از اقدام مجدد، وضعیت سرویس را در پنل بررسی کنید.";
                 $this->method = 'toUser';
                 $this->sendMessage([
                     'chat_id' => $this->chatId,
@@ -12063,23 +6809,27 @@ $codeText
 
     protected function adminOrderChangeTimeSubmit($data)
     {
-        $text = intval($data['text']);
+        if (!$this->isAdmin) return $this->denyAdminAccess();
+        $text = filter_var($data['text'] ?? '', FILTER_VALIDATE_INT);
+        if ($text === false || $text === 0 || abs($text) > 3650) return $this->sendTemporaryMessage('مقدار روز باید یک عدد صحیح غیرصفر در بازه مجاز باشد.');
         $user = $this->user;
-        $order = Orders::botManaged()->find($user->tel_detail['order-bw']);
-        $panel = Panels::find($order->panel_id);
+        $order = Orders::botManaged()->find($user->tel_detail['order-time'] ?? 0);
+        $panel = $order ? Panels::find($order->panel_id) : null;
+        if (!$order || !$panel) return $this->sendTemporaryMessage('سفارش یا پنل پیدا نشد؛ سفارش را دوباره باز کنید.');
 
         $data = getConfigDetail($order);
 
 
-        if ($data['status']) {
+        if ($data['status'] ?? false) {
             $totalGb = $data['data']['totalGb'];
             $expire = $data['data']['expire'];
 
         } else {
-            return $this->sendTemporaryMessage($data['msg']);
+            return $this->sendTemporaryMessage($data['msg'] ?? 'دریافت اطلاعات سرویس انجام نشد.');
         }
 
 
+        if (!$expire) return $this->sendTemporaryMessage('سرویس تاریخ انقضای مشخص ندارد؛ تاریخ باید از پنل تعیین شود.');
         $expire = Carbon::parse($expire);
         if ($text >= 0) {
             $expire->addDays((int)$text);
@@ -12097,23 +6847,14 @@ $codeText
                 'id' => $panel->id,
             ]);
             if (!$pasarGuard->checkConnection()) {
-                return [
-                    'status' => false,
-                    'message' => $pasarGuard->getLoginStatus()['message'],
-                ];
+                return $this->sendTemporaryMessage('اتصال به پنل برقرار نشد؛ تغییری ارسال نشد.');
             }
-            $result = $pasarGuard->getUserById($order->uid);
-
-            $expire = $expire->format('Y-m-d H:i:s');
-            $band = gbToByte($totalGb);
-            $data = [
-                'status' => 'active',
-                'expire' => $expire,
-                'data_limit' => $band,
-            ];
+            $data = ['expire' => $expire->toIso8601String()];
+            $this->updatePath('start');
             $result = $pasarGuard->updateUserById($order->uid, $data);
 
-            if ($result['status'] != false) {
+            if (is_array($result) && !empty($result['id']) && ($result['status'] ?? false) !== false) {
+                $order->expire_at = $expire; $order->save();
                 $caption = "$txtType با موفقیت انجام شد.";
 
                 $this->method = 'toUser';
@@ -12134,7 +6875,7 @@ $codeText
                 ], 'message');
 
             } else {
-                $caption = "خطا در انجام عملیات";
+                $caption = "پاسخ موفقیت از پنل دریافت نشد؛ پیش از اقدام مجدد، وضعیت سرویس را در پنل بررسی کنید.";
 
                 $this->method = 'toUser';
                 $this->sendMessage([
@@ -12162,6 +6903,7 @@ $codeText
                 'url' => $panel->url,
             ];
             $session = loginToSanaie($loginData);
+            if (empty($session['session'])) return $this->sendTemporaryMessage('اتصال پنل برقرار نشد.');
 
             $clientRequestData = [
                 'sessionCookie' => $session['session'],
@@ -12169,11 +6911,13 @@ $codeText
                 'uuid' => $order->uid,
             ];
 
-            $clientData = getClient($clientRequestData)['obj'][0];
+            $clientResponse = getClient($clientRequestData);
+            $clientData = $clientResponse['obj'][0] ?? null;
+            if (!is_array($clientData)) return $this->sendTemporaryMessage('اطلاعات سرویس دریافت نشد.');
             $band = gbToByte($totalGb);
 
 
-            $expiryTimestamp = $clientData['expiryTime'];
+            $expiryTimestamp = $expire->timestamp * 1000;
             $result = [
                 'serverUrl' => $panel->url,
                 'sessionCookie' => $session['session'],
@@ -12186,8 +6930,10 @@ $codeText
                 'totalGB' => $band,
             ];
 
+            $this->updatePath('start');
             $result = updateClient($result);
-            if ($result['success']) {
+            if ($result['success'] ?? false) {
+                $order->expire_at = $expire; $order->save();
                 $caption = "$txtType با موفقیت انجام شد.";
                 $this->method = 'toUser';
                 $this->sendMessage([
@@ -12206,7 +6952,7 @@ $codeText
                     ]),
                 ], 'message');
             } else {
-                $caption = "خطا در انجام عملیات";
+                $caption = "پاسخ موفقیت از پنل دریافت نشد؛ پیش از اقدام مجدد، وضعیت سرویس را در پنل بررسی کنید.";
                 $this->method = 'toUser';
                 $this->sendMessage([
                     'chat_id' => $this->chatId,

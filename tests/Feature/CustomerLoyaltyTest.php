@@ -28,7 +28,9 @@ class CustomerLoyaltyTest extends TestCase
             '2026_05_17_112220_create_settings_table.php', '2026_05_20_145319_create_pre_orders_table.php',
             '2026_05_19_100650_create_services_table.php', '2026_05_17_112153_create_plans_table.php',
             '2026_05_18_155104_create_countries_table.php', '2026_05_17_114351_create_telegram_data_table.php', '2026_05_17_113131_create_panels_table.php',
-            '2026_05_18_093434_create_extra_bandwidths_table.php', '2026_05_20_104904_add_price_column_to_services_table.php'] as $migration) {
+            '2026_05_18_093434_create_extra_bandwidths_table.php', '2026_05_20_104904_add_price_column_to_services_table.php',
+            '2026_05_20_120513_add_type_column_to_countries_table.php', '2026_05_17_112208_create_inbounds_table.php',
+            '2026_05_26_123119_add_setting_to_inbounds_table.php', '2026_05_31_164514_add_column_to_inbounds_table.php'] as $migration) {
             (require database_path('migrations/'.$migration))->up();
         }
         Schema::create('orders', function (Blueprint $t) {
@@ -132,10 +134,11 @@ class CustomerLoyaltyTest extends TestCase
 
     private function setupCatalog(): void
     {
-        DB::table('services')->insert(['id' => 1, 'name' => 'shared', 'price_per_gb' => 10000]);
+        DB::table('services')->insert(['id' => 1, 'name' => 'VIP', 'status' => 1, 'price_per_gb' => 10000]);
         DB::table('plans')->insert(['id' => 1, 'name' => 'plan', 'price' => 100000, 'discount' => 10, 'type' => 1, 'status' => 1]);
-        DB::table('countries')->insert(['id' => 1, 'name' => 'test']);
-        DB::table('panels')->insert(['id' => 1, 'name' => 'test', 'panel_type' => 1]);
+        DB::table('countries')->insert(['id' => 1, 'name' => 'test', 'status' => 1, 'type' => 1]);
+        DB::table('panels')->insert(['id' => 1, 'name' => 'test', 'panel_type' => 1, 'status' => 1, 'system_type' => 'sanaie', 'country_id' => 1]);
+        DB::table('inbounds')->insert(['panel_id' => 1, 'inbound_id' => 101, 'country_id' => 1, 'status' => 1]);
         DB::table('orders')->insert(['id' => 1, 'user_id' => 1, 'panel_id' => 1, 'expire_at' => now()->addMonth()]);
         DB::table('extra_bandwidths')->insert(['id' => 1, 'name' => '10', 'discount' => 10, 'type' => 1, 'status' => 1]);
     }
@@ -212,7 +215,7 @@ class CustomerLoyaltyTest extends TestCase
     {
         $this->fakeProfile(10);
         $this->setupCatalog();
-        DB::table('panels')->update(['system_type' => 'pasarguard', 'detail' => json_encode(['percent' => 70])]);
+        DB::table('panels')->update(['system_type' => 'pasarguard', 'detail' => json_encode(['status' => 1, 'percent' => 70])]);
         DB::table('orders')->update(['inbound_id' => 0]);
         $user = User::find(1);
         $user->tel_detail = ['order-service-id' => 1, 'order-country-id' => 0, 'order-plan-id' => 1, 'order-count' => 1, 'order-pasarguard-id' => 1];

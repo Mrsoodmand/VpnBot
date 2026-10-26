@@ -210,7 +210,7 @@ class PasarGuard
 
     /* Groups */
 
-    public function getGroups()
+    public function getGroups(array $query = [])
     {
         if (!$this->token) {
             return false;
@@ -219,7 +219,7 @@ class PasarGuard
         return $this->request([
             'link' => "{$this->url}/api/groups",
             'method' => 'GET',
-            'query' => [],
+            'query' => $query,
         ]);
     }
 

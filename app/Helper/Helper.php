@@ -86,7 +86,7 @@ if (!function_exists('loginToSanaie')) {
         }
 
         if (!is_null($panel)) {
-            $panel->detail = $Data;
+            $panel->detail = array_merge($panel->detail ?? [], $Data);
             $panel->save();
         }
 
