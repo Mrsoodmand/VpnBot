@@ -22,6 +22,7 @@ use App\Models\Setting;
 use App\Models\TelegramData;
 use App\Models\User;
 use App\Services\OrderCountryResolver;
+use App\Services\OrderPricingService;
 use App\Services\OrderLifecycleService;
 use App\Services\PasarGuardPaymentService;
 use App\Services\PaymentReceiptFormatter;
@@ -2112,32 +2113,13 @@ class TelegramBotController extends Controller
         $row = [];
 
         if (count($list) > 0) {
-            $pasarguardPercent = 0;
-            if ($pasarGuard_id != 0) {
-                $pasarguard = Panels::find($pasarGuard_id);
-                $pasarguardDetail = $pasarguard->detail;
-                $pasarguardPercent = $pasarguardDetail['percent'];
-            }
-
+            $pricing = app(OrderPricingService::class);
+            $pricingPanel = $pasarGuard_id ? Panels::find($pasarGuard_id) : null;
 
             foreach ($list as $item) {
                 $name = !is_null($item->name) ? $item->name : 'بدون نام';
 
-                if ($pasarguardPercent != 0) {
-                    $basePrice = $item->price;
-                    $percentPrice = ($basePrice / 100) * $pasarguardPercent;
-                    $planPrice = $basePrice + $percentPrice;
-                    if ($item->discount != 0) {
-                        $discount = ($planPrice / 100) * $item->discount;
-                        $planPrice = $planPrice - $discount;
-                    }
-                    $price = number_format($planPrice);
-
-                } else {
-                    $planPrice = calculatePlanDiscount($item)['price'];
-                    $price = number_format($planPrice);
-                }
-
+                $planPrice = $pricing->amount((float) $item->price, (float) $item->discount, $pricingPanel);
 
                 $discount = "";
                 if ($item->discount > 0) {
@@ -2357,24 +2339,8 @@ class TelegramBotController extends Controller
         if (is_null($plan)) {
             return $this->sendTemporaryMessage('تعرفه مورد نظر یافت نشد');
         }
-        $pasarguardPercent = 0;
-        if ($pasarGuard_id != 0) {
-            $pasarguard = Panels::find($pasarGuard_id);
-            $pasarguardDetail = $pasarguard->detail;
-            $pasarguardPercent = $pasarguardDetail['percent'];
-        }
-
-        if ($pasarguardPercent != 0) {
-            $basePrice = $plan->price;
-            $percentPrice = ($basePrice / 100) * $pasarguardPercent;
-            $planPrice = $basePrice + $percentPrice;
-            if ($plan->discount != 0) {
-                $discount = ($planPrice / 100) * $plan->discount;
-                $planPrice = $planPrice - $discount;
-            }
-        } else {
-            $planPrice = calculatePlanDiscount($plan)['price'];
-        }
+        $pricingPanel = $pasarGuard_id ? Panels::find($pasarGuard_id) : null;
+        $planPrice = app(OrderPricingService::class)->amount((float) $plan->price, (float) $plan->discount, $pricingPanel);
         try {
             $loyaltyQuote = app(CustomerLoyaltyService::class)->quote($user, (int) $service->id, $planPrice);
         } catch (\RuntimeException $e) {
@@ -3544,6 +3510,7 @@ class TelegramBotController extends Controller
                     'detail' => [
                         'code' => $config,
                         'preOrderId' => $preOrder->id,
+                        'is_all_countries' => !empty($orderDetail['pasarguard-id']),
                         'country-id' => $orderCountryId,
                         'country' => $orderCountryName,
                     ],
@@ -3713,6 +3680,7 @@ $codeText
                     'detail' => [
                         'code' => $code,
                         'preOrderId' => $preOrder->id,
+                        'is_all_countries' => !empty($orderDetail['pasarguard-id']),
                         'country-id' => $orderCountryId,
                         'country' => $orderCountryName,
                     ],
@@ -4515,28 +4483,12 @@ $codeText
         $plans = Plans::where('type', $panel->panel_type)->where('status', 1)->orderby('id')->get();
 
         if (count($plans) > 0) {
-            $pasarguardPercent = 0;
-            if ($order->inbound_id == 0) {
-                $pasarguardDetail = is_array($panel->detail) ? $panel->detail : [];
-                $pasarguardPercent = (float) ($pasarguardDetail['percent'] ?? 0);
-            }
-
+            $pricing = app(OrderPricingService::class);
+            $pricingPanel = $pricing->isAllCountries($order, $panel) ? $panel : null;
 
             foreach ($plans as $item) {
 
-                if ($pasarguardPercent != 0) {
-                    $basePrice = $item->price;
-                    $percentPrice = ($basePrice / 100) * $pasarguardPercent;
-                    $planPrice = $basePrice + $percentPrice;
-                    if ($item->discount != 0) {
-                        $discount = ($planPrice / 100) * $item->discount;
-                        $planPrice = $planPrice - $discount;
-                    }
-                    $price = number_format($planPrice);
-                } else {
-                    $planPrice = calculatePlanDiscount($item)['price'];
-                    $price = number_format($planPrice);
-                }
+                $planPrice = $pricing->amount((float) $item->price, (float) $item->discount, $pricingPanel);
                 $name = !is_null($item->name) ? $item->name : 'بدون نام';
                 try {
                     $price = number_format(app(CustomerLoyaltyService::class)->quote($this->user, (int) $panel->panel_type, $planPrice)['amount']);
@@ -4600,25 +4552,9 @@ $codeText
             return $this->sendTemporaryMessage('تعرفه انتخاب‌شده مربوط به این سرویس نیست.');
         }
 
-        $pasarguardPercent = 0;
-        if ($order->inbound_id == 0) {
-            $pasarguardDetail = is_array($panel->detail) ? $panel->detail : [];
-            $pasarguardPercent = (float) ($pasarguardDetail['percent'] ?? 0);
-        }
-
-        if ($pasarguardPercent != 0) {
-            $basePrice = $plan->price;
-            $percentPrice = ($basePrice / 100) * $pasarguardPercent;
-            $planPrice = $basePrice + $percentPrice;
-            if ($plan->discount != 0) {
-                $discount = ($planPrice / 100) * $plan->discount;
-                $planPrice = $planPrice - $discount;
-            }
-            $price = number_format($planPrice);
-        } else {
-            $planPrice = calculatePlanDiscount($plan)['price'];
-            $price = number_format($planPrice);
-        }
+        $pricing = app(OrderPricingService::class);
+        $pricingPanel = $pricing->isAllCountries($order, $panel) ? $panel : null;
+        $planPrice = $pricing->amount((float) $plan->price, (float) $plan->discount, $pricingPanel);
 
         try {
             $loyaltyQuote = app(CustomerLoyaltyService::class)->quote($user, (int) $panel->panel_type, $planPrice);
@@ -4956,32 +4892,17 @@ $codeText
 
         $list = ExtraBandwidth::where('type', $service->id)->where('status', 1)->paginate(20);
         $perGbPrice = $service->price_per_gb;
+        $pricing = app(OrderPricingService::class);
+        $pricingPanel = $pricing->isAllCountries($order, $panel) ? $panel : null;
+        $unitPrice = number_format($pricing->amount((float) $perGbPrice, 0, $pricingPanel));
+        $text .= "\n💰 نرخ پایه هر گیگ: {$unitPrice} تومان";
 
         $keyboard = [];
         if (count($list) > 0) {
 
-            $pasarguardPercent = 0;
-            if ($order->inbound_id == 0) {
-                $pasarguardDetail = is_array($panel->detail) ? $panel->detail : [];
-                $pasarguardPercent = (float) ($pasarguardDetail['percent'] ?? 0);
-            }
-
             foreach ($list as $item) {
                 $name = !is_null($item->name) ? $item->name : 'بدون نام';
-                if ($pasarguardPercent != 0) {
-                    $basePrice = $item->name * $perGbPrice;
-                    $percentPrice = ($basePrice / 100) * $pasarguardPercent;
-                    $planPrice = $basePrice + $percentPrice;
-                    if ($item->discount != 0) {
-                        $discount = ($planPrice / 100) * $item->discount;
-                        $planPrice = $planPrice - $discount;
-                    }
-                    $price = number_format($planPrice);
-                } else {
-                    $price = calculateExtraDiscount($item, $perGbPrice);
-                    $planPrice = $price['price'];
-                    $price = number_format($planPrice);
-                }
+                $planPrice = $pricing->amount((float) $item->name * $perGbPrice, (float) $item->discount, $pricingPanel);
 
                 try {
                     $price = number_format(app(CustomerLoyaltyService::class)->quote($this->user, (int) $service->id, $planPrice)['amount']);
@@ -5038,27 +4959,9 @@ $codeText
         }
         $perGbPrice = $service->price_per_gb;
 
-        $pasarguardPercent = 0;
-        if ($order->inbound_id == 0) {
-            $pasarguardDetail = is_array($panel->detail) ? $panel->detail : [];
-            $pasarguardPercent = (float) ($pasarguardDetail['percent'] ?? 0);
-        }
-
-        if ($pasarguardPercent != 0) {
-            $basePrice = $extra->name * $perGbPrice;
-            $percentPrice = ($basePrice / 100) * $pasarguardPercent;
-            $planPrice = $basePrice + $percentPrice;
-            if ($extra->discount != 0) {
-                $discount = ($planPrice / 100) * $extra->discount;
-                $planPrice = $planPrice - $discount;
-            }
-            $extraPrice = $planPrice;
-            $price = number_format($planPrice);
-        } else {
-            $price = calculateExtraDiscount($extra, $perGbPrice);
-            $extraPrice = $price['price'];
-            $price = number_format($price['price']);
-        }
+        $pricing = app(OrderPricingService::class);
+        $pricingPanel = $pricing->isAllCountries($order, $panel) ? $panel : null;
+        $extraPrice = $pricing->amount((float) $extra->name * $perGbPrice, (float) $extra->discount, $pricingPanel);
 
         try {
             $loyaltyQuote = app(CustomerLoyaltyService::class)->quote($user, (int) $service->id, $extraPrice);

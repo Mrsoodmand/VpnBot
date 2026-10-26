@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 use Tests\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 class CustomerLoyaltyTest extends TestCase
 {
@@ -159,6 +160,72 @@ class CustomerLoyaltyTest extends TestCase
         $this->assertSame(919000, (int) $user->fresh()->balance);
         $this->assertSame(1, $controller->fulfilled);
         $this->assertSame([], app(CustomerLoyaltyService::class)->events($user)['rows']);
+    }
+
+    public static function allCountryPricingCases(): array
+    {
+        return [
+            'legacy all-country' => [[], 0, 'pasarguard', 70, 170000],
+            'explicit all-country with group' => [['is_all_countries' => true], 77, 'pasarguard', 70, 170000],
+            'site all-country with group' => [['raw' => ['is_all_countries' => true, 'country_id' => 77]], 77, 'pasarguard', 70, 170000],
+            'original purchase selection' => [['preOrderId' => 9], 77, 'pasarguard', 70, 170000],
+            'all-country name from old import' => [['country' => '🌍 همه کشور ها'], 77, 'pasarguard', 70, 170000],
+            'explicit single country without inbound' => [['is_all_countries' => false], 0, 'pasarguard', 70, 100000],
+            'site single country without inbound' => [['raw' => ['is_all_countries' => false, 'country_id' => 2]], 0, 'pasarguard', 70, 100000],
+            'known single country' => [['country-id' => 1], 0, 'pasarguard', 70, 100000],
+            'legacy single country' => [[], 77, 'pasarguard', 70, 100000],
+            'sanaei without inbound' => [[], 0, 'sanaie', 70, 100000],
+            'configured percentage changes' => [[], 0, 'pasarguard', 25, 125000],
+            'zero surcharge' => [[], 0, 'pasarguard', 0, 100000],
+        ];
+    }
+
+    #[DataProvider('allCountryPricingCases')]
+    public function test_renewal_and_extra_catalog_match_final_payment_with_configured_surcharge(array $detail, int $inbound, string $system, int $percent, int $expected): void
+    {
+        config(['loyalty.enabled' => false]);
+        $this->setupCatalog();
+        DB::table('plans')->update(['discount' => 0]);
+        DB::table('extra_bandwidths')->update(['discount' => 0]);
+        DB::table('panels')->update(['system_type' => $system, 'detail' => json_encode(['percent' => $percent])]);
+        DB::table('orders')->update(['inbound_id' => $inbound, 'detail' => json_encode($detail)]);
+        if (isset($detail['preOrderId'])) {
+            DB::table('pre_orders')->insert(['id' => 9, 'user_id' => 1, 'status' => 1, 'count' => 1, 'count_left' => 0, 'data' => json_encode(['pasarguard-id' => 1, 'country-id' => 0])]);
+        }
+        $controller = new LoyaltyTestController(User::find(1));
+        $controller->call('clientRenewOrder', ['id' => 1]);
+        $renewMenu = end($controller->messages);
+        $this->assertStringContainsString(number_format($expected), json_decode($renewMenu['reply_markup'], true)['inline_keyboard'][0][0]['text']);
+        $controller->call('clientSubmitRenew', ['o_id' => 1, 'pl_id' => 1, 'price' => 1, 'percent' => 0]);
+        $this->assertStringContainsString(number_format($expected), end($controller->messages)['text']);
+        $controller->call('clientBuyExtra', ['id' => 1]);
+        $extraMenu = end($controller->messages);
+        $this->assertStringContainsString(number_format($expected), json_decode($extraMenu['reply_markup'], true)['inline_keyboard'][0][0]['text']);
+        $this->assertStringContainsString(number_format($expected / 10), $extraMenu['text']);
+        $controller->call('clientSubmitExtra', ['o_id' => 1, 'ex_id' => 1, 'price' => 1, 'percent' => 0]);
+        $this->assertStringContainsString(number_format($expected), end($controller->messages)['text']);
+        $this->assertSame([$expected, $expected], Payment::orderBy('id')->pluck('price')->all());
+        Http::assertNothingSent();
+    }
+
+    public function test_all_country_purchase_renewal_and_extra_apply_discount_after_surcharge_once(): void
+    {
+        $this->fakeProfile(10);
+        $this->setupCatalog();
+        DB::table('panels')->update(['system_type' => 'pasarguard', 'detail' => json_encode(['percent' => 70])]);
+        DB::table('orders')->update(['inbound_id' => 0]);
+        $user = User::find(1);
+        $user->tel_detail = ['order-service-id' => 1, 'order-country-id' => 0, 'order-plan-id' => 1, 'order-count' => 1, 'order-pasarguard-id' => 1];
+        $user->save();
+        $controller = new LoyaltyTestController($user);
+        $controller->call('clientFinalStep', ['name' => 'Example']);
+        $controller->call('clientSubmitRenew', ['o_id' => 1, 'pl_id' => 1]);
+        $controller->call('clientSubmitExtra', ['o_id' => 1, 'ex_id' => 1]);
+        $this->assertSame([137700, 137700, 137700], Payment::orderBy('id')->pluck('price')->all());
+        foreach ($controller->messages as $message) $this->assertStringContainsString('137,700', $message['text']);
+        $controller->call('paymentWallet', ['id' => 2]);
+        $controller->call('paymentWallet', ['id' => 2]);
+        $this->assertSame(862300, (int) $user->fresh()->balance);
     }
 
     public function test_quantity_uses_the_same_rounded_unit_price_as_the_catalog(): void
@@ -459,6 +526,7 @@ class LoyaltyTestController extends TelegramBotController
         $sdk->shouldReceive('sendMessage')->andReturnUsing(function ($data) { $this->messages[] = $data; return ['ok' => false]; });
         $sdk->shouldReceive('editMessage')->andReturnUsing(function ($data) { $this->messages[] = $data; return ['ok' => false]; });
         $sdk->shouldReceive('answerCallback')->andReturn([]);
+        $sdk->shouldReceive('deleteMessage')->andReturn(['ok' => true]);
         $this->telegramSdk = $sdk;
     }
     public function callback(string $data) { $this->callbackData = $data; $this->type = 'callback_query'; return $this->index(); }
