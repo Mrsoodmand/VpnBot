@@ -320,7 +320,7 @@ class BotAdminCatalogTest extends TestCase
         $bot = $this->controller();
         $bot->callback('type=adminS');
         $this->callbackLengths($bot);
-        foreach (['sales', 'payment', 'access', 'channels', 'texts', 'legacy'] as $group) {
+        foreach (['sales', 'payment', 'access', 'channels', 'texts', 'notices', 'legacy'] as $group) {
             $bot->callback('type=adminS|g='.$group);
             $this->callbackLengths($bot);
         }
@@ -333,6 +333,25 @@ class BotAdminCatalogTest extends TestCase
         $bot->callback('type=adminS|k=charge_amount');
         $bot->input('200000,100000,200000');
         $this->assertSame('100000,200000', Setting::where('key', 'charge_amount')->value('value'));
+    }
+
+    public function test_notification_settings_validate_ranges_and_accept_persian_digits(): void
+    {
+        $bot = $this->controller();
+        $bot->callback('type=adminS|g=notices');
+        $this->assertStringContainsString('۲۴', strtr($bot->last()['text'], ['2'=>'۲','4'=>'۴']));
+        $this->callbackLengths($bot);
+        foreach (['notify_hours'=>['۴۸','48','0'], 'notify_gb'=>['۰٫۵','0.5','-1'], 'notify_interval'=>['۱۵','15','1']] as $key=>[$input, $expected, $invalid]) {
+            $bot->callback('type=adminS|k='.$key);
+            $bot->input($input);
+            $this->assertSame($expected, Setting::where('key', $key)->value('value'));
+            $bot->callback('type=adminS|k='.$key);
+            $bot->input($invalid);
+            $this->assertSame($expected, Setting::where('key', $key)->value('value'));
+            $this->assertStringContainsString('معتبر نیست', $bot->last()['text']);
+        }
+        $bot->callback('type=adminS|a=save|k=notify_renew|v=0');
+        $this->assertSame('0', Setting::where('key', 'notify_renew')->value('value'));
     }
 
     public function test_unknown_and_malformed_buttons_have_a_visible_response(): void

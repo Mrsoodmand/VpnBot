@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Models\Orders;
+use App\Models\Setting;
 use App\Services\OrderLifecycleNotificationService;
 use App\Services\OrderLifecycleService;
 use Carbon\Carbon;
@@ -116,12 +117,109 @@ class OrderLifecycleNotificationServiceTest extends TestCase
         $failed = $notifications->sendDueNotifications();
 
         $this->assertSame(1, $failed['failed']);
-        $this->assertArrayNotHasKey('renewal_24h', $order->fresh()->detail['lifecycle']['notifications']);
+        $this->assertSame('failed', $order->fresh()->detail['lifecycle']['notifications']['renewal_24h']['state']);
+        $this->assertSame(0, $notifications->sendDueNotifications()['renewal_sent']);
+        Carbon::setTestNow(now()->addMinutes(2));
 
         $retried = $notifications->sendDueNotifications();
 
         $this->assertSame(1, $retried['renewal_sent']);
         $this->assertSame('sent', $order->fresh()->detail['lifecycle']['notifications']['renewal_24h']['state']);
+    }
+
+    public function test_admin_thresholds_apply_and_messages_are_short_and_escaped(): void
+    {
+        Setting::create(['key' => 'notify_hours', 'value' => '48']);
+        Setting::create(['key' => 'notify_gb', 'value' => '2.5']);
+        $this->createOrder('<office>', now()->addHours(36), ['total_gb'=>20, 'used_gb'=>17.5, 'left_gb'=>2.5]);
+        $notifications = new FakeOrderLifecycleNotificationService(app(OrderLifecycleService::class));
+        $result = $notifications->sendDueNotifications();
+        $this->assertSame(1, $result['renewal_sent']);
+        $this->assertSame(1, $result['volume_sent']);
+        $this->assertStringContainsString('36 ساعت', $notifications->messages[0]['text']);
+        $this->assertStringContainsString('2.5 گیگ', $notifications->messages[1]['text']);
+        foreach ($notifications->messages as $message) {
+            $this->assertLessThan(300, mb_strlen($message['text']));
+            $this->assertStringContainsString('&lt;office&gt;', $message['text']);
+        }
+        Setting::where('key', 'notify_gb')->update(['value'=>'3']);
+        $this->assertSame(0, $notifications->sendDueNotifications()['volume_sent']);
+    }
+
+    public function test_disabled_notices_or_disabled_sales_prevent_delivery(): void
+    {
+        $this->createOrder('service', now()->addHours(12), ['total_gb'=>20, 'used_gb'=>19, 'left_gb'=>1]);
+        Setting::create(['key'=>'notify_renew', 'value'=>'0']);
+        Setting::create(['key'=>'notify_volume', 'value'=>'0']);
+        $notifications = new FakeOrderLifecycleNotificationService(app(OrderLifecycleService::class));
+        $notifications->sendDueNotifications();
+        $this->assertCount(0, $notifications->messages);
+        Setting::whereIn('key', ['notify_renew', 'notify_volume'])->update(['value'=>'1']);
+        Setting::whereIn('key', ['renew', 'extra'])->update(['value'=>'0']);
+        $notifications->sendDueNotifications();
+        $this->assertCount(0, $notifications->messages);
+    }
+
+    public function test_stale_unlimited_dedicated_cancelled_and_blocked_orders_are_not_notified(): void
+    {
+        $stale = $this->createOrder('stale', now()->addDays(2), ['total_gb'=>20, 'used_gb'=>19, 'left_gb'=>1]);
+        $detail = $stale->detail;
+        $detail['lifecycle']['last_checked_at'] = now()->subMinutes(16)->toDateTimeString();
+        $stale->update(['detail'=>$detail]);
+        $this->createOrder('unlimited', now()->addDays(2), ['total_gb'=>0, 'used_gb'=>20, 'left_gb'=>0]);
+        $dedicated = $this->createOrder('website', now()->addHours(12), ['total_gb'=>20, 'used_gb'=>19, 'left_gb'=>1]);
+        $dedicated->update(['detail'=>array_merge($dedicated->detail, ['service_type'=>'dedicated'])]);
+        $cancelled = $this->createOrder('cancelled', now()->addHours(12), ['total_gb'=>20, 'used_gb'=>19, 'left_gb'=>1, 'remote_disabled'=>true]);
+        $notifications = new FakeOrderLifecycleNotificationService(app(OrderLifecycleService::class));
+        $notifications->sendDueNotifications();
+        $this->assertCount(0, $notifications->messages);
+        DB::table('users')->where('id', 1)->update(['status'=>0]);
+        $this->createOrder('blocked', now()->addHours(12), ['total_gb'=>20, 'used_gb'=>19, 'left_gb'=>1]);
+        $notifications->sendDueNotifications();
+        $this->assertCount(0, $notifications->messages);
+    }
+
+    public function test_renewal_and_top_up_rearm_only_the_next_cycle(): void
+    {
+        $order = $this->createOrder('cycle', now()->addHours(12), ['total_gb'=>20, 'used_gb'=>19, 'left_gb'=>1]);
+        $notifications = new FakeOrderLifecycleNotificationService(app(OrderLifecycleService::class));
+        $notifications->sendDueNotifications();
+        $order->refresh();
+        $detail = $order->detail;
+        $detail['lifecycle'] = array_merge($detail['lifecycle'], ['total_gb'=>25, 'left_gb'=>6]);
+        $order->update(['expire_at'=>now()->addDays(30), 'detail'=>$detail]);
+        $notifications->sendDueNotifications();
+        $this->assertCount(2, $notifications->messages);
+        $detail['lifecycle'] = array_merge($detail['lifecycle'], ['used_gb'=>24.5, 'left_gb'=>0.5]);
+        $order->update(['detail'=>$detail]);
+        $this->assertSame(1, $notifications->sendDueNotifications()['volume_sent']);
+        Carbon::setTestNow(now()->addDays(29));
+        $this->assertSame(1, $notifications->sendDueNotifications()['renewal_sent']);
+        $this->assertCount(4, $notifications->messages);
+    }
+
+    public function test_telegram_retry_after_pauses_the_whole_batch_and_resumes_later(): void
+    {
+        $this->createOrder('first', now()->addHours(12), ['total_gb'=>20, 'used_gb'=>19, 'left_gb'=>1]);
+        $this->createOrder('second', now()->addHours(12), ['total_gb'=>20, 'used_gb'=>19, 'left_gb'=>1]);
+        $notifications = new FakeOrderLifecycleNotificationService(app(OrderLifecycleService::class));
+        $notifications->nextResponse = ['ok'=>false, 'error_code'=>429, 'parameters'=>['retry_after'=>180]];
+        $this->assertSame(1, $notifications->sendDueNotifications()['failed']);
+        $this->assertCount(1, $notifications->messages);
+        Carbon::setTestNow(now()->addMinutes(2));
+        $notifications->sendDueNotifications();
+        $this->assertCount(1, $notifications->messages);
+        Carbon::setTestNow(now()->addMinute());
+        $this->assertSame(2, $notifications->sendDueNotifications()['renewal_sent']);
+    }
+
+    public function test_notification_limit_continues_with_unsent_orders_on_next_run(): void
+    {
+        for ($i=0; $i<105; $i++) $this->createOrder('bulk-'.$i, now()->addHours(12), ['total_gb'=>20, 'used_gb'=>0, 'left_gb'=>20]);
+        $notifications = new FakeOrderLifecycleNotificationService(app(OrderLifecycleService::class));
+        $this->assertSame(100, $notifications->sendDueNotifications()['renewal_sent']);
+        $this->assertSame(5, $notifications->sendDueNotifications()['renewal_sent']);
+        $this->assertCount(105, $notifications->messages);
     }
 
     private function createOrder(string $remark, Carbon $expireAt, array $lifecycle): Orders
@@ -148,9 +246,18 @@ class FakeOrderLifecycleNotificationService extends OrderLifecycleNotificationSe
 
     public bool $failNext = false;
 
+    public ?array $nextResponse = null;
+
+    protected function paceTelegram(string $chatId): void {}
+
     protected function sendTelegramMessage(array $params): array
     {
         $this->messages[] = $params;
+        if ($this->nextResponse !== null) {
+            $response = $this->nextResponse;
+            $this->nextResponse = null;
+            return $response;
+        }
 
         if ($this->failNext) {
             $this->failNext = false;

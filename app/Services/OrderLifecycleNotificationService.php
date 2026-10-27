@@ -3,8 +3,8 @@
 namespace App\Services;
 
 use App\Models\Orders;
-use App\Models\Setting;
 use Carbon\Carbon;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -16,32 +16,32 @@ class OrderLifecycleNotificationService
 
     public const LOW_VOLUME_GB = 1.0;
 
+    public const MAX_CHECKS = 200;
+
     private const CLAIM_TIMEOUT_MINUTES = 5;
 
-    private const ELIGIBLE_STATUSES = [
-        Orders::STATUS_ACTIVE,
-        Orders::STATUS_DATA_EXHAUSTED,
-        Orders::STATUS_SUSPENDED,
-        '1',
-        '0',
-        '2',
-        'created',
-        'limited',
-        'expired',
-        'on_hold',
-    ];
+    private array $settings = [];
 
-    public function __construct(private readonly OrderLifecycleService $lifecycle)
-    {
-    }
+    private array $lastChatSend = [];
+
+    private int $attempts = 0;
+
+    private bool $rateLimited = false;
+
+    public function __construct(private readonly OrderLifecycleService $lifecycle) {}
 
     public function sendDueNotifications(?Carbon $now = null): array
     {
         $now ??= now();
-        $this->lifecycle->reconcileTimeStatuses(now: $now);
+        $schedule = app(OrderCheckSchedule::class);
+        $schedule->prepare();
 
-        $renewEnabled = (int) Setting::where('key', 'renew')->value('value') === 1;
-        $extraEnabled = (int) Setting::where('key', 'extra')->value('value') === 1;
+        $this->settings = OrderNotificationSettings::load();
+        $renewEnabled = $this->settings['renew'];
+        $extraEnabled = $this->settings['volume'];
+        $this->attempts = 0;
+        $this->rateLimited = Cache::has('orders:notifications:telegram-pause');
+        $deadline = microtime(true) + 40;
         $result = [
             'checked' => 0,
             'renewal_sent' => 0,
@@ -50,87 +50,65 @@ class OrderLifecycleNotificationService
             'failed' => 0,
         ];
 
-        if (!$renewEnabled && !$extraEnabled) {
+        if ((! $renewEnabled && ! $extraEnabled) || $this->rateLimited) {
             return $result;
         }
 
-        Orders::query()
-            ->with('user')
-            ->whereIn('status', self::ELIGIBLE_STATUSES)
-            ->orderBy('id')
-            ->chunkById(100, function ($orders) use ($now, $renewEnabled, $extraEnabled, &$result) {
-                foreach ($orders as $order) {
-                    $result['checked']++;
-                    $user = $order->user;
+        $ids = $schedule->due('notice_at', self::MAX_CHECKS);
+        $orders = Orders::with('user')->whereIn('id', $ids)->get()->keyBy('id');
+        foreach ($ids as $id) {
+            if ($this->attempts >= 100 || $this->rateLimited || microtime(true) >= $deadline) {
+                break;
+            }
+            $order = $orders->get($id);
+            if (! $order) {
+                $schedule->remove($id);
 
-                    if (!$user || (string) $user->status !== '1' || empty($user->tel_id)) {
-                        $result['skipped']++;
-                        continue;
-                    }
+                continue;
+            }
+            $result['checked']++;
+            $user = $order->user;
+            if (! $user || (string) $user->status !== '1' || empty($user->tel_id)) {
+                $result['skipped']++;
+                $schedule->finishNotice($id, unreachable: true);
 
-                    if ($renewEnabled && $this->renewalIsDue($order, $now)) {
-                        $this->deliver(
-                            $order,
-                            'renewal_24h',
-                            $this->renewalFingerprint($order),
-                            $this->renewalMessage($order, $now),
-                            $this->renewalKeyboard($order),
-                            'renewal_sent',
-                            $result
-                        );
-                    }
-
-                    if ($extraEnabled && $this->volumeIsDue($order, $now)) {
-                        $this->deliver(
-                            $order,
-                            'low_volume',
-                            $this->volumeFingerprint($order),
-                            $this->volumeMessage($order),
-                            $this->volumeKeyboard($order),
-                            'volume_sent',
-                            $result
-                        );
-                    }
+                continue;
+            }
+            try {
+                if ($renewEnabled && $this->renewalIsDue($order, $now)) {
+                    $this->deliver($order, 'renewal_24h', $this->renewalFingerprint($order),
+                        $this->renewalMessage($order, $now), $this->renewalKeyboard($order), 'renewal_sent', $result);
                 }
-            });
+                if ($extraEnabled && $this->volumeIsDue($order, $now)) {
+                    $this->deliver($order, 'low_volume', $this->volumeFingerprint($order),
+                        $this->volumeMessage($order), $this->volumeKeyboard($order), 'volume_sent', $result);
+                }
+                $schedule->finishNotice($id);
+            } catch (Throwable $exception) {
+                $result['failed']++;
+                $schedule->defer($id, 'notice_at', now()->addMinutes(5));
+                Log::warning('Could not check scheduled order notice', ['order_id' => $id, 'error' => $exception->getMessage()]);
+            }
+        }
 
         return $result;
     }
 
     private function renewalIsDue(Orders $order, Carbon $now): bool
     {
-        if (!$order->expire_at || !$this->lifecycle->canRenew($order, $now)) {
+        if (! $order->expire_at || ! $this->lifecycle->canRenew($order, $now)) {
             return false;
         }
 
         $expireAt = Carbon::parse($order->expire_at);
 
         return $expireAt->gt($now)
-            && $expireAt->lte($now->copy()->addHours(self::RENEWAL_NOTICE_HOURS));
+            && $expireAt->lte($now->copy()->addHours($this->settings['hours'] ?? self::RENEWAL_NOTICE_HOURS));
     }
 
     private function volumeIsDue(Orders $order, Carbon $now): bool
     {
-        if (!$this->lifecycle->canBuyExtra($order, $now)) {
-            return false;
-        }
-
-        $lifecycle = $this->lifecycleDetail($order);
-        $totalGb = $lifecycle['total_gb'] ?? null;
-        $leftGb = $lifecycle['left_gb'] ?? null;
-        $lastCheckedAt = $lifecycle['last_checked_at'] ?? null;
-
-        if (!is_numeric($totalGb) || (float) $totalGb <= 0 || !is_numeric($leftGb) || !$lastCheckedAt) {
-            return false;
-        }
-
-        try {
-            $isFresh = Carbon::parse($lastCheckedAt)->gte($now->copy()->subMinutes(30));
-        } catch (Throwable) {
-            return false;
-        }
-
-        return $isFresh && (float) $leftGb <= self::LOW_VOLUME_GB;
+        return app(OrderNoticePolicy::class)->volumeIsDue($order, $this->settings, $now);
     }
 
     private function deliver(
@@ -142,13 +120,19 @@ class OrderLifecycleNotificationService
         string $resultKey,
         array &$result
     ): void {
+        if ($this->rateLimited || $this->attempts >= 100) {
+            return;
+        }
         $token = $this->claim($order, $type, $fingerprint);
         if ($token === null) {
             $result['skipped']++;
+
             return;
         }
 
+        $this->attempts++;
         try {
+            $this->paceTelegram((string) $order->user->tel_id);
             $response = $this->sendTelegramMessage([
                 'chat_id' => $order->user->tel_id,
                 'text' => $message,
@@ -159,12 +143,18 @@ class OrderLifecycleNotificationService
             $response = ['ok' => false, 'error' => $exception->getMessage()];
         }
 
-        if (!empty($response['ok'])) {
+        if (! empty($response['ok'])) {
             $this->completeClaim($order->id, $type, $token);
             $result[$resultKey]++;
+
             return;
         }
 
+        if ((int) ($response['error_code'] ?? 0) === 429) {
+            $seconds = max(1, (int) ($response['parameters']['retry_after'] ?? 60));
+            Cache::put('orders:notifications:telegram-pause', true, now()->addSeconds($seconds));
+            $this->rateLimited = true;
+        }
         $this->releaseClaim($order->id, $type, $token);
         $result['failed']++;
         Log::warning('Order lifecycle notification failed', [
@@ -178,7 +168,15 @@ class OrderLifecycleNotificationService
     {
         return DB::transaction(function () use ($order, $type, $fingerprint) {
             $lockedOrder = Orders::where('id', $order->id)->lockForUpdate()->first();
-            if (!$lockedOrder) {
+            if (! $lockedOrder || $lockedOrder->isSiteManagedDedicated() || $this->lifecycle->shouldSkipProviderRefresh($lockedOrder)) {
+                return null;
+            }
+            // Renewal/top-up may have completed after the scan selected this row.
+            $isRenewal = $type === 'renewal_24h';
+            if ($isRenewal ? ! $this->renewalIsDue($lockedOrder, now()) : ! $this->volumeIsDue($lockedOrder, now())) {
+                return null;
+            }
+            if (($isRenewal ? $this->renewalFingerprint($lockedOrder) : $this->volumeFingerprint($lockedOrder)) !== $fingerprint) {
                 return null;
             }
 
@@ -187,14 +185,17 @@ class OrderLifecycleNotificationService
             $notifications = is_array($lifecycle['notifications'] ?? null) ? $lifecycle['notifications'] : [];
             $current = is_array($notifications[$type] ?? null) ? $notifications[$type] : [];
 
+            if (($current['state'] ?? '') === 'sending' && $this->claimIsFresh($current)) {
+                return null;
+            }
             if (($current['fingerprint'] ?? null) === $fingerprint) {
+                if (($current['retry_at'] ?? 0) > now()->timestamp) {
+                    return null;
+                }
                 if (($current['state'] ?? null) === 'sent') {
                     return null;
                 }
 
-                if (($current['state'] ?? null) === 'sending' && $this->claimIsFresh($current)) {
-                    return null;
-                }
             }
 
             $token = (string) Str::uuid();
@@ -203,6 +204,7 @@ class OrderLifecycleNotificationService
                 'state' => 'sending',
                 'token' => $token,
                 'started_at' => now()->toDateTimeString(),
+                'failures' => ($current['fingerprint'] ?? null) === $fingerprint ? (int) ($current['failures'] ?? 0) : 0,
             ];
             $lifecycle['notifications'] = $notifications;
             $detail['lifecycle'] = $lifecycle;
@@ -217,7 +219,7 @@ class OrderLifecycleNotificationService
     {
         DB::transaction(function () use ($orderId, $type, $token) {
             $order = Orders::where('id', $orderId)->lockForUpdate()->first();
-            if (!$order) {
+            if (! $order) {
                 return;
             }
 
@@ -247,7 +249,7 @@ class OrderLifecycleNotificationService
     {
         DB::transaction(function () use ($orderId, $type, $token) {
             $order = Orders::where('id', $orderId)->lockForUpdate()->first();
-            if (!$order) {
+            if (! $order) {
                 return;
             }
 
@@ -259,7 +261,11 @@ class OrderLifecycleNotificationService
                 return;
             }
 
-            unset($notifications[$type]);
+            $notification['state'] = 'failed';
+            $notification['failures'] = min(6, ($notification['failures'] ?? 0) + 1);
+            $notification['retry_at'] = now()->addMinutes(min(60, 2 ** $notification['failures']))->timestamp;
+            unset($notification['token'], $notification['started_at']);
+            $notifications[$type] = $notification;
             $lifecycle['notifications'] = $notifications;
             $detail['lifecycle'] = $lifecycle;
             $order->detail = $detail;
@@ -279,48 +285,31 @@ class OrderLifecycleNotificationService
 
     private function renewalFingerprint(Orders $order): string
     {
-        return 'expire:' . Carbon::parse($order->expire_at)->copy()->utc()->format('Y-m-d\TH:i:s\Z');
+        return app(OrderNoticePolicy::class)->renewalFingerprint($order);
     }
 
     private function volumeFingerprint(Orders $order): string
     {
-        $lifecycle = $this->lifecycleDetail($order);
-        $expireAt = $order->expire_at
-            ? Carbon::parse($order->expire_at)->copy()->utc()->format('Y-m-d\TH:i:s\Z')
-            : 'no-expiry';
-
-        return $expireAt . '|total:' . number_format((float) $lifecycle['total_gb'], 3, '.', '');
+        return app(OrderNoticePolicy::class)->volumeFingerprint($order);
     }
 
     private function renewalMessage(Orders $order, Carbon $now): string
     {
-        $expireAt = Carbon::parse($order->expire_at);
-        $minutes = max(1, (int) floor($now->diffInMinutes($expireAt, false)));
-        $remaining = $minutes >= 60
-            ? floor($minutes / 60) . ' ساعت و ' . ($minutes % 60) . ' دقیقه'
-            : $minutes . ' دقیقه';
+        $minutes = max(1, (int) ceil($now->diffInMinutes(Carbon::parse($order->expire_at), false)));
+        $remaining = $minutes >= 60 ? (int) ceil($minutes / 60).' ساعت' : $minutes.' دقیقه';
 
-        return "⏰ <b>زمان تمدید سرویس نزدیک است</b>\n\n"
-            . "کمتر از ۲۴ ساعت تا پایان سرویس شما باقی مانده است.\n\n"
-            . "🔢 سفارش: <code>#{$order->id}</code>\n"
-            . "🏷 نام سرویس: <code>{$this->escape($order->remark)}</code>\n"
-            . "⏳ زمان باقی‌مانده: <b>{$remaining}</b>\n"
-            . "📅 تاریخ انقضا: <code>{$expireAt->format('Y/m/d H:i')}</code>\n\n"
-            . "برای جلوگیری از قطع سرویس، می‌توانید همین حالا آن را تمدید کنید.";
+        return headTitle('⏰ زمان تمدید سرویس نزدیک است')
+            ."<code>{$this->escape($order->remark)}</code> · #{$order->id}\n"
+            ."زمان باقی‌مانده: <b>{$remaining}</b>\nبرای تمدید، دکمهٔ زیر را بزنید.";
     }
 
     private function volumeMessage(Orders $order): string
     {
-        $lifecycle = $this->lifecycleDetail($order);
+        $left = max(0, (float) $this->lifecycleDetail($order)['left_gb']);
 
-        return "⚠️ <b>حجم سرویس رو به اتمام است</b>\n\n"
-            . "حجم باقی‌مانده سرویس شما به ۱ گیگابایت یا کمتر رسیده است.\n\n"
-            . "🔢 سفارش: <code>#{$order->id}</code>\n"
-            . "🏷 نام سرویس: <code>{$this->escape($order->remark)}</code>\n"
-            . "📦 حجم کل: <code>{$this->formatGb($lifecycle['total_gb'])}</code> گیگ\n"
-            . "📊 حجم مصرف‌شده: <code>{$this->formatGb($lifecycle['used_gb'])}</code> گیگ\n"
-            . "🟠 حجم باقی‌مانده: <b>{$this->formatGb($lifecycle['left_gb'])} گیگ</b>\n\n"
-            . "برای جلوگیری از اتمام سرویس، می‌توانید حجم اضافه تهیه کنید.";
+        return headTitle('⚠️ حجم سرویس رو به اتمام است')
+            ."<code>{$this->escape($order->remark)}</code> · #{$order->id}\n"
+            ."حجم باقی‌مانده: <b>{$this->formatGb($left)} گیگ</b>\nبرای خرید حجم، دکمهٔ زیر را بزنید.";
     }
 
     private function renewalKeyboard(Orders $order): array
@@ -329,8 +318,7 @@ class OrderLifecycleNotificationService
             [[
                 'text' => '🔄 تمدید سرویس',
                 'callback_data' => "type=clientRenewOrder|id={$order->id}",
-            ]],
-            [[
+            ], [
                 'text' => '📄 مشاهده سفارش',
                 'callback_data' => "type=clientSingleOrder|id={$order->id}",
             ]],
@@ -343,8 +331,7 @@ class OrderLifecycleNotificationService
             [[
                 'text' => '➕ خرید حجم',
                 'callback_data' => "type=clientBuyExtra|id={$order->id}",
-            ]],
-            [[
+            ], [
                 'text' => '📄 مشاهده سفارش',
                 'callback_data' => "type=clientSingleOrder|id={$order->id}",
             ]],
@@ -366,6 +353,13 @@ class OrderLifecycleNotificationService
     private function escape(mixed $value): string
     {
         return htmlspecialchars((string) $value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    }
+
+    protected function paceTelegram(string $chatId): void
+    {
+        $wait = max(0.12, 1.1 - (microtime(true) - ($this->lastChatSend[$chatId] ?? 0)));
+        usleep((int) ($wait * 1_000_000));
+        $this->lastChatSend[$chatId] = microtime(true);
     }
 
     protected function sendTelegramMessage(array $params): array

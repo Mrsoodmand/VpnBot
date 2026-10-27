@@ -12,6 +12,7 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->scoped(\App\Services\CustomerLoyaltyService::class);
+        $this->app->scoped(\App\Services\OrderCheckSchedule::class);
         //
     }
 

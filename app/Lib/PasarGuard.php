@@ -238,6 +238,21 @@ class PasarGuard
 
     /* Users */
 
+    /** FastAPI expects repeated ids parameters, not PHP's ids[0] encoding. */
+    public function getUsersByIds(array $ids)
+    {
+        $ids = array_values(array_unique(array_map('strval', $ids)));
+        if (!$this->token || !$ids || count($ids) > 200 || collect($ids)->contains(fn ($id) => !ctype_digit($id) || (int) $id < 1)) {
+            return ['status' => false, 'message' => 'Invalid user batch'];
+        }
+
+        return $this->request([
+            'link' => "{$this->url}/api/users",
+            'method' => 'GET',
+            'query' => 'offset=0&limit='.count($ids).'&load_sub=false&'.implode('&', array_map(fn ($id) => 'ids='.rawurlencode($id), $ids)),
+        ]);
+    }
+
     public function getAllUsers()
     {
         if (!$this->token) {

@@ -7,6 +7,8 @@ use App\Models\Plans;
 use App\Models\Setting;
 use App\Services\BotCatalogService;
 use App\Services\PaymentReceiptFormatter;
+use App\Services\OrderNotificationSettings;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Validator;
 
 trait ManagesBotSettings
@@ -20,6 +22,7 @@ trait ManagesBotSettings
             [$this->adminButton('🧾 رسیدها و تحویل سفارش', 'type=adminReceipts')],
             [$this->adminButton('💳 پرداخت و کیف پول', 'type=adminS|g=payment'), $this->adminButton('⚙️ تنظیمات ربات', 'type=adminS')],
             [$this->adminButton('⭐ تخفیف پلکانی کاربران عادی', 'type=adminCustomerLoyalty')],
+            [$this->adminButton('🔔 اعلان حجم و تمدید', 'type=adminS|g=notices')],
             [$this->adminButton('🩺 بررسی آمادگی فروش', 'type=adminHealth'), $this->adminButton('📘 راهنمای مدیریت', 'type=adminServiceHelp')],
         ], 'type=home');
     }
@@ -40,6 +43,11 @@ trait ManagesBotSettings
             'sell' => ['فروش سرویس جدید', 'sales', 'bool', '1'],
             'renew' => ['تمدید سرویس', 'sales', 'bool', '1'],
             'extra' => ['خرید حجم اضافه', 'sales', 'bool', '1'],
+            'notify_renew' => ['اعلان نزدیک شدن انقضا', 'notices', 'bool', '1'],
+            'notify_volume' => ['اعلان کم شدن حجم', 'notices', 'bool', '1'],
+            'notify_hours' => ['اعلان چند ساعت قبل از انقضا', 'notices', 'notice_hours', '24'],
+            'notify_gb' => ['حجم باقی‌مانده برای اعلان (گیگ)', 'notices', 'notice_gb', '1'],
+            'notify_interval' => ['فاصله بررسی پنل (دقیقه)', 'notices', 'notice_interval', '10'],
             'join-bot' => ['ثبت‌نام کاربر جدید', 'access', 'bool', '1'],
             'channel-join' => ['عضویت اجباری کانال', 'access', 'bool', '0'],
             'cart_be_cart' => ['پرداخت کارت به کارت', 'payment', 'bool', '0'],
@@ -64,7 +72,7 @@ trait ManagesBotSettings
             return $this->denyAdminAccess();
         }
         $groups = ['sales' => 'فروش و تمدید', 'payment' => 'پرداخت و کیف پول', 'access' => 'ثبت‌نام و عضویت',
-            'channels' => 'کانال‌ها و پشتیبانی', 'texts' => 'متن‌های ربات', 'legacy' => 'تنظیمات قدیمی'];
+            'channels' => 'کانال‌ها و پشتیبانی', 'texts' => 'متن‌های ربات', 'notices' => '🔔 اعلان حجم و تمدید', 'legacy' => 'تنظیمات قدیمی'];
         $definitions = $this->botSettingDefinitions();
         $key = $type['k'] ?? '';
         if ($key !== '') {
@@ -76,6 +84,9 @@ trait ManagesBotSettings
             $back = "type=adminS|g={$group}";
             if (($type['a'] ?? '') === 'save') {
                 $value = trim((string) ($type['v'] ?? $this->text));
+                if (str_starts_with($kind, 'notice_')) {
+                    $value = strtr($value, ['۰'=>'0','۱'=>'1','۲'=>'2','۳'=>'3','۴'=>'4','۵'=>'5','۶'=>'6','۷'=>'7','۸'=>'8','۹'=>'9', '٠'=>'0','١'=>'1','٢'=>'2','٣'=>'3','٤'=>'4','٥'=>'5','٦'=>'6','٧'=>'7','٨'=>'8','٩'=>'9', '٫'=>'.']);
+                }
                 if (in_array($kind, ['chat', 'channel', 'username'], true)) {
                     $value = preg_replace('#^https?://t\.me/#i', '', $value);
                     $value = ltrim($value, '@');
@@ -94,6 +105,9 @@ trait ManagesBotSettings
                 }
                 $rules = match ($kind) {
                     'bool' => ['required', 'in:0,1,-1'], 'percent' => ['required', 'numeric', 'between:0,100'],
+                    'notice_hours' => ['required', 'integer', 'between:1,720'],
+                    'notice_gb' => ['required', 'numeric', 'between:0.1,1000'],
+                    'notice_interval' => ['required', 'integer', 'between:5,60'],
                     'username' => ['required', 'regex:/^[a-zA-Z][a-zA-Z0-9_]{4,31}$/'],
                     'chat', 'channel' => ['required', 'regex:/^(?:-?[0-9]{1,20}|@[a-zA-Z][a-zA-Z0-9_]{4,31})$/'],
                     'text' => ['required', 'string', 'max:2500'], default => ['required', 'string', 'max:255'],
@@ -138,6 +152,9 @@ trait ManagesBotSettings
                 'chat', 'channel' => 'شناسه عددی مثل -1001234567890 یا @نام‌کانال را بفرستید. ربات باید دسترسی لازم را داشته باشد.',
                 'username' => 'نام کاربری پشتیبانی را بفرستید؛ مانند @support_name.',
                 'text' => 'متن سادهٔ جدید را بفرستید (حداکثر ۲۵۰۰ نویسه).', default => 'مقدار جدید را انتخاب یا ارسال کنید.',
+                'notice_hours' => 'تعداد ساعت را از ۱ تا ۷۲۰ بفرستید؛ مثلاً ۲۴ یعنی یک روز قبل از پایان سرویس.',
+                'notice_gb' => 'حجم باقی‌مانده را بین ۰٫۱ تا ۱۰۰۰ گیگ بفرستید؛ مثلاً ۱ یا ۰٫۵. سرویس نامحدود اعلان حجم ندارد.',
+                'notice_interval' => 'فاصلهٔ بررسی گروهی پنل را از ۵ تا ۶۰ دقیقه بفرستید. مقدار پیشنهادی: ۱۰. فاصلهٔ کمتر یعنی درخواست بیشتر.',
             };
 
             return $this->adminPage($label, 'مقدار فعلی: <code>'.$this->escapeHtml($setting->value)."</code>\n\n".$hint, $rows, $back);
@@ -169,6 +186,29 @@ trait ManagesBotSettings
         $body = $group === 'legacy' ? 'این تنظیمات برای حفظ داده‌های نسخه قدیمی در دسترس‌اند. در سورس فعلی، جریان ثبت معرف و پرداخت پورسانت پیاده‌سازی نشده است و تغییر این مقادیر، پرداخت خودکار ایجاد نمی‌کند.' : 'هر تنظیم را برای مشاهدهٔ مقدار و ویرایش باز کنید.';
         if ($group === 'payment') {
             $body .= "\nپرداخت آنلاین در این نسخه پیاده‌سازی نشده؛ روش‌های موجود، کیف پول و کارت به کارت هستند.";
+        }
+        if ($group === 'notices') {
+            $settings = OrderNotificationSettings::load();
+            $body = 'اعلان زمان: '.$settings['hours'].' ساعت قبل از انقضا'
+                ."\nاعلان حجم: ".$settings['gb'].' گیگ یا کمتر'
+                ."\nفاصله بررسی گروهی پنل: ".$settings['interval'].' دقیقه'
+                ."\n\nپیام‌ها کوتاه و دارای دکمهٔ اقدام هستند؛ هر نوع اعلان در هر دورهٔ سرویس یک بار ارسال می‌شود. غیرفعال بودن تمدید یا خرید حجم، اعلان مربوط را متوقف می‌کند."
+                ."\nفقط سفارش‌های موعدرسیده، حداکثر ۲۰۰ سفارش برای اعلان در هر نوبت، بررسی می‌شوند. سفارش‌های قدیمی پس از نصب به‌تدریج زمان‌بندی می‌شوند."
+                ."\nبرای اجرا، زمان‌بند سرور باید هر دقیقه فعال باشد و نصب جدول زمان‌بندی انجام شده باشد.";
+            $last = Cache::get('orders:lifecycle:last-run');
+            if (is_array($last)) {
+                $body .= "\n\nآخرین اجرای زمان‌بند: ".$this->escapeHtml($last['at'] ?? '—')
+                    ."\nدرخواست گروهی این اجرا: ".($last['synchronization']['requests'] ?? 0)
+                    ." · بررسی‌شده: ".($last['synchronization']['checked'] ?? 0)
+                    ."\nبررسی اعلان از دیتابیس: ".($last['notifications']['checked'] ?? 0)
+                    ."\nاعلان ارسال‌شده: ".(($last['notifications']['renewal_sent'] ?? 0) + ($last['notifications']['volume_sent'] ?? 0))
+                    ." · خطا: ".(($last['synchronization']['failed'] ?? 0) + ($last['notifications']['failed'] ?? 0));
+                if (!empty($last['at']) && \Carbon\Carbon::parse($last['at'])->lt(now()->subMinutes(5))) {
+                    $body .= "\n⚠️ زمان‌بند بیش از ۵ دقیقه اجرا نشده؛ کرون و لاگ سرور را بررسی کنید.";
+                }
+            } else {
+                $body .= "\n\nهنوز اجرای زمان‌بند ثبت نشده است؛ پس از نصب، کرون سرور را بررسی کنید.";
+            }
         }
 
         return $this->adminPage($groups[$group], $body, $rows, 'type=adminS');

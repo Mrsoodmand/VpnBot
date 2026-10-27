@@ -7,6 +7,7 @@ use App\Models\Orders;
 use App\Models\Panels;
 use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -51,7 +52,7 @@ class OrderLifecycleService
         $now ??= now();
         $expireAt = $order->expire_at ? Carbon::parse($order->expire_at) : null;
 
-        if (!$expireAt || $this->shouldSkipProviderRefresh($order)) {
+        if (! $expireAt || $this->shouldSkipProviderRefresh($order)) {
             return $order;
         }
 
@@ -74,7 +75,9 @@ class OrderLifecycleService
 
     public function canRenew(Orders $order, ?Carbon $now = null): bool
     {
-        if ($order->isSiteManagedDedicated()) return false;
+        if ($order->isSiteManagedDedicated()) {
+            return false;
+        }
 
         $this->refreshTimeStatus($order, $now);
 
@@ -83,7 +86,9 @@ class OrderLifecycleService
 
     public function canBuyExtra(Orders $order, ?Carbon $now = null): bool
     {
-        if ($order->isSiteManagedDedicated()) return false;
+        if ($order->isSiteManagedDedicated()) {
+            return false;
+        }
 
         $this->refreshTimeStatus($order, $now);
 
@@ -98,7 +103,21 @@ class OrderLifecycleService
      */
     public function applyConfigDetail(Orders $order, array $configDetail): Orders
     {
-        if (!($configDetail['status'] ?? false) || !($configDetail['data']['remote_available'] ?? false)) {
+        return DB::transaction(function () use ($order, $configDetail) {
+            $fresh = Orders::whereKey($order->id)->lockForUpdate()->first();
+            if (! $fresh) {
+                return $order;
+            }
+            $this->persistConfigDetail($fresh, $configDetail);
+            $order->setRawAttributes($fresh->getAttributes(), true);
+
+            return $order;
+        });
+    }
+
+    private function persistConfigDetail(Orders $order, array $configDetail): Orders
+    {
+        if (! ($configDetail['status'] ?? false) || ! ($configDetail['data']['remote_available'] ?? false)) {
             return $order;
         }
 
@@ -107,7 +126,7 @@ class OrderLifecycleService
         }
 
         $data = $configDetail['data'];
-        if (!empty($data['expire'])) {
+        if (! empty($data['expire'])) {
             try {
                 $order->expire_at = Carbon::parse($data['expire'])->timezone(config('app.timezone'));
             } catch (Throwable) {
@@ -119,11 +138,16 @@ class OrderLifecycleService
         $lifecycleDetail = is_array($detail['lifecycle'] ?? null) ? $detail['lifecycle'] : [];
         $detail['lifecycle'] = array_merge($lifecycleDetail, [
             'last_checked_at' => now()->toDateTimeString(),
+            'usage_checked_at' => now()->toDateTimeString(),
             'total_gb' => $data['totalGb'] ?? null,
             'used_gb' => $data['totalUsed'] ?? null,
             'left_gb' => $data['left'] ?? null,
             'provider_status' => $data['provider_status'] ?? null,
         ]);
+        if (is_numeric($lifecycleDetail['used_gb'] ?? null) && is_numeric($data['totalUsed'] ?? null)
+            && (float) $data['totalUsed'] < (float) $lifecycleDetail['used_gb'] - 0.001) {
+            $detail['lifecycle']['usage_cycle'] = (int) ($lifecycleDetail['usage_cycle'] ?? 0) + 1;
+        }
 
         $order->status = $this->resolveProviderOrderStatus(
             $order,
@@ -132,7 +156,8 @@ class OrderLifecycleService
         );
 
         $order->detail = $detail;
-        $order->save();
+        $order->saveQuietly();
+        app(OrderCheckSchedule::class)->refresh($order, providerRead: true);
 
         return $order;
     }
@@ -152,7 +177,7 @@ class OrderLifecycleService
         $lifecycle = is_array($detail['lifecycle'] ?? null) ? $detail['lifecycle'] : [];
 
         return ($lifecycle['remote_disabled'] ?? false) === true
-            || !empty($lifecycle['cancelled_at'])
+            || ! empty($lifecycle['cancelled_at'])
             || $this->providerIsInactive($lifecycle['provider_status'] ?? null);
     }
 
@@ -219,8 +244,9 @@ class OrderLifecycleService
 
         foreach ($ordersByPanel as $panelId => $orders) {
             $panel = $panels->get($panelId);
-            if (!$panel) {
+            if (! $panel) {
                 $failed += $orders->count();
+
                 continue;
             }
 
@@ -235,18 +261,21 @@ class OrderLifecycleService
                         'panel_id' => $panel->id,
                         'user_id' => $userId,
                     ]);
+
                     continue;
                 }
 
                 foreach ($orders as $order) {
                     $remoteUser = $usersById[(string) $order->uid] ?? null;
-                    if (!is_array($remoteUser)) {
+                    if (! is_array($remoteUser)) {
                         $failed++;
+
                         continue;
                     }
 
                     $before = (string) $order->status;
-                    $this->applyPasarguardListStatus($order, $remoteUser);
+                    $this->applyPasarguardSnapshot($order, $remoteUser);
+                    $order->refresh();
                     $checked++;
                     if ($before !== (string) $order->status) {
                         $updated++;
@@ -279,7 +308,7 @@ class OrderLifecycleService
 
     private function pasarGuardUsersById(mixed $response): ?array
     {
-        if (!is_array($response) || ($response['status'] ?? null) === false) {
+        if (! is_array($response) || ($response['status'] ?? null) === false) {
             return null;
         }
 
@@ -297,7 +326,7 @@ class OrderLifecycleService
 
         $usersById = [];
         foreach ($users as $user) {
-            if (!is_array($user)) {
+            if (! is_array($user)) {
                 continue;
             }
 
@@ -310,9 +339,38 @@ class OrderLifecycleService
         return $usersById;
     }
 
+    public function applyPasarguardSnapshot(Orders $order, array $remoteUser): bool
+    {
+        return DB::transaction(function () use ($order, $remoteUser) {
+            $fresh = Orders::whereKey($order->id)->lockForUpdate()->first();
+            if (! $fresh || $fresh->isSiteManagedDedicated() || $this->shouldSkipProviderRefresh($fresh)) {
+                return false;
+            }
+            // A payment or a newer usage read may finish while the group GET is
+            // in flight. Never replace it with the older provider snapshot.
+            if ($this->snapshotVersion($fresh) != $this->snapshotVersion($order)) {
+                return false;
+            }
+            $this->applyPasarguardListStatus($fresh, $remoteUser);
+
+            return true;
+        });
+    }
+
+    private function snapshotVersion(Orders $order): array
+    {
+        $detail = is_array($order->detail) ? $order->detail : [];
+        unset($detail['lifecycle']['notifications']);
+        if (empty($detail['lifecycle'])) {
+            unset($detail['lifecycle']);
+        }
+
+        return [$order->uid, $order->panel_id, $order->plan, $order->status, $order->expire_at?->timestamp, $detail];
+    }
+
     private function applyPasarguardListStatus(Orders $order, array $remoteUser): void
     {
-        if (!empty($remoteUser['expire'])) {
+        if (! empty($remoteUser['expire'])) {
             try {
                 $order->expire_at = Carbon::parse($remoteUser['expire'])->timezone(config('app.timezone'));
             } catch (Throwable) {
@@ -329,19 +387,38 @@ class OrderLifecycleService
         $detail = is_array($order->detail) ? $order->detail : [];
         $lifecycleDetail = is_array($detail['lifecycle'] ?? null) ? $detail['lifecycle'] : [];
         $detail['lifecycle'] = array_merge($lifecycleDetail, [
-            'last_checked_at' => now()->toDateTimeString(),
+            'last_checked_at' => $lifecycleDetail['last_checked_at'] ?? null,
             'provider_status' => $remoteUser['status'] ?? null,
         ]);
+        if (array_key_exists('data_limit', $remoteUser) && is_numeric($remoteUser['used_traffic'] ?? null)
+            && ($remoteUser['data_limit'] === null || is_numeric($remoteUser['data_limit']))) {
+            $total = max(0, (float) $remoteUser['data_limit']) / (1024 ** 3);
+            $used = max(0, (float) $remoteUser['used_traffic']) / (1024 ** 3);
+            $previousUsed = $lifecycleDetail['used_gb'] ?? null;
+            // A manual/periodic usage reset starts a new volume notification cycle.
+            if (is_numeric($previousUsed) && $used < (float) $previousUsed - 0.001) {
+                $detail['lifecycle']['usage_cycle'] = (int) ($lifecycleDetail['usage_cycle'] ?? 0) + 1;
+            }
+            $detail['lifecycle'] = array_merge($detail['lifecycle'], [
+                'total_gb' => $total, 'used_gb' => $used, 'left_gb' => max(0, $total - $used),
+                'usage_checked_at' => now()->toDateTimeString(),
+                'last_checked_at' => now()->toDateTimeString(),
+            ]);
+        }
+        // Explicit null is unlimited/on-hold, not the previous plan's expiry.
+        if (array_key_exists('expire', $remoteUser) && $remoteUser['expire'] === null) {
+            $order->expire_at = null;
+        }
         $order->detail = $detail;
-        $order->save();
+        $order->saveQuietly();
+        app(OrderCheckSchedule::class)->refresh($order, providerRead: true);
     }
 
     private function resolveProviderOrderStatus(
         Orders $order,
         mixed $providerStatus,
         bool $dataIsExhausted
-    ): string
-    {
+    ): string {
         $providerStatus = strtolower(trim((string) $providerStatus));
 
         if ($this->providerIsInactive($providerStatus)) {
@@ -367,7 +444,7 @@ class OrderLifecycleService
 
     private function expiryStatus(Orders $order, ?Carbon $now = null): ?string
     {
-        if (!$order->expire_at) {
+        if (! $order->expire_at) {
             return null;
         }
 
@@ -398,68 +475,130 @@ class OrderLifecycleService
      */
     public function synchronizeAll(): array
     {
-        $this->reconcileTimeStatuses();
-        $checked = 0;
+        $schedule = app(OrderCheckSchedule::class);
+        $initialization = $schedule->prepare();
+        $stateChecked = $this->reconcileScheduledTimeStatuses();
+        $batch = app(PasarGuardLifecycleSyncService::class)->synchronize($this);
+        $checked = $batch['checked'];
         $disabled = 0;
-        $failed = 0;
+        $failed = $batch['failed'];
+        $requests = $batch['requests'];
+        $maintenanceDeadline = microtime(true) + 30;
 
-        Orders::query()
-            ->where('status', Orders::STATUS_INACTIVE)
-            ->whereNotNull('expire_at')
-            ->where('expire_at', '<=', now()->subDays(self::RENEWAL_GRACE_DAYS))
-            ->chunkById(100, function ($orders) use (&$disabled, &$failed) {
-                foreach ($orders as $order) {
-                    $detail = is_array($order->detail) ? $order->detail : [];
-                    $lifecycleDetail = is_array($detail['lifecycle'] ?? null) ? $detail['lifecycle'] : [];
-                    if (($lifecycleDetail['remote_disabled'] ?? false) === true) {
-                        continue;
-                    }
+        foreach ($schedule->due('cleanup_at', 20) as $id) {
+            if (microtime(true) >= $maintenanceDeadline) {
+                break;
+            }
+            $order = Orders::find($id);
+            if (! $order) {
+                $schedule->remove($id);
 
-                    if ($this->disableRemoteOrder($order)) {
-                        $lifecycleDetail['remote_disabled'] = true;
-                        $lifecycleDetail['cancelled_at'] = now()->toDateTimeString();
-                        $detail['lifecycle'] = $lifecycleDetail;
-                        $order->detail = $detail;
-                        $order->save();
-                        $disabled++;
-                    } else {
-                        $failed++;
-                    }
-                }
-            });
+                continue;
+            }
+            if ($order->isSiteManagedDedicated() || $this->shouldSkipProviderRefresh($order)
+                || ! $order->expire_at || $order->expire_at->copy()->addDays(self::RENEWAL_GRACE_DAYS)->gt(now())) {
+                $schedule->refresh($order);
 
-        Orders::query()
-            ->whereIn('status', [Orders::STATUS_ACTIVE, Orders::STATUS_DATA_EXHAUSTED, '1', '0', 'created'])
-            ->where(function (Builder $query) {
-                $query->whereNull('expire_at')->orWhere('expire_at', '>', now());
-            })
-            ->chunkById(100, function ($orders) use (&$checked, &$failed) {
-                foreach ($orders as $order) {
-                    try {
-                        $configDetail = getConfigDetail($order);
-                        if ($configDetail['status'] ?? false) {
-                            $this->applyConfigDetail($order, $configDetail);
-                            $checked++;
-                        } else {
-                            $failed++;
+                continue;
+            }
+            try {
+                if ($this->disableRemoteOrder($order)) {
+                    DB::transaction(function () use ($order) {
+                        $fresh = Orders::whereKey($order->id)->lockForUpdate()->first();
+                        if (! $fresh || $this->snapshotVersion($fresh) != $this->snapshotVersion($order)) {
+                            return;
                         }
-                    } catch (Throwable $exception) {
-                        $failed++;
-                        Log::warning('Order lifecycle synchronization failed', [
-                            'order_id' => $order->id,
-                            'message' => $exception->getMessage(),
-                        ]);
-                    }
+                        $detail = $fresh->detail ?? [];
+                        $detail['lifecycle']['remote_disabled'] = true;
+                        $detail['lifecycle']['cancelled_at'] = now()->toDateTimeString();
+                        $fresh->detail = $detail;
+                        $fresh->status = Orders::STATUS_INACTIVE;
+                        $fresh->save();
+                    });
+                    $disabled++;
+                } else {
+                    $failed++;
+                    $schedule->defer($id, 'cleanup_at', now()->addHour());
                 }
-            });
+            } catch (Throwable $exception) {
+                $failed++;
+                $schedule->defer($id, 'cleanup_at', now()->addHour());
+                Log::warning('Scheduled order cleanup failed', ['order_id' => $id]);
+            }
+        }
 
-        return compact('checked', 'disabled', 'failed');
+        $legacyChecked = 0;
+        foreach (Panels::where('system_type', '!=', 'pasarguard')->get() as $panel) {
+            if ($legacyChecked >= 20 || microtime(true) >= $maintenanceDeadline) {
+                break;
+            }
+            foreach ($schedule->due('provider_at', 20 - $legacyChecked, $panel->id) as $id) {
+                if (microtime(true) >= $maintenanceDeadline) {
+                    break 2;
+                }
+                $legacyChecked++;
+                $order = Orders::find($id);
+                if (! $order) {
+                    $schedule->remove($id);
+
+                    continue;
+                }
+                if ($order->isSiteManagedDedicated() || $this->shouldSkipProviderRefresh($order)
+                    || ($order->expire_at && $order->expire_at->copy()->addDays(self::RENEWAL_GRACE_DAYS)->lte(now()))) {
+                    $schedule->refresh($order);
+
+                    continue;
+                }
+                try {
+                    $detail = getConfigDetail($order);
+                    if (! ($detail['status'] ?? false)) {
+                        throw new \RuntimeException('Provider read failed');
+                    }
+                    $this->applyConfigDetail($order, $detail);
+                    $checked++;
+                } catch (Throwable $exception) {
+                    $failed++;
+                    $schedule->defer($id, 'provider_at', now()->addMinutes(10));
+                    Log::warning('Scheduled legacy order read failed', ['order_id' => $id]);
+                }
+            }
+        }
+
+        return compact('checked', 'disabled', 'failed', 'requests', 'stateChecked', 'legacyChecked', 'initialization');
     }
 
-    private function disableRemoteOrder(Orders $order): bool
+    /** Scheduler-only: no mass UPDATE of the entire orders table. */
+    public function reconcileScheduledTimeStatuses(): int
+    {
+        $schedule = app(OrderCheckSchedule::class);
+        $ids = $schedule->due('state_at', 200);
+        foreach ($ids as $id) {
+            try {
+                DB::transaction(function () use ($id, $schedule) {
+                    $order = Orders::whereKey($id)->lockForUpdate()->first();
+                    if (! $order) {
+                        $schedule->remove($id);
+
+                        return;
+                    }
+                    if (! $order->isSiteManagedDedicated()) {
+                        $this->refreshTimeStatus($order);
+                    }
+                    $schedule->refresh($order);
+                });
+            } catch (Throwable $exception) {
+                $schedule->defer($id, 'state_at', now()->addHour());
+                Log::warning('Scheduled time transition failed', ['order_id' => $id]);
+            }
+        }
+
+        return count($ids);
+    }
+
+    protected function disableRemoteOrder(Orders $order): bool
     {
         $panel = $order->panel_id ? Panels::find($order->panel_id) : null;
-        if (!$panel || !$order->uid) {
+        if (! $panel || ! $order->uid) {
             return false;
         }
 
@@ -471,7 +610,7 @@ class OrderLifecycleService
                 'id' => $panel->id,
             ]);
 
-            if (!$pasarGuard->checkConnection()) {
+            if (! $pasarGuard->checkConnection()) {
                 return false;
             }
 
@@ -495,7 +634,7 @@ class OrderLifecycleService
             'uuid' => $order->uid,
         ]);
         $client = is_array($clientResult) ? ($clientResult['obj'][0] ?? null) : null;
-        if (!is_array($client)) {
+        if (! is_array($client)) {
             return false;
         }
 

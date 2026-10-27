@@ -16,6 +16,7 @@ class OrderLifecycleServiceTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
+        (require database_path('migrations/2026_05_17_112220_create_settings_table.php'))->up();
 
         Schema::create('orders', function (Blueprint $table) {
             $table->id();
@@ -213,7 +214,7 @@ class OrderLifecycleServiceTest extends TestCase
         $this->assertTrue($lifecycle->canRenew($expired->fresh()));
         $this->assertSame(Orders::STATUS_INACTIVE, $cancelled->fresh()->status);
         $this->assertSame(Orders::STATUS_INACTIVE, $cancelledOnItsOwnPanel->fresh()->status);
-        $this->assertArrayNotHasKey('total_gb', $active->fresh()->detail['lifecycle']);
+        $this->assertEquals(10000 / (1024 ** 3), $active->fresh()->detail['lifecycle']['total_gb']);
     }
 
     private function createOrder(

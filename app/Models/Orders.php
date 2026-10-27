@@ -6,6 +6,12 @@ use Illuminate\Database\Eloquent\Model;
 
 class Orders extends Model
 {
+    protected static function booted(): void
+    {
+        static::saved(fn (Orders $order) => app(\App\Services\OrderCheckSchedule::class)->refresh($order));
+        static::deleted(fn (Orders $order) => app(\App\Services\OrderCheckSchedule::class)->remove($order->id));
+    }
+
     public const STATUS_INACTIVE = 'inactive';
 
     public const STATUS_DATA_EXHAUSTED = 'data_exhausted';

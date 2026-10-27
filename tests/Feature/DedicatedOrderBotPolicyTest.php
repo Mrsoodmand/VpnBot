@@ -13,6 +13,7 @@ class DedicatedOrderBotPolicyTest extends TestCase
 {
     public function test_existing_dedicated_imports_are_hidden_and_cannot_be_managed(): void
     {
+        (require database_path('migrations/2026_05_17_112220_create_settings_table.php'))->up();
         Schema::create('orders', function (Blueprint $table) {
             $table->id();
             $table->json('detail')->nullable();
