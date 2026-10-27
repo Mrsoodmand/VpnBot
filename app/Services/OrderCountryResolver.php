@@ -28,6 +28,7 @@ class OrderCountryResolver
             $detail = $this->asArray($order->detail);
 
             return [(int) $order->id => [
+                'current_name' => $this->cleanName($detail['current_country']['label'] ?? null),
                 'direct_name' => $this->countryNameFrom($detail),
                 'country_id' => $this->positiveIntFrom($detail, ['country-id', 'country_id', 'countryId']),
                 'pre_order_id' => $this->positiveIntFrom($detail, ['preOrderId', 'pre_order_id', 'pre-order-id']),
@@ -86,6 +87,9 @@ class OrderCountryResolver
             ->pluck('name', 'id');
 
         return $metadata->map(function (array $item) use ($inbounds, $legacyInbounds, $panels, $countryNames) {
+            if ($item['current_name']) {
+                return $item['current_name'];
+            }
             if ($item['is_all_countries']) {
                 return self::ALL_COUNTRIES;
             }

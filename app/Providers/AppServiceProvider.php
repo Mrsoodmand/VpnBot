@@ -13,6 +13,7 @@ class AppServiceProvider extends ServiceProvider
     {
         $this->app->scoped(\App\Services\CustomerLoyaltyService::class);
         $this->app->scoped(\App\Services\OrderCheckSchedule::class);
+        $this->app->scoped(\App\Services\OrderCountryService::class);
         //
     }
 

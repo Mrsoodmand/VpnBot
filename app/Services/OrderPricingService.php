@@ -11,6 +11,9 @@ class OrderPricingService
     public function isAllCountries(Orders $order, Panels $panel): bool
     {
         $detail = is_array($order->detail) ? $order->detail : [];
+        if (is_bool($detail['current_country']['is_all_countries'] ?? null)) {
+            return $detail['current_country']['is_all_countries'];
+        }
         $raw = is_array($detail['raw'] ?? null) ? $detail['raw'] : [];
         // Site imports can carry a group/inbound ID even for all-country orders.
         foreach ([$detail, $raw] as $data) {

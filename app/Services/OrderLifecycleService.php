@@ -108,6 +108,10 @@ class OrderLifecycleService
             if (! $fresh) {
                 return $order;
             }
+            if ($this->snapshotVersion($fresh) != $this->snapshotVersion($order)) {
+                $order->setRawAttributes($fresh->getAttributes(), true);
+                return $order;
+            }
             $this->persistConfigDetail($fresh, $configDetail);
             $order->setRawAttributes($fresh->getAttributes(), true);
 
@@ -156,6 +160,7 @@ class OrderLifecycleService
         );
 
         $order->detail = $detail;
+        app(OrderCountryService::class)->observe($order, ['group_ids' => $data['group_ids'] ?? null]);
         $order->saveQuietly();
         app(OrderCheckSchedule::class)->refresh($order, providerRead: true);
 
@@ -410,6 +415,7 @@ class OrderLifecycleService
             $order->expire_at = null;
         }
         $order->detail = $detail;
+        app(OrderCountryService::class)->observe($order, $remoteUser);
         $order->saveQuietly();
         app(OrderCheckSchedule::class)->refresh($order, providerRead: true);
     }

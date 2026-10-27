@@ -46,6 +46,7 @@ class TelegramBotController extends Controller
     use Concerns\ManagesBotCatalog;
     use Concerns\ManagesBotSettings;
     use Concerns\LegacyBotAdminNavigation;
+    use Concerns\ManagesOrderCountry;
     protected $chatId;
     protected $panel;
     protected $messageId;
@@ -210,6 +211,7 @@ class TelegramBotController extends Controller
         $telData->types = json_encode($type);
         $telData->save();
         switch ($type['type']) {
+            case 'adminOC': return $this->adminOrderCountry($type);
             case 'adminC': return $this->adminCatalog($type);
             case 'adminN': return $this->adminNetwork($type);
             case 'adminS': return $this->adminSettings($type);
@@ -3654,6 +3656,8 @@ $codeText
         $subUrlSafe = htmlspecialchars($subUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 
         $message = headTitle("📄 جزئیات سفارش #{$order->id}");
+        $countryLabel = app(OrderCountryResolver::class)->resolve([$order])[$order->id];
+        $message .= '<b>کشور:</b> '.htmlspecialchars($countryLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')."\n";
         $message .= "<b>وضعیت:</b> {$status['icon']} {$status['label']}\n";
         $message .= "<b>حجم کل:</b> {$totalGb} گیگ\n";
         $message .= "<b>حجم مصرف شده:</b> {$totalUsed} گیگ\n";
@@ -6234,6 +6238,7 @@ $codeText
         $orders = $lifecycle->orderByStatus($query)
             ->orderByDesc('id')
             ->paginate(20, ['*'], 'page', $page);
+        $orderCountries = app(OrderCountryResolver::class)->resolve($orders->items());
 
         $text = headTitle("👥 لیست سفارشات");
         $text .= "🔎 جستجو بر اساس:
@@ -6265,7 +6270,7 @@ $codeText
         foreach ($orders as $order) {
 
             $status = $lifecycle->statusMeta($order);
-            $btnText = "{$status['icon']} #{$order->id}";
+            $btnText = "{$status['icon']} #{$order->id} ".($orderCountries[$order->id] ?? '');
             $row[] = [
                 'text' => $btnText,
                 'callback_data' => "type=adminOrderSingle|id={$order->id}|search=$search|userId=$userId"
@@ -6420,6 +6425,9 @@ $codeText
             : json_decode($order->detail, true);
 
         $buttons = [];
+        if (Panels::whereKey($order->panel_id)->where('system_type', 'pasarguard')->exists()) {
+            $buttons[] = [['text' => '🌍 تغییر کشور', 'callback_data' => "type=adminOC|id={$order->id}"]];
+        }
 
 
         $buttons[] = [
@@ -6514,6 +6522,8 @@ $codeText
 
         $message = headTitle("📄 جزئیات سفارش #{$order->id}");
         $status = $lifecycle->statusMeta($order->fresh());
+        $countryLabel = app(OrderCountryResolver::class)->resolve([$order])[$order->id];
+        $message .= '<b>کشور:</b> '.htmlspecialchars($countryLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')."\n";
         $message .= "<b>وضعیت:</b> {$status['icon']} {$status['label']}\n";
         $message .= "<b>ریمارک:</b> {$order->remark}\n";
         $message .= "<b>حجم کل:</b> {$totalGb} گیگ\n";

@@ -24,6 +24,26 @@ use Throwable;
 
 class WpSyncService
 {
+    public function pushOrderCountry(Orders $order): bool
+    {
+        $detail = is_array($order->detail) ? $order->detail : [];
+        $siteId = (int) ($detail['site_order_id'] ?? 0);
+        if (!$siteId) return true;
+        $history = is_array($detail['country_history'] ?? null) ? $detail['country_history'] : [];
+        $latest = $history ? $history[array_key_last($history)] : [];
+        try {
+            $response = Http::timeout(12)->acceptJson()->asJson()->withHeaders(['X-IPSABET-API-KEY' => $this->secret()])
+                ->post($this->wpBaseUrl().'/wp-json/ipsvp/v1/sync/order-country', [
+                    'site_order_id' => $siteId, 'uid' => (string) $order->uid,
+                    'group_ids' => $detail['current_country']['group_ids'] ?? [],
+                    'actor' => $latest['actor'] ?? ['source' => 'telegram'],
+                ]);
+            return $response->successful() && $response->json('ok') === true;
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
     public function secret(): string
     {
         return (string) config('services.wp_sync.secret', '');
@@ -253,6 +273,14 @@ class WpSyncService
     public function formatOrder(Orders $order, bool $full = false): array
     {
         $detail = is_array($order->detail) ? $order->detail : (json_decode((string) $order->detail, true) ?: []);
+        $location = is_array($detail['current_country'] ?? null) ? $detail['current_country'] : [];
+        if ($location) {
+            $detail['country'] = $location['label'];
+            $detail['country_name'] = $location['name'];
+            $detail['country_flag'] = $location['flag'];
+            $detail['pg_group_ids'] = $location['group_ids'];
+            $detail['is_all_countries'] = $location['is_all_countries'];
+        }
         if (empty($detail['code']) && !empty($order->remark)) $detail['code'] = $order->remark;
         if (empty($detail['pg_user_id']) && !empty($order->uid)) $detail['pg_user_id'] = (string) $order->uid;
         if (empty($detail['subscription_url']) && !empty($order->sub_id)) $detail['subscription_url'] = (string) $order->sub_id;
@@ -665,6 +693,7 @@ class WpSyncService
         if ($mapping && $mapping->bot_order_id) {
             $order = Orders::find($mapping->bot_order_id);
             if ($order) {
+                $payload['detail'] = array_replace(is_array($order->detail) ? $order->detail : [], $detail);
                 $order->fill($payload);
                 $order->save();
                 return $order;

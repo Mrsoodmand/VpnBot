@@ -15,6 +15,8 @@ Route::get('send-bulk-message', [JobController::class, 'sendBulkMessage']);
 Route::get('importUsers', [DefaultController::class, 'importUsers']);
 
 Route::prefix('wp-sync')->group(function () {
+    Route::post('orders/country/{action}', [\App\Http\Controllers\Api\OrderCountryController::class, 'handle'])
+        ->where('action', 'options|preview|confirm|sync');
     Route::get('ping', [WpSyncController::class, 'ping']);
 
     // Account link

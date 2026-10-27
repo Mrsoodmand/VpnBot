@@ -1053,6 +1053,7 @@ function getConfigDetail($order)
             'code' => $code,
             'provider_status' => $providerStatus,
             'remote_available' => true,
+            'group_ids' => $panel->system_type === 'pasarguard' ? ($result['group_ids'] ?? null) : null,
         ]
     ];
 }
