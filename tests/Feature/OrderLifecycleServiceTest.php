@@ -217,6 +217,99 @@ class OrderLifecycleServiceTest extends TestCase
         $this->assertEquals(10000 / (1024 ** 3), $active->fresh()->detail['lifecycle']['total_gb']);
     }
 
+    public function test_on_hold_snapshots_clear_estimated_expiry_and_switch_to_real_expiry_after_connection(): void
+    {
+        $lifecycle = app(OrderLifecycleService::class);
+        foreach ([null, 0, '0', now()->subDays(30)->toISOString()] as $expiry) {
+            $order = $this->createOrder(1, Orders::STATUS_INACTIVE, now()->subDays(30));
+            $lifecycle->applyPasarguardSnapshot($order, ['status' => 'on_hold', 'expire' => $expiry, 'data_limit' => 70 * 1024 ** 3, 'used_traffic' => 0]);
+            $order->refresh();
+            $this->assertSame(Orders::STATUS_ON_HOLD, $order->status);
+            $this->assertNull($order->expire_at);
+            $this->assertSame('در انتظار اتصال', $lifecycle->statusMeta($order)['label']);
+            $this->assertSame('بعد از اولین اتصال نمایش داده می‌شود', $lifecycle->expiryLabel($order));
+            $this->assertTrue($lifecycle->canBuyExtra($order));
+            $realExpiry = now()->addDays(30);
+            $lifecycle->applyPasarguardSnapshot($order, ['status' => 'active', 'expire' => $realExpiry->timestamp, 'data_limit' => 70 * 1024 ** 3, 'used_traffic' => 100]);
+            $order->refresh();
+            $this->assertSame(Orders::STATUS_ACTIVE, $lifecycle->statusMeta($order)['key']);
+            $this->assertTrue($order->expire_at->equalTo($realExpiry));
+            $this->assertStringNotContainsString('اولین اتصال', $lifecycle->expiryLabel($order));
+        }
+    }
+
+    public function test_local_time_reconciliation_never_expires_known_waiting_orders_or_revives_cancellations(): void
+    {
+        $lifecycle = app(OrderLifecycleService::class);
+        $waiting = $this->createOrder(1, 'on_hold', now()->subDays(40));
+        $legacy = $this->createOrder(1, 'suspended', now()->subDays(40));
+        $legacy->update(['detail' => ['lifecycle' => ['provider_status' => 'on_hold']]]);
+        $cancelled = $this->createOrder(1, 'inactive', now()->subDays(40));
+        $cancelled->update(['detail' => ['lifecycle' => ['provider_status' => 'on_hold', 'remote_disabled' => true]]]);
+        $lifecycle->reconcileTimeStatuses(1);
+        $this->assertSame('on_hold', $waiting->fresh()->status);
+        $this->assertSame('suspended', $legacy->fresh()->status);
+        foreach ([$waiting, $legacy] as $order) {
+            $this->assertSame('on_hold', $lifecycle->statusMeta($order->fresh())['key']);
+            $this->assertNull($order->fresh()->expire_at);
+            $row = DB::table('order_checks')->where('order_id', $order->id)->first();
+            $this->assertNull($row->state_at);
+            $this->assertNull($row->cleanup_at);
+            $this->assertNull($row->notice_at);
+        }
+        $this->assertSame('inactive', $lifecycle->statusMeta($cancelled->fresh())['key']);
+        $lifecycle->applyPasarguardSnapshot($cancelled->fresh(), ['status' => 'on_hold', 'expire' => null]);
+        $this->assertSame('inactive', $cancelled->fresh()->status);
+    }
+
+    public function test_detail_refresh_distinguishes_waiting_unlimited_limited_expired_and_disabled(): void
+    {
+        $lifecycle = app(OrderLifecycleService::class);
+        foreach ([
+            ['on_hold', 70, 0, 70, null, 'on_hold'],
+            ['active', 0, 12, 0, null, 'active'],
+            ['limited', 70, 70, 0, now()->addDay()->toISOString(), 'data_exhausted'],
+            ['active', 70, 70, 0, now()->addDay()->toISOString(), 'data_exhausted'],
+            ['expired', 70, 0, 70, now()->subDay()->toISOString(), 'suspended'],
+            ['expired', 70, 0, 70, now()->addDay()->toISOString(), 'suspended'],
+            ['disabled', 70, 0, 70, null, 'inactive'],
+        ] as [$status, $total, $used, $left, $expiry, $expected]) {
+            $order = $this->createOrder(1, 'active', now()->subDays(30));
+            $lifecycle->applyConfigDetail($order, ['status' => true, 'data' => [
+                'remote_available' => true, 'provider_status' => $status, 'expire' => $expiry,
+                'totalGb' => $total, 'totalUsed' => $used, 'left' => $left,
+            ]]);
+            $this->assertSame($expected, $lifecycle->statusMeta($order->fresh())['key'], $status);
+        }
+    }
+
+    public function test_absent_or_invalid_expiry_does_not_invent_a_date(): void
+    {
+        $lifecycle = app(OrderLifecycleService::class);
+        $date = now()->addDays(30);
+        foreach ([[], ['expire' => 'invalid date'], ['expire' => ''], ['expire' => []]] as $remote) {
+            $this->assertEquals($date, $lifecycle->providerExpiry($remote, $date));
+        }
+        foreach ([null, 0, '0'] as $value) $this->assertNull($lifecycle->providerExpiry(['expire' => $value], $date));
+        $order = $this->createOrder(1, 'active', $date);
+        $order->update(['expire_at' => null]);
+        $this->assertSame('تاریخ پایان تعیین نشده', $lifecycle->expiryLabel($order));
+    }
+
+    public function test_expiry_migration_preserves_existing_dates_and_allows_waiting_orders(): void
+    {
+        Schema::table('orders', fn (Blueprint $table) => $table->timestamp('expire_at')->nullable(false)->change());
+        $order = $this->createOrder(1, 'active', now()->addDays(30));
+        $before = $order->getAttributes();
+        $migration = require database_path('migrations/2026_10_28_000000_allow_pending_order_expiry.php');
+        $migration->up();
+        $this->assertSame($before, $order->fresh()->getAttributes());
+        $order->update(['expire_at' => null, 'status' => 'on_hold']);
+        $migration->up();
+        $this->assertNull($order->fresh()->expire_at);
+        $this->assertSame('on_hold', $order->fresh()->status);
+    }
+
     private function createOrder(
         int $userId,
         string $status,

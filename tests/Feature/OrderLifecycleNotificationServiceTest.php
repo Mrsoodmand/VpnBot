@@ -104,6 +104,20 @@ class OrderLifecycleNotificationServiceTest extends TestCase
         $this->assertSame('sent', $volumeState['state']);
     }
 
+    public function test_waiting_services_do_not_receive_notices_from_old_scheduled_rows(): void
+    {
+        $order = $this->createOrder('waiting', now()->addHours(1), ['provider_status' => 'on_hold', 'total_gb' => 1, 'used_gb' => 0, 'left_gb' => 1]);
+        app(\App\Services\OrderCheckSchedule::class)->prepare();
+        DB::table('order_checks')->where('order_id', $order->id)->update(['notice_at' => now()]);
+        $service = new FakeOrderLifecycleNotificationService(app(OrderLifecycleService::class));
+        $result = $service->sendDueNotifications();
+        $this->assertSame(1, $result['checked']);
+        $this->assertSame(0, $result['renewal_sent']);
+        $this->assertSame(0, $result['volume_sent']);
+        $this->assertSame([], $service->messages);
+        $this->assertNull(DB::table('order_checks')->where('order_id', $order->id)->value('notice_at'));
+    }
+
     public function test_a_failed_delivery_is_released_and_retried(): void
     {
         $order = $this->createOrder(

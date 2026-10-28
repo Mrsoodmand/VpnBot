@@ -12,6 +12,7 @@ class OrderNoticePolicy
     public function nextAt(Orders $order, array $settings, Carbon $now): ?Carbon
     {
         if ($order->isSiteManagedDedicated() || app(OrderLifecycleService::class)->shouldSkipProviderRefresh($order)
+            || app(OrderLifecycleService::class)->isAwaitingConnection($order)
             || ! in_array((string) $order->status, ['active', 'data_exhausted', 'suspended', '1', '0', '2', 'created', 'limited', 'expired', 'on_hold'], true)) {
             return null;
         }
@@ -36,7 +37,8 @@ class OrderNoticePolicy
 
     public function volumeIsDue(Orders $order, array $settings, Carbon $now): bool
     {
-        if (! in_array((string) $order->status, ['active', 'data_exhausted', '1', '0', 'created', 'limited'], true)
+        if (app(OrderLifecycleService::class)->isAwaitingConnection($order)
+            || ! in_array((string) $order->status, ['active', 'data_exhausted', '1', '0', 'created', 'limited'], true)
             || ($order->expire_at && $order->expire_at->lte($now))) {
             return false;
         }

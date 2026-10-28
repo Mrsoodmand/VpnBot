@@ -121,7 +121,7 @@ class CustomerLoyaltyService
             $rows[] = ['id' => (int) $p->id, 'type' => $type, 'amount' => (int) $p->price,
                 'approved_at' => $at, 'key' => 'bot:'.$p->id];
         }
-        return ['rows' => $rows, 'first_purchase' => Orders::where('user_id', $user->id)->whereIn('status', ['1','0','2','active','data_exhausted','suspended','inactive'])->exists(), 'currency' => 'IRT'];
+        return ['rows' => $rows, 'first_purchase' => Orders::where('user_id', $user->id)->whereIn('status', ['1','0','2','active','on_hold','data_exhausted','suspended','inactive'])->exists(), 'currency' => 'IRT'];
     }
 
     public static function persianNumber(string|int|float $value): string

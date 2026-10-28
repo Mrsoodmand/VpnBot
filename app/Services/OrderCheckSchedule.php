@@ -12,6 +12,8 @@ class OrderCheckSchedule
 {
     public const SEED_LIMIT = 200;
 
+    private const LOGIC_VERSION = 2;
+
     private ?array $settings = null;
 
     private ?bool $available = null;
@@ -41,7 +43,7 @@ class OrderCheckSchedule
     public function prepare(): array
     {
         $settings = $this->settings(OrderNotificationSettings::load());
-        $hash = hash('sha256', json_encode($settings));
+        $hash = hash('sha256', self::LOGIC_VERSION.json_encode($settings));
         $signature = now()->format('Y-m-d H:i').$hash;
         if ($this->preparedSignature === $signature) {
             return ['seeded' => 0, 'rescheduled' => 0];
@@ -61,8 +63,9 @@ class OrderCheckSchedule
         // Settings changes reschedule existing rows incrementally, never UPDATE all orders.
         $rebuild = Cache::get('orders:checks:settings', []);
         if (($rebuild['hash'] ?? '') !== $hash) {
-            $wakeProvider = isset($rebuild['interval']) && $rebuild['interval'] !== $settings['interval'];
-            $rebuild = ['hash' => $hash, 'cursor' => 0, 'ceiling' => (int) Orders::max('id'), 'interval' => $settings['interval'], 'wake_provider' => $wakeProvider];
+            $wakeProvider = ($rebuild['version'] ?? null) !== self::LOGIC_VERSION
+                || (isset($rebuild['interval']) && $rebuild['interval'] !== $settings['interval']);
+            $rebuild = ['hash' => $hash, 'version' => self::LOGIC_VERSION, 'cursor' => 0, 'ceiling' => (int) Orders::max('id'), 'interval' => $settings['interval'], 'wake_provider' => $wakeProvider];
         }
         $rescheduled = 0;
         if ($rebuild['cursor'] < $rebuild['ceiling']) {
@@ -89,10 +92,11 @@ class OrderCheckSchedule
         $settings = $this->settings();
         $now = now();
         $terminal = $order->isSiteManagedDedicated() || app(OrderLifecycleService::class)->shouldSkipProviderRefresh($order);
-        $grace = $order->expire_at?->copy()->addDays(OrderLifecycleService::RENEWAL_GRACE_DAYS);
+        $awaiting = app(OrderLifecycleService::class)->isAwaitingConnection($order);
+        $grace = ! $awaiting ? $order->expire_at?->copy()->addDays(OrderLifecycleService::RENEWAL_GRACE_DAYS) : null;
         $overGrace = $grace && $grace->lte($now);
         $stateAt = null;
-        if (! $terminal && $order->expire_at) {
+        if (! $terminal && ! $awaiting && $order->expire_at) {
             if ($order->expire_at->gt($now)) {
                 $stateAt = $order->expire_at;
             } elseif ($overGrace) {

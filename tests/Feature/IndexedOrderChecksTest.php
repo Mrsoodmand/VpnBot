@@ -248,7 +248,10 @@ class IndexedOrderChecksTest extends TestCase
     {
         $max = (int) Orders::max('id');
         Cache::forever('orders:checks:seed-id', $max);
-        Cache::forever('orders:checks:settings', ['hash' => hash('sha256', json_encode(OrderNotificationSettings::load())), 'cursor' => $max, 'ceiling' => $max, 'interval' => 10]);
+        app(OrderCheckSchedule::class)->prepare();
+        $state = Cache::get('orders:checks:settings');
+        $state['cursor'] = $state['ceiling'] = $max;
+        Cache::forever('orders:checks:settings', $state);
     }
 }
 

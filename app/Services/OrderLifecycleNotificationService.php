@@ -96,7 +96,7 @@ class OrderLifecycleNotificationService
 
     private function renewalIsDue(Orders $order, Carbon $now): bool
     {
-        if (! $order->expire_at || ! $this->lifecycle->canRenew($order, $now)) {
+        if ($this->lifecycle->isAwaitingConnection($order) || ! $order->expire_at || ! $this->lifecycle->canRenew($order, $now)) {
             return false;
         }
 

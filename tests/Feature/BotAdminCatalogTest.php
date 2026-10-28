@@ -220,6 +220,30 @@ class BotAdminCatalogTest extends TestCase
         $this->assertSame(['status' => 1, 'percent' => 70], Panels::find(7)->detail);
     }
 
+    public function test_user_and_admin_order_details_show_waiting_status_without_a_fake_end_date(): void
+    {
+        DB::table('orders')->insert(['id' => 90, 'user_id' => 1, 'panel_id' => 7, 'uid' => '42', 'remark' => 'waiting',
+            'inbound_id' => 20, 'plan' => 1, 'status' => 'suspended', 'expire_at' => now()->toDateTimeString(), 'detail' => '{}']);
+        Http::fake([
+            '*/api/admin/token' => Http::response(['access_token' => 'token']),
+            '*/api/user/by-id/42' => Http::response(['id' => 42, 'status' => 'on_hold', 'expire' => 0, 'data_limit' => 70 * 1024 ** 3, 'used_traffic' => 0]),
+            '*/subscription/links' => Http::response('vless://test'),
+        ]);
+        $bot = $this->controller();
+        foreach (['clientSingleOrder', 'adminOrderSingle'] as $action) {
+            $bot->callback('type='.$action.'|id=90');
+            $this->assertStringContainsString('در انتظار اتصال', $bot->last()['text']);
+            $this->assertStringContainsString('بعد از اولین اتصال نمایش داده می‌شود', $bot->last()['text']);
+            $this->assertStringNotContainsString('اتمام زمان', $bot->last()['text']);
+            $this->assertNull(Orders::find(90)->expire_at);
+        }
+        $payload = app(\App\Services\WpSyncService::class)->formatOrder(Orders::find(90));
+        $this->assertSame('on_hold', $payload['status']);
+        $this->assertSame('در انتظار اتصال', $payload['status_label']);
+        $this->assertNull($payload['expire_at']);
+        $this->assertTrue(app(\App\Services\CustomerLoyaltyService::class)->events(User::find(1))['first_purchase']);
+    }
+
     public function test_failed_connection_does_not_erase_surcharge_or_report_success(): void
     {
         Http::fake(['*' => Http::response(['detail' => 'Unauthorized'], 401)]);
@@ -735,6 +759,7 @@ class CatalogBotController extends TelegramBotController
             return ['ok' => true];
         });
         $sdk->shouldReceive('deleteMessage')->andReturn(['ok' => true]);
+        $sdk->shouldReceive('sendPhoto')->andReturn(['ok' => false]);
         $this->telegramSdk = $sdk;
     }
 

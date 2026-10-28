@@ -195,6 +195,30 @@ class PasarGuardLifecycleSyncTest extends TestCase
         Http::assertSentCount(1);
     }
 
+    public function test_old_waiting_order_is_checked_in_batch_and_never_disabled_by_an_estimated_expiry(): void
+    {
+        $order = $this->order('42', ['lifecycle' => ['provider_status' => 'on_hold']]);
+        $order->update(['status' => 'inactive', 'expire_at' => now()->subDays(40)]);
+        // Simulate a cleanup deadline written by the old release.
+        DB::table('order_checks')->where('order_id', $order->id)->update(['cleanup_at' => now()]);
+        Cache::put('pasarguard-token-1', 'test-token');
+        Http::fake(['https://panel.test/api/users*' => Http::response([
+            'users' => [['id' => 42, 'status' => 'on_hold', 'expire' => 0, 'data_limit' => 20 * 1024 ** 3, 'used_traffic' => 0]], 'total' => 1,
+        ])]);
+        $result = app(OrderLifecycleService::class)->synchronizeAll();
+        $this->assertSame(1, $result['checked']);
+        $this->assertSame(0, $result['disabled']);
+        $this->assertSame('on_hold', $order->fresh()->status);
+        $this->assertNull($order->fresh()->expire_at);
+        $row = DB::table('order_checks')->where('order_id', $order->id)->first();
+        $this->assertNull($row->cleanup_at);
+        $this->assertNull($row->state_at);
+        $this->assertNull($row->notice_at);
+        $this->assertNotNull($row->provider_at);
+        Http::assertSentCount(1);
+        Http::assertNotSent(fn ($r) => $r->method() === 'PUT');
+    }
+
     public function test_console_worker_saves_health_report_and_skips_overlapping_invocations(): void
     {
         $this->mock(OrderLifecycleService::class)->shouldReceive('synchronizeAll')->once()->andReturn(['checked' => 200, 'failed' => 0, 'requests' => 1]);

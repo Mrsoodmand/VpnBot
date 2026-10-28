@@ -272,6 +272,8 @@ class WpSyncService
 
     public function formatOrder(Orders $order, bool $full = false): array
     {
+        $awaiting = app(OrderLifecycleService::class)->isAwaitingConnection($order);
+        $displayStatus = $awaiting ? Orders::STATUS_ON_HOLD : (string) $order->status;
         $detail = is_array($order->detail) ? $order->detail : (json_decode((string) $order->detail, true) ?: []);
         $location = is_array($detail['current_country'] ?? null) ? $detail['current_country'] : [];
         if ($location) {
@@ -284,7 +286,7 @@ class WpSyncService
         if (empty($detail['code']) && !empty($order->remark)) $detail['code'] = $order->remark;
         if (empty($detail['pg_user_id']) && !empty($order->uid)) $detail['pg_user_id'] = (string) $order->uid;
         if (empty($detail['subscription_url']) && !empty($order->sub_id)) $detail['subscription_url'] = (string) $order->sub_id;
-        if (empty($detail['pg_status']) && isset($order->status)) $detail['pg_status'] = (string) $order->status;
+        $detail['pg_status'] = $detail['lifecycle']['provider_status'] ?? ($awaiting ? Orders::STATUS_ON_HOLD : ($detail['pg_status'] ?? $displayStatus));
 
         $panel = $order->panel_id ? Panels::find($order->panel_id) : null;
         $user = $order->user_id ? User::find($order->user_id) : null;
@@ -296,15 +298,15 @@ class WpSyncService
             'sub_id' => (string) $order->sub_id,
             'subscription_url' => (string) ($detail['subscription_url'] ?? $order->sub_id),
             'plan' => $order->plan,
-            'status' => (string) $order->status,
-            'status_label' => $this->orderStatusLabel($order->status),
+            'status' => $displayStatus,
+            'status_label' => $this->orderStatusLabel($displayStatus),
             'panel_id' => $order->panel_id,
             'panel_name' => $panel?->name,
             'panel_url' => $panel?->url,
             'inbound_id' => $order->inbound_id,
             'system_type' => $order->system_type ?: 'bot',
             'source' => $order->system_type ?: 'bot',
-            'expire_at' => optional($order->expire_at)->toDateTimeString(),
+            'expire_at' => $awaiting ? null : optional($order->expire_at)->toDateTimeString(),
             'created_at' => optional($order->created_at)->toDateTimeString(),
             'updated_at' => optional($order->updated_at)->toDateTimeString(),
             'detail' => $detail,
@@ -422,7 +424,8 @@ class WpSyncService
         return match ((string) $status) {
             '1', 'created', 'active' => 'فعال',
             '0', 'data_exhausted', 'limited' => 'اتمام حجم',
-            '2', 'suspended', 'expired', 'on_hold' => 'اتمام زمان (معلق)',
+            'on_hold' => 'در انتظار اتصال',
+            '2', 'suspended', 'expired' => 'اتمام زمان (معلق)',
             'inactive', 'cancelled', 'disabled', '-1', '-2' => 'غیرفعال',
             'pending', 'waiting_review', 'review' => 'در انتظار بررسی',
             'deleted' => 'حذف شده',

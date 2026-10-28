@@ -42,6 +42,7 @@ class PasarGuardReceiptFulfillmentTest extends TestCase
             $t->string('system_type')->default('pasarguard'); $t->string('status'); $t->json('detail')->nullable();
             $t->integer('reminded')->default(0); $t->timestamp('expire_at'); $t->timestamps();
         });
+        (require database_path('migrations/2026_10_28_000000_allow_pending_order_expiry.php'))->up();
         DB::table('users')->insert([
             ['id' => 1, 'tel_id' => '1001', 'is_admin' => '1', 'status' => 1, 'balance' => 0],
             ['id' => 2, 'tel_id' => '2002', 'is_admin' => '0', 'status' => 1, 'balance' => 1000000],
@@ -100,6 +101,8 @@ class PasarGuardReceiptFulfillmentTest extends TestCase
         ]);
         $telegram = $this->approve($payment);
         $this->assertSame(1, Orders::count());
+        $this->assertSame(Orders::STATUS_ON_HOLD, Orders::first()->status);
+        $this->assertNull(Orders::first()->expire_at);
         $this->assertSame(0, (int) DB::table('pre_orders')->value('count_left'));
         $this->assertStringContainsString('https://sub.test/sub/42', $telegram->text());
         $this->assertStringNotContainsString('https://sub.testhttps://', $telegram->text());
@@ -177,14 +180,16 @@ class PasarGuardReceiptFulfillmentTest extends TestCase
     public function test_extra_volume_keeps_on_hold_expiration_and_adds_to_existing_limit(): void
     {
         $payment = $this->payment(3);
-        $expiry = Orders::first()->expire_at;
+        Orders::first()->update(['status' => Orders::STATUS_ON_HOLD, 'expire_at' => null,
+            'detail' => ['lifecycle' => ['provider_status' => Orders::STATUS_ON_HOLD]]]);
         Http::fake(['*' => Http::sequence()
             ->push(['id' => 42, 'status' => 'on_hold', 'expire' => null, 'data_limit' => 20 * 1073741824])
             ->push(['id' => 42, 'status' => 'on_hold'])]);
         $telegram = $this->approve($payment);
         Http::assertSent(fn ($r) => $r->method() === 'PUT' && $r['data_limit'] === 25 * 1073741824
             && !array_key_exists('expire', $r->data()) && !array_key_exists('status', $r->data()));
-        $this->assertTrue(Orders::first()->expire_at->equalTo($expiry));
+        $this->assertNull(Orders::first()->expire_at);
+        $this->assertSame(Orders::STATUS_ON_HOLD, Orders::first()->status);
         $this->assertStringContainsString('خرید حجم سرویس با موفقیت', $telegram->text());
         $this->approve($payment);
         Http::assertSentCount(2);

@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Lib\Jdf;
 use App\Lib\PasarGuard;
 use App\Models\Orders;
 use App\Models\Panels;
@@ -24,6 +25,50 @@ class OrderLifecycleService
         '-2',
     ];
 
+    /** A provider-confirmed waiting service has no running expiry clock. */
+    public function isAwaitingConnection(Orders $order): bool
+    {
+        if ($this->shouldSkipProviderRefresh($order)) {
+            return false;
+        }
+        $provider = $order->detail['lifecycle']['provider_status'] ?? $order->detail['pg_status'] ?? null;
+
+        return ($provider ?? (string) $order->status) === Orders::STATUS_ON_HOLD;
+    }
+
+    /** Distinguish absent/invalid expiry from an explicit provider null or zero. */
+    public function providerExpiry(array $remote, ?Carbon $fallback = null): ?Carbon
+    {
+        if (($remote['status'] ?? null) === Orders::STATUS_ON_HOLD) {
+            return null;
+        }
+        if (! array_key_exists('expire', $remote)) {
+            return $fallback;
+        }
+        $value = $remote['expire'];
+        if ($value === null || $value === 0 || $value === '0') {
+            return null;
+        }
+        try {
+            if (is_numeric($value)) {
+                return (float) $value > 0 ? Carbon::createFromTimestamp((float) $value, config('app.timezone')) : $fallback;
+            }
+            return is_string($value) && trim($value) !== ''
+                ? Carbon::parse($value)->timezone(config('app.timezone')) : $fallback;
+        } catch (Throwable) {
+            return $fallback;
+        }
+    }
+
+    public function expiryLabel(Orders $order): string
+    {
+        if ($this->isAwaitingConnection($order)) {
+            return 'بعد از اولین اتصال نمایش داده می‌شود';
+        }
+
+        return $order->expire_at ? (new Jdf)->jdate('H:i:s d-m-Y', $order->expire_at->timestamp) : 'تاریخ پایان تعیین نشده';
+    }
+
     /**
      * Time-based transitions are local and cheap, so run them before every list.
      */
@@ -35,6 +80,9 @@ class OrderLifecycleService
         $expiredQuery = Orders::query()
             ->when($userId !== null, fn (Builder $query) => $query->where('user_id', $userId))
             ->whereNotNull('expire_at')
+            ->where('status', '!=', Orders::STATUS_ON_HOLD)
+            ->where(fn ($q) => $q->whereNull('detail->lifecycle->provider_status')->orWhere('detail->lifecycle->provider_status', '!=', Orders::STATUS_ON_HOLD))
+            ->where(fn ($q) => $q->whereNotNull('detail->lifecycle->provider_status')->orWhereNull('detail->pg_status')->orWhere('detail->pg_status', '!=', Orders::STATUS_ON_HOLD))
             ->whereNotIn('status', self::INACTIVE_VALUES);
 
         (clone $expiredQuery)
@@ -50,6 +98,15 @@ class OrderLifecycleService
     public function refreshTimeStatus(Orders $order, ?Carbon $now = null): Orders
     {
         $now ??= now();
+        if ($this->isAwaitingConnection($order)) {
+            $order->status = Orders::STATUS_ON_HOLD;
+            $order->expire_at = null;
+            if ($order->isDirty(['status', 'expire_at'])) {
+                $order->save();
+            }
+
+            return $order;
+        }
         $expireAt = $order->expire_at ? Carbon::parse($order->expire_at) : null;
 
         if (! $expireAt || $this->shouldSkipProviderRefresh($order)) {
@@ -61,7 +118,8 @@ class OrderLifecycleService
             $newStatus = Orders::STATUS_INACTIVE;
         } elseif ($expireAt->lte($now)) {
             $newStatus = Orders::STATUS_SUSPENDED;
-        } elseif ($this->normalizeStatus($order->status) === Orders::STATUS_SUSPENDED) {
+        } elseif ($this->normalizeStatus($order->status) === Orders::STATUS_SUSPENDED
+            && ! in_array($order->detail['lifecycle']['provider_status'] ?? null, ['expired', 'suspended'], true)) {
             $newStatus = Orders::STATUS_ACTIVE;
         }
 
@@ -94,6 +152,7 @@ class OrderLifecycleService
 
         return in_array($this->normalizeStatus($order->status), [
             Orders::STATUS_ACTIVE,
+            Orders::STATUS_ON_HOLD,
             Orders::STATUS_DATA_EXHAUSTED,
         ], true);
     }
@@ -130,13 +189,8 @@ class OrderLifecycleService
         }
 
         $data = $configDetail['data'];
-        if (! empty($data['expire'])) {
-            try {
-                $order->expire_at = Carbon::parse($data['expire'])->timezone(config('app.timezone'));
-            } catch (Throwable) {
-                // Keep the valid local expiry when the provider value is invalid.
-            }
-        }
+        $order->expire_at = $this->providerExpiry(['status' => $data['provider_status'] ?? null]
+            + (array_key_exists('expire', $data) ? ['expire' => $data['expire']] : []), $order->expire_at);
 
         $detail = is_array($order->detail) ? $order->detail : [];
         $lifecycleDetail = is_array($detail['lifecycle'] ?? null) ? $detail['lifecycle'] : [];
@@ -156,7 +210,8 @@ class OrderLifecycleService
         $order->status = $this->resolveProviderOrderStatus(
             $order,
             $data['provider_status'] ?? null,
-            is_numeric($data['left'] ?? null) && (float) $data['left'] <= 0
+            is_numeric($data['totalGb'] ?? null) && (float) $data['totalGb'] > 0
+                && is_numeric($data['left'] ?? null) && (float) $data['left'] <= 0
         );
 
         $order->detail = $detail;
@@ -192,6 +247,7 @@ class OrderLifecycleService
 
         return match ($this->normalizeStatus($order->status)) {
             Orders::STATUS_ACTIVE => ['key' => Orders::STATUS_ACTIVE, 'icon' => '🟢', 'label' => 'فعال', 'priority' => 1],
+            Orders::STATUS_ON_HOLD => ['key' => Orders::STATUS_ON_HOLD, 'icon' => '🟣', 'label' => 'در انتظار اتصال', 'priority' => 1],
             Orders::STATUS_DATA_EXHAUSTED => ['key' => Orders::STATUS_DATA_EXHAUSTED, 'icon' => '🟠', 'label' => 'اتمام حجم', 'priority' => 2],
             Orders::STATUS_SUSPENDED => ['key' => Orders::STATUS_SUSPENDED, 'icon' => '🔵', 'label' => 'اتمام زمان (معلق)', 'priority' => 3],
             default => ['key' => Orders::STATUS_INACTIVE, 'icon' => '🔴', 'label' => 'غیرفعال', 'priority' => 4],
@@ -201,9 +257,9 @@ class OrderLifecycleService
     public function orderByStatus(Builder $query): Builder
     {
         return $query->orderByRaw("CASE
-            WHEN status IN ('active', '1', 'created') THEN 1
+            WHEN status IN ('active', '1', 'created', 'on_hold') THEN 1
             WHEN status IN ('data_exhausted', '0', 'limited') THEN 2
-            WHEN status IN ('suspended', 'expired', '2', 'on_hold') THEN 3
+            WHEN status IN ('suspended', 'expired', '2') THEN 3
             ELSE 4 END");
     }
 
@@ -375,13 +431,7 @@ class OrderLifecycleService
 
     private function applyPasarguardListStatus(Orders $order, array $remoteUser): void
     {
-        if (! empty($remoteUser['expire'])) {
-            try {
-                $order->expire_at = Carbon::parse($remoteUser['expire'])->timezone(config('app.timezone'));
-            } catch (Throwable) {
-                // An invalid remote expiry must not erase the valid local value.
-            }
-        }
+        $order->expire_at = $this->providerExpiry($remoteUser, $order->expire_at);
 
         $order->status = $this->resolveProviderOrderStatus(
             $order,
@@ -410,10 +460,6 @@ class OrderLifecycleService
                 'last_checked_at' => now()->toDateTimeString(),
             ]);
         }
-        // Explicit null is unlimited/on-hold, not the previous plan's expiry.
-        if (array_key_exists('expire', $remoteUser) && $remoteUser['expire'] === null) {
-            $order->expire_at = null;
-        }
         $order->detail = $detail;
         app(OrderCountryService::class)->observe($order, $remoteUser);
         $order->saveQuietly();
@@ -431,10 +477,16 @@ class OrderLifecycleService
             return Orders::STATUS_INACTIVE;
         }
 
-        if (in_array($providerStatus, ['suspended', 'expired', 'on_hold'], true)) {
-            return $this->expiryStatus($order) === Orders::STATUS_INACTIVE
-                ? Orders::STATUS_INACTIVE
-                : Orders::STATUS_SUSPENDED;
+        if ($providerStatus === Orders::STATUS_ON_HOLD) {
+            return Orders::STATUS_ON_HOLD;
+        }
+
+        if ($expiryStatus = $this->expiryStatus($order)) {
+            return $expiryStatus;
+        }
+
+        if (in_array($providerStatus, ['suspended', 'expired'], true)) {
+            return Orders::STATUS_SUSPENDED;
         }
 
         if ($providerStatus === 'limited' || $dataIsExhausted) {
@@ -502,6 +554,7 @@ class OrderLifecycleService
                 continue;
             }
             if ($order->isSiteManagedDedicated() || $this->shouldSkipProviderRefresh($order)
+                || $this->isAwaitingConnection($order)
                 || ! $order->expire_at || $order->expire_at->copy()->addDays(self::RENEWAL_GRACE_DAYS)->gt(now())) {
                 $schedule->refresh($order);
 
@@ -665,7 +718,8 @@ class OrderLifecycleService
         return match ((string) $status) {
             '1', 'active', 'created' => Orders::STATUS_ACTIVE,
             '0', 'data_exhausted', 'limited' => Orders::STATUS_DATA_EXHAUSTED,
-            '2', 'suspended', 'expired', 'on_hold' => Orders::STATUS_SUSPENDED,
+            'on_hold' => Orders::STATUS_ON_HOLD,
+            '2', 'suspended', 'expired' => Orders::STATUS_SUSPENDED,
             default => Orders::STATUS_INACTIVE,
         };
     }

@@ -1005,16 +1005,7 @@ function getConfigDetail($order)
         $usedBytes = is_numeric($result['used_traffic'] ?? null) ? (float) $result['used_traffic'] : 0;
         $totalGb = byteToGb($totalBytes);
         $totalUsed = byteToGb($usedBytes);
-        $expire = optional($order->expire_at)->format('Y-m-d H:i:s');
-        if (!empty($result['expire'])) {
-            try {
-                $expire = Carbon::parse($result['expire'])
-                    ->timezone(config('app.timezone'))
-                    ->format('Y-m-d H:i:s');
-            } catch (Throwable) {
-                // Keep the local expiry when the provider returns an invalid date.
-            }
-        }
+        $expire = app(\App\Services\OrderLifecycleService::class)->providerExpiry($result, $order->expire_at)?->format('Y-m-d H:i:s');
         $left = $totalGb - $totalUsed;
         $code = $order->detail['code'] ?? null;
         // All-country PasarGuard orders use their subscription URL. Fetching a

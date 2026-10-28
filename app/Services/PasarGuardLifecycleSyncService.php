@@ -55,7 +55,7 @@ class PasarGuardLifecycleSyncService
                     }
                     if ((int) $order->panel_id !== (int) $panel->id || $order->isSiteManagedDedicated()
                         || $lifecycle->shouldSkipProviderRefresh($order)
-                        || ($order->expire_at && $order->expire_at->copy()->addDays(OrderLifecycleService::RENEWAL_GRACE_DAYS)->lte(now()))) {
+                        || (! $lifecycle->isAwaitingConnection($order) && $order->expire_at && $order->expire_at->copy()->addDays(OrderLifecycleService::RENEWAL_GRACE_DAYS)->lte(now()))) {
                         $schedule->refresh($order);
 
                         continue;

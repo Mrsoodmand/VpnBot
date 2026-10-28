@@ -18,6 +18,8 @@ class Orders extends Model
 
     public const STATUS_ACTIVE = 'active';
 
+    public const STATUS_ON_HOLD = 'on_hold';
+
     public const STATUS_SUSPENDED = 'suspended';
 
     /** Keep website-only dedicated services out of bot queries, including old imports. */

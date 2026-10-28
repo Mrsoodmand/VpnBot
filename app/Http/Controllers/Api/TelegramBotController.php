@@ -3128,16 +3128,21 @@ class TelegramBotController extends Controller
                     'panel_id' => $panel->id,
                     'inbound_id' => $inboundId,
                     'system_type' => 'pasarguard',
-                    'expire_at' => Carbon::now()->addDays((int)$plan->days)->format('Y-m-d H:i:s'),
-                    'status' => 1,
+                    'expire_at' => null,
+                    'status' => Orders::STATUS_ON_HOLD,
                     'detail' => [
                         'code' => $config,
                         'preOrderId' => $preOrder->id,
                         'is_all_countries' => !empty($orderDetail['pasarguard-id']),
                         'country-id' => $orderCountryId,
                         'country' => $orderCountryName,
+                        'lifecycle' => ['provider_status' => Orders::STATUS_ON_HOLD],
                     ],
                 ]);
+
+                // Reuse the creation/retry response; an already-connected user may now be active.
+                app(OrderLifecycleService::class)->applyPasarguardSnapshot($Order,
+                    ($result['user'] ?? []) + ['status' => Orders::STATUS_ON_HOLD]);
 
                 // Save each completed item before the next API request in a bulk order.
                 $remaining = max(0, (int) $preOrder->count_left - 1);
@@ -3417,7 +3422,7 @@ $codeText
         if ($list->count() == 0) {
             $text .= "❌ موردی یافت نشد.";
         } else {
-            $text .= "🟢 فعال | 🟠 حجم تمام\n";
+            $text .= "🟢 فعال | 🟣 در انتظار اتصال\n🟠 حجم تمام\n";
             $text .= "🔵 زمان تمام | 🔴 لغو/غیرفعال\n\n";
             $text .= "برای مشاهده جزئیات روی سفارش کلیک کنید 👇\n\n";
         }
@@ -3614,8 +3619,7 @@ $codeText
         ];
 
 
-        $jdf = new Jdf();
-        $expireTime = $order->expire_at ? $jdf->jdate('H:i:s d-m-Y', strtotime($order->expire_at)) : 'اطلاعات یافت نشد';
+        $expireTime = $lifecycle->expiryLabel($order);
 
         $warning = '';
         if ($configDetail['status'] ?? false) {
@@ -4353,6 +4357,7 @@ $codeText
                 $orderDetail = is_array($order->detail) ? $order->detail : [];
                 $lifecycleDetail = is_array($orderDetail['lifecycle'] ?? null) ? $orderDetail['lifecycle'] : [];
                 unset($lifecycleDetail['remote_disabled'], $lifecycleDetail['cancelled_at']);
+                $lifecycleDetail['provider_status'] = $result['status'] ?? 'active';
                 $orderDetail['lifecycle'] = $lifecycleDetail;
                 $order->detail = $orderDetail;
                 $order->save();
@@ -4758,11 +4763,17 @@ $codeText
                 'data_limit' => (int) $result['data_limit'] + $band,
             ];
             // Buying traffic must not move the expiry or start an on-hold service.
-            if (($result['status'] ?? '') !== 'on_hold') $data['status'] = 'active';
+            $wasOnHold = ($result['status'] ?? '') === Orders::STATUS_ON_HOLD;
+            if (!$wasOnHold) $data['status'] = 'active';
             $result = app(PasarGuardPaymentService::class)->updateAccount($pasarGuard, $payment, (string) $order->uid, $result, $data, (int) $panel->id);
 
             if (is_array($result) && !empty($result['id']) && ($result['status'] ?? false) !== false) {
-                $order->status = Orders::STATUS_ACTIVE;
+                $order->status = ($result['status'] ?? ($wasOnHold ? 'on_hold' : 'active')) === 'on_hold'
+                    ? Orders::STATUS_ON_HOLD : Orders::STATUS_ACTIVE;
+                if ($order->status === Orders::STATUS_ON_HOLD) $order->expire_at = null;
+                $orderDetail = $order->detail ?? [];
+                $orderDetail['lifecycle']['provider_status'] = $result['status'] ?? $order->status;
+                $order->detail = $orderDetail;
                 $order->reminded = 0;
                 $order->save();
                 $caption = headTitle('✅ نتیجهٔ خرید حجم')."خرید حجم سرویس با موفقیت انجام شد.\n\n{$remarkLine}";
@@ -6482,8 +6493,6 @@ $codeText
             ],
         ];
 
-        $jdf = new Jdf();
-
         if ($lifecycle->shouldSkipProviderRefresh($order)) {
             $configDetail = ['status' => false];
         } else {
@@ -6504,14 +6513,12 @@ $codeText
             $totalUsed = $configDetail['data']['totalUsed'];
             $left = $configDetail['data']['left'];
             $code = $configDetail['data']['code'];
-            $expireTime = $configDetail['data']['code'] ? $jdf->jdate('H:i:s d-m-Y', strtotime($configDetail['data']['expire'])) : $jdf->jdate('H:i:s d-m-Y', strtotime($order->expire_at));
         } else {
             $cached = is_array($detail['lifecycle'] ?? null) ? $detail['lifecycle'] : [];
             $totalGb = $cached['total_gb'] ?? 'نامشخص';
             $totalUsed = $cached['used_gb'] ?? 'نامشخص';
             $left = $cached['left_gb'] ?? 'نامشخص';
             $code = $detail['code'] ?? null;
-            $expireTime = $order->expire_at ? $jdf->jdate('H:i:s d-m-Y', strtotime($order->expire_at)) : 'نامشخص';
         }
 
 
@@ -6522,6 +6529,7 @@ $codeText
 
         $message = headTitle("📄 جزئیات سفارش #{$order->id}");
         $status = $lifecycle->statusMeta($order->fresh());
+        $expireTime = $lifecycle->expiryLabel($order->fresh());
         $countryLabel = app(OrderCountryResolver::class)->resolve([$order])[$order->id];
         $message .= '<b>کشور:</b> '.htmlspecialchars($countryLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')."\n";
         $message .= "<b>وضعیت:</b> {$status['icon']} {$status['label']}\n";
