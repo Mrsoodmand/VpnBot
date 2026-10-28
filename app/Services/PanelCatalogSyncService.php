@@ -50,30 +50,62 @@ class PanelCatalogSyncService
 
     public function sync(Panels $panel): int
     {
+        // Lock before fetching, so a delayed older snapshot cannot undo a newer import.
+        $lock = Cache::lock('panel:catalog:sync:'.$panel->id, 300);
+        if (! $lock->get()) {
+            throw new RuntimeException('دریافت گروه‌های این پنل در حال انجام است؛ کمی بعد دوباره تلاش کنید.');
+        }
+        try {
+            return $this->import($panel);
+        } finally {
+            $lock->release();
+        }
+    }
+
+    private function groups(PasarGuard $client): array
+    {
+        $items = [];
+        $seen = [];
+        $total = null;
+        $deadline = microtime(true) + 180;
+        do {
+            if (microtime(true) >= $deadline) {
+                throw new RuntimeException('دریافت گروه‌ها بیش از حد طول کشید؛ اطلاعات قبلی حفظ شد.');
+            }
+            $response = $client->getGroups(['offset' => count($items), 'limit' => 100]);
+            if (! is_array($response) || ($response['status'] ?? true) === false
+                || ! is_array($response['groups'] ?? null) || ! array_is_list($response['groups'])) {
+                throw new RuntimeException('دریافت گروه‌ها ناموفق بود؛ هیچ اتصالی تغییر نکرد.');
+            }
+            // PasarGuard 5.5 supplies total. Without it a partial page is not a deletion snapshot.
+            $count = $response['total'] ?? null;
+            if (! is_int($count) || $count < 0 || $count > 10000 || ($total !== null && $count !== $total)) {
+                throw new RuntimeException('تعداد کل گروه‌ها معتبر یا ثابت نیست؛ اطلاعات قبلی حفظ شد. دوباره دریافت کنید.');
+            }
+            $total = $count;
+            foreach ($response['groups'] as $item) {
+                $id = is_array($item) ? filter_var($item['id'] ?? null, FILTER_VALIDATE_INT) : false;
+                if (! $id || $id < 1 || isset($seen[$id]) || ! is_string($item['name'] ?? null)) {
+                    throw new RuntimeException('ساختار یا صفحه‌بندی فهرست گروه‌ها معتبر نیست؛ اطلاعات قبلی حفظ شد.');
+                }
+                $seen[$id] = true;
+                $items[] = $item;
+            }
+            if (count($items) > $total || (! $response['groups'] && count($items) !== $total)) {
+                throw new RuntimeException('فهرست گروه‌ها کامل نیست؛ اطلاعات قبلی حفظ شد.');
+            }
+        } while (count($items) < $total);
+
+        return $items;
+    }
+
+    private function import(Panels $panel): int
+    {
         $login = $this->credentials($panel);
         try {
             if ($panel->system_type === 'pasarguard') {
                 $client = new PasarGuard($login);
-                $response = $client->getGroups();
-                if (! is_array($response) || ! isset($response['groups']) || ! is_array($response['groups']) || ($response['status'] ?? true) === false) {
-                    throw new RuntimeException('دریافت گروه‌ها ناموفق بود؛ هیچ اتصالی تغییر نکرد.');
-                }
-                $items = $response['groups'];
-                $total = isset($response['total']) ? (int) $response['total'] : count($items);
-                while (count($items) < $total && count($items) < 10000) {
-                    $next = $client->getGroups(['offset' => count($items), 'limit' => 100]);
-                    if (! is_array($next) || empty($next['groups']) || ! is_array($next['groups']) || ($next['status'] ?? true) === false) {
-                        throw new RuntimeException('فهرست گروه‌ها ناقص دریافت شد؛ اطلاعات قبلی حفظ شد.');
-                    }
-                    if (array_intersect(array_column($items, 'id'), array_column($next['groups'], 'id'))) {
-                        throw new RuntimeException('صفحه‌بندی پنل تکراری است؛ اطلاعات قبلی حفظ شد.');
-                    }
-                    $items = array_merge($items, $next['groups']);
-                }
-                if (count($items) !== $total) {
-                    throw new RuntimeException('فهرست گروه‌ها کامل نیست؛ اطلاعات قبلی حفظ شد.');
-                }
-                $complete = isset($response['total']);
+                $items = $this->groups($client);
             } elseif ($panel->system_type === 'sanaie') {
                 $session = loginToSanaie($login);
                 if (empty($session['session'])) {
@@ -84,7 +116,6 @@ class PanelCatalogSyncService
                     throw new RuntimeException('دریافت اینباندها انجام نشد؛ هیچ اتصالی تغییر نکرد.');
                 }
                 $items = $response['inbounds'];
-                $complete = true;
             } else {
                 throw new RuntimeException('سیستم پنل مشخص نیست.');
             }
@@ -100,7 +131,7 @@ class PanelCatalogSyncService
             $ids[] = (int) $item['id'];
         }
 
-        return DB::transaction(function () use ($panel, $items, $ids, $complete) {
+        return DB::transaction(function () use ($panel, $items, $ids) {
             // Serialize imports for one panel; preserve local country assignments and sale switches.
             Panels::whereKey($panel->id)->lockForUpdate()->first();
             foreach ($items as $item) {
@@ -127,14 +158,13 @@ class PanelCatalogSyncService
                 }
                 $route->save();
             }
-            if ($complete) {
-                foreach (Inbounds::where('panel_id', $panel->id)->whereNotIn('inbound_id', $ids)->get() as $missing) {
-                    $setting = json_decode((string) $missing->setting, true) ?: [];
-                    $setting['_bot_catalog_missing'] = true;
-                    $missing->setting = json_encode($setting);
-                    $missing->status = -1;
-                    $missing->save();
-                }
+            // Keep IDs and country assignments for old orders; exclude only from the live catalog.
+            foreach (Inbounds::where('panel_id', $panel->id)->whereNotIn('inbound_id', $ids)->get() as $missing) {
+                $setting = json_decode((string) $missing->setting, true) ?: [];
+                $setting['_bot_catalog_missing'] = true;
+                $missing->setting = json_encode($setting);
+                $missing->status = -1;
+                $missing->save();
             }
 
             return count($items);

@@ -115,6 +115,57 @@ class OrderCountryManagementTest extends TestCase
         $this->assertSame(3, $this->panel->reads);
     }
 
+    public function test_admin_can_reassign_an_order_left_without_groups_after_deletion(): void
+    {
+        $o = $this->order();
+        $before = $o->getAttributes();
+        DB::table('inbounds')->where('id', 10)->update(['status' => -1]);
+        $this->panel->groups = [];
+        $preview = $this->countries->preview($o, 2, $this->actor);
+        $this->assertSame('بدون گروه در پاسارگارد', $preview['from']);
+        $saved = $this->countries->confirm($preview['token'], $this->actor);
+        $this->countries->confirm($preview['token'], $this->actor);
+        $this->assertSame([['group_ids' => [200]]], $this->panel->updates);
+        $this->assertSame('🇬🇧 انگلیس', $saved->detail['current_country']['label']);
+        $this->assertSame($before['expire_at'], $saved->getAttributes()['expire_at']);
+        $this->assertSame($before['plan'], $saved->plan);
+        $this->assertSame($before['uid'], $saved->uid);
+        $this->assertSame('🇩🇪 آلمان', $saved->detail['country']);
+        $this->assertSame(10, $saved->inbound_id);
+    }
+
+    public function test_invalid_group_snapshot_cannot_be_treated_as_an_empty_group(): void
+    {
+        $o = $this->order();
+        $this->panel->groups = ['invalid'];
+        try {
+            $this->countries->preview($o, 2, $this->actor);
+            $this->fail('Malformed groups must not authorize a change');
+        } catch (\RuntimeException $e) {
+            $this->assertStringContainsString('دریافت نشد', $e->getMessage());
+        }
+        $this->assertSame([], $this->panel->updates);
+    }
+
+    public function test_order_details_still_open_when_provider_has_removed_its_only_group(): void
+    {
+        $o = $this->order();
+        DB::table('inbounds')->where('id', 10)->update(['status' => -1]);
+        DB::table('panels')->where('id', 1)->update(['url' => 'https://panel.test', 'username' => 'admin', 'password' => 'test']);
+        Http::fake([
+            '*/api/admin/token' => Http::response(['access_token' => 'token']),
+            '*/api/user/by-id/7' => Http::response(['id' => 7, 'status' => 'active', 'group_ids' => [],
+                'data_limit' => 20 * 1073741824, 'used_traffic' => 1073741824, 'expire' => $o->expire_at->toIso8601String()]),
+            '*/subscription/links' => Http::response(''),
+        ]);
+        $details = getConfigDetail($o);
+        $this->assertTrue($details['status']);
+        $this->assertSame([], $details['data']['group_ids']);
+        $this->assertEquals(19, $details['data']['left']);
+        $this->assertSame('🇩🇪 آلمان', app(OrderCountryResolver::class)->resolve([$o])[$o->id]);
+        $this->assertSame('7', $o->fresh()->uid);
+    }
+
     public function test_failed_remote_change_never_changes_the_local_country(): void
     {
         $o = $this->order();

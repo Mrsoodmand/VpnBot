@@ -249,7 +249,7 @@ trait ManagesBotCatalog
             $rows[] = [$this->adminButton('✏️ '.$label, "$base|a=edit|k={$key}")];
         }
         if ($entity === 'c') {
-            $routes = app(BotCatalogService::class)->forCountry(Inbounds::query(), $item->id)->count();
+            $routes = app(BotCatalogService::class)->forCountry(Inbounds::catalogPresent(), $item->id)->count();
             $body .= "\nاتصال‌های متصل: {$routes}\n";
             $rows[] = [$this->adminButton('🔗 مدیریت اتصال‌های این کشور', "type=adminN|c={$item->id}")];
             $rows[] = [$this->adminButton('➕ اتصال اینباند / گروه', "type=adminN|a=pick|c={$item->id}")];
@@ -328,7 +328,7 @@ trait ManagesBotCatalog
                 try {
                     $service = app(PanelCatalogSyncService::class);
                     $result = $action === 'check' ? $service->check($panel) : $service->sync($panel);
-                    $body = $action === 'check' ? '✅ اتصال به پنل برقرار است.' : "✅ {$result} اتصال دریافت شد. اکنون کشور و وضعیت فروش آن‌ها را مشخص کنید.";
+                    $body = $action === 'check' ? '✅ اتصال به پنل برقرار است.' : "✅ {$result} اتصال از پنل دریافت شد.\nتنظیمات اتصال‌های موجود حفظ شد؛ اتصال‌های جدید غیرفعال هستند تا کشور و فروش آن‌ها را تنظیم کنید.\nاتصال‌های ناموجود به آرشیو منتقل شدند؛ سفارش‌های قبلی حفظ شده‌اند.";
                 } catch (\RuntimeException $e) {
                     $body = '❌ '.$this->escapeHtml($e->getMessage());
                 }
@@ -370,6 +370,16 @@ trait ManagesBotCatalog
             $route = Inbounds::with('panel')->find($id);
             if (! $route || ! $route->panel) {
                 return $this->adminPage('اتصال', 'این اتصال یا پنل آن پیدا نشد.', [], $back);
+            }
+            if ($route->isCatalogMissing()) {
+                $countryName = Countries::find($route->country_id)?->name ?? 'بدون کشور';
+                $body = 'نام: '.$this->escapeHtml($route->remark)."\nپنل: ".$this->escapeHtml($route->panel->name).
+                    "\nکشور قبلی: ".$this->escapeHtml($countryName).
+                    "\nوضعیت: در آخرین دریافت از پنل موجود نیست؛ فروش متوقف است.\n\nسفارش‌های قبلی و اطلاعات آن‌ها محفوظ است. اگر سرویس کاربر بدون گروه شده، از «تغییر کشور» در جزئیات سفارش، مقصد فعال انتخاب کنید.";
+
+                return $this->adminPage('🗂 اتصال آرشیوشده', $body,
+                    [[$this->adminButton('🔄 دریافت مجدد از پنل', "type=adminN|a=sync|p={$route->panel_id}")]],
+                    'type=adminN|a=arch'.($countryId ? "|c={$countryId}" : "|p={$route->panel_id}"));
             }
             $effectiveCountry = $route->country_id ?? ($route->panel->system_type === 'sanaie' ? $route->panel->country_id : null);
             if ($action === 'assign') {
@@ -442,21 +452,33 @@ trait ManagesBotCatalog
         if (! empty($type['u'])) {
             $query->where(fn ($q) => $q->where('country_id', 0)->orWhere(fn ($q) => $q->whereNull('country_id')->whereHas('panel', fn ($p) => $p->where('system_type', 'pasarguard')->orWhereNull('country_id')->orWhere('country_id', 0))));
         }
-        $list = $query->orderByDesc('id')->paginate(10, ['*'], 'page', $page);
+        $archived = $action === 'arch';
+        $missingCount = $action !== 'pick' ? (clone $query)->catalogMissing()->count() : 0;
+        $archived ? $query->catalogMissing() : $query->catalogPresent();
+        $list = $query->orderByRaw('CASE WHEN status = ? THEN 0 ELSE 1 END', ['1'])
+            ->orderByDesc('id')->paginate(10, ['*'], 'page', $page);
         foreach ($list as $route) {
-            $rows[] = [$this->adminButton(((int) $route->status === 1 ? '🟢 ' : '🔴 ').$route->remark.' · '.$route->panel->name,
+            $rows[] = [$this->adminButton(($archived ? '🗂 ' : ((int) $route->status === 1 ? '🟢 ' : '🔴 ')).$route->remark.' · '.$route->panel->name,
                 'type=adminN|a='.($action === 'pick' ? 'set' : 'show')."|id={$route->id}".($countryId ? "|c={$countryId}" : ''))];
         }
         $filter = "adminN|a={$action}".$context.(! empty($type['u']) ? '|u=1' : '');
         if ($pagination = $this->paginationFooterButton($list, $page, $filter)) {
             $rows[] = $pagination;
         }
-        if ($countryId && $action !== 'pick') {
+        if ($countryId && ! in_array($action, ['pick', 'arch'], true)) {
             $rows[] = [$this->adminButton('➕ اتصال گروه / اینباند', "type=adminN|a=pick|c={$countryId}")];
+        }
+        if ($archived) {
+            $rows[] = [$this->adminButton('🔗 اتصال‌های موجود', 'type=adminN'.$context.(! empty($type['u']) ? '|u=1' : ''))];
+        } elseif ($missingCount > 0) {
+            $rows[] = [$this->adminButton("🗂 آرشیو اتصال‌های ناموجود ({$missingCount})", 'type=adminN|a=arch'.$context.(! empty($type['u']) ? '|u=1' : ''))];
         }
         $rows[] = [$this->adminButton('🔄 دریافت از پنل', 'type=adminN|a='.($panelId ? 'sync' : 'panels').$context)];
 
-        return $this->adminPage('🔗 اتصال‌های کشور', $list->total() ? "تعداد: {$list->total()}\nبرای مدیریت، اتصال را باز کنید." : 'اتصالی پیدا نشد؛ ابتدا از پنل دریافت کنید.', $rows, $back);
+        return $this->adminPage($archived ? '🗂 آرشیو اتصال‌ها' : '🔗 اتصال‌های کشور',
+            "تعداد: {$list->total()} · صفحه {$list->currentPage()} از {$list->lastPage()}\n".
+            ($archived ? 'این اتصال‌ها در آخرین دریافت از پنل موجود نبودند. سفارش‌های قبلی حفظ شده‌اند.' :
+                ($list->total() ? 'اتصال‌های فعال در ابتدای فهرست هستند. برای مدیریت، اتصال را باز کنید.' : 'اتصالی پیدا نشد؛ از پنل دریافت کنید.')), $rows, $back);
     }
 
     protected function adminAllCountryPercent()

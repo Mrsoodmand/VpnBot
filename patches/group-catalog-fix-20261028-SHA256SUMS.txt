@@ -1,0 +1,4 @@
+369c1d3944128cb4191debf332e3485a393e4f7d0e67644c83d0387a3dc563be  bot-group-catalog-fix-20261028.zip
+23d1d437c2c375c1d271cd7fd2bcd4a39295ca1b117c35f7d07acf42d84902c8  before-group-catalog-fix-20261028-161452.zip
+e55dea305c4c591cd8e486f78c56eb6e34ae56f749db531b7eab6ecadbd91fe4  group-catalog-fix-20261028-README.fa.txt
+01cbc6de940843e91479c0a6cc4e962c9ef84538e197ec1f57c1a0d48b7ab42f  group-catalog-fix-20261028.patch

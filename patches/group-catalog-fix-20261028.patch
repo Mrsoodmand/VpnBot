@@ -1,0 +1,518 @@
+diff --git a/app/Http/Controllers/Api/Concerns/ManagesBotCatalog.php b/app/Http/Controllers/Api/Concerns/ManagesBotCatalog.php
+index 3937404..1da6c7d 100644
+--- a/app/Http/Controllers/Api/Concerns/ManagesBotCatalog.php
++++ b/app/Http/Controllers/Api/Concerns/ManagesBotCatalog.php
+@@ -249,7 +249,7 @@ protected function adminCatalog($type = [])
+             $rows[] = [$this->adminButton('✏️ '.$label, "$base|a=edit|k={$key}")];
+         }
+         if ($entity === 'c') {
+-            $routes = app(BotCatalogService::class)->forCountry(Inbounds::query(), $item->id)->count();
++            $routes = app(BotCatalogService::class)->forCountry(Inbounds::catalogPresent(), $item->id)->count();
+             $body .= "\nاتصال‌های متصل: {$routes}\n";
+             $rows[] = [$this->adminButton('🔗 مدیریت اتصال‌های این کشور', "type=adminN|c={$item->id}")];
+             $rows[] = [$this->adminButton('➕ اتصال اینباند / گروه', "type=adminN|a=pick|c={$item->id}")];
+@@ -328,7 +328,7 @@ protected function adminNetwork($type = [])
+                 try {
+                     $service = app(PanelCatalogSyncService::class);
+                     $result = $action === 'check' ? $service->check($panel) : $service->sync($panel);
+-                    $body = $action === 'check' ? '✅ اتصال به پنل برقرار است.' : "✅ {$result} اتصال دریافت شد. اکنون کشور و وضعیت فروش آن‌ها را مشخص کنید.";
++                    $body = $action === 'check' ? '✅ اتصال به پنل برقرار است.' : "✅ {$result} اتصال از پنل دریافت شد.\nتنظیمات اتصال‌های موجود حفظ شد؛ اتصال‌های جدید غیرفعال هستند تا کشور و فروش آن‌ها را تنظیم کنید.\nاتصال‌های ناموجود به آرشیو منتقل شدند؛ سفارش‌های قبلی حفظ شده‌اند.";
+                 } catch (\RuntimeException $e) {
+                     $body = '❌ '.$this->escapeHtml($e->getMessage());
+                 }
+@@ -371,6 +371,16 @@ protected function adminNetwork($type = [])
+             if (! $route || ! $route->panel) {
+                 return $this->adminPage('اتصال', 'این اتصال یا پنل آن پیدا نشد.', [], $back);
+             }
++            if ($route->isCatalogMissing()) {
++                $countryName = Countries::find($route->country_id)?->name ?? 'بدون کشور';
++                $body = 'نام: '.$this->escapeHtml($route->remark)."\nپنل: ".$this->escapeHtml($route->panel->name).
++                    "\nکشور قبلی: ".$this->escapeHtml($countryName).
++                    "\nوضعیت: در آخرین دریافت از پنل موجود نیست؛ فروش متوقف است.\n\nسفارش‌های قبلی و اطلاعات آن‌ها محفوظ است. اگر سرویس کاربر بدون گروه شده، از «تغییر کشور» در جزئیات سفارش، مقصد فعال انتخاب کنید.";
++
++                return $this->adminPage('🗂 اتصال آرشیوشده', $body,
++                    [[$this->adminButton('🔄 دریافت مجدد از پنل', "type=adminN|a=sync|p={$route->panel_id}")]],
++                    'type=adminN|a=arch'.($countryId ? "|c={$countryId}" : "|p={$route->panel_id}"));
++            }
+             $effectiveCountry = $route->country_id ?? ($route->panel->system_type === 'sanaie' ? $route->panel->country_id : null);
+             if ($action === 'assign') {
+                 $list = Countries::where('type', $route->panel->panel_type)->orderBy('name')->paginate(10, ['*'], 'page', $page);
+@@ -442,21 +452,33 @@ protected function adminNetwork($type = [])
+         if (! empty($type['u'])) {
+             $query->where(fn ($q) => $q->where('country_id', 0)->orWhere(fn ($q) => $q->whereNull('country_id')->whereHas('panel', fn ($p) => $p->where('system_type', 'pasarguard')->orWhereNull('country_id')->orWhere('country_id', 0))));
+         }
+-        $list = $query->orderByDesc('id')->paginate(10, ['*'], 'page', $page);
++        $archived = $action === 'arch';
++        $missingCount = $action !== 'pick' ? (clone $query)->catalogMissing()->count() : 0;
++        $archived ? $query->catalogMissing() : $query->catalogPresent();
++        $list = $query->orderByRaw('CASE WHEN status = ? THEN 0 ELSE 1 END', ['1'])
++            ->orderByDesc('id')->paginate(10, ['*'], 'page', $page);
+         foreach ($list as $route) {
+-            $rows[] = [$this->adminButton(((int) $route->status === 1 ? '🟢 ' : '🔴 ').$route->remark.' · '.$route->panel->name,
++            $rows[] = [$this->adminButton(($archived ? '🗂 ' : ((int) $route->status === 1 ? '🟢 ' : '🔴 ')).$route->remark.' · '.$route->panel->name,
+                 'type=adminN|a='.($action === 'pick' ? 'set' : 'show')."|id={$route->id}".($countryId ? "|c={$countryId}" : ''))];
+         }
+         $filter = "adminN|a={$action}".$context.(! empty($type['u']) ? '|u=1' : '');
+         if ($pagination = $this->paginationFooterButton($list, $page, $filter)) {
+             $rows[] = $pagination;
+         }
+-        if ($countryId && $action !== 'pick') {
++        if ($countryId && ! in_array($action, ['pick', 'arch'], true)) {
+             $rows[] = [$this->adminButton('➕ اتصال گروه / اینباند', "type=adminN|a=pick|c={$countryId}")];
+         }
++        if ($archived) {
++            $rows[] = [$this->adminButton('🔗 اتصال‌های موجود', 'type=adminN'.$context.(! empty($type['u']) ? '|u=1' : ''))];
++        } elseif ($missingCount > 0) {
++            $rows[] = [$this->adminButton("🗂 آرشیو اتصال‌های ناموجود ({$missingCount})", 'type=adminN|a=arch'.$context.(! empty($type['u']) ? '|u=1' : ''))];
++        }
+         $rows[] = [$this->adminButton('🔄 دریافت از پنل', 'type=adminN|a='.($panelId ? 'sync' : 'panels').$context)];
+ 
+-        return $this->adminPage('🔗 اتصال‌های کشور', $list->total() ? "تعداد: {$list->total()}\nبرای مدیریت، اتصال را باز کنید." : 'اتصالی پیدا نشد؛ ابتدا از پنل دریافت کنید.', $rows, $back);
++        return $this->adminPage($archived ? '🗂 آرشیو اتصال‌ها' : '🔗 اتصال‌های کشور',
++            "تعداد: {$list->total()} · صفحه {$list->currentPage()} از {$list->lastPage()}\n".
++            ($archived ? 'این اتصال‌ها در آخرین دریافت از پنل موجود نبودند. سفارش‌های قبلی حفظ شده‌اند.' :
++                ($list->total() ? 'اتصال‌های فعال در ابتدای فهرست هستند. برای مدیریت، اتصال را باز کنید.' : 'اتصالی پیدا نشد؛ از پنل دریافت کنید.')), $rows, $back);
+     }
+ 
+     protected function adminAllCountryPercent()
+diff --git a/app/Models/Inbounds.php b/app/Models/Inbounds.php
+index 3d5c8c8..dcbd4ac 100644
+--- a/app/Models/Inbounds.php
++++ b/app/Models/Inbounds.php
+@@ -2,10 +2,27 @@
+ 
+ namespace App\Models;
+ 
++use Illuminate\Database\Eloquent\Builder;
+ use Illuminate\Database\Eloquent\Model;
+ 
+ class Inbounds extends Model
+ {
++    public function scopeCatalogPresent(Builder $query): Builder
++    {
++        return $query->where(fn ($q) => $q->whereNull('setting->_bot_catalog_missing')
++            ->orWhere('setting->_bot_catalog_missing', false));
++    }
++
++    public function scopeCatalogMissing(Builder $query): Builder
++    {
++        return $query->where('setting->_bot_catalog_missing', true);
++    }
++
++    public function isCatalogMissing(): bool
++    {
++        return ! empty((json_decode((string) $this->setting, true) ?: [])['_bot_catalog_missing']);
++    }
++
+     public function panel()
+     {
+         return $this->belongsTo(Panels::class);
+diff --git a/app/Services/OrderCountryService.php b/app/Services/OrderCountryService.php
+index 41aa255..d91979c 100644
+--- a/app/Services/OrderCountryService.php
++++ b/app/Services/OrderCountryService.php
+@@ -18,7 +18,7 @@ class OrderCountryService
+ 
+     public function groups(mixed $value): ?array
+     {
+-        if (! is_array($value) || ! array_is_list($value) || ! $value || count($value) > 200) {
++        if (! is_array($value) || ! array_is_list($value) || count($value) > 200) {
+             return null;
+         }
+         $ids = [];
+@@ -160,7 +160,8 @@ protected function client(Panels $panel): PasarGuard
+     private function read(PasarGuard $client, Orders $order): array
+     {
+         $remote = $client->getUserById($order->uid);
+-        if (! is_array($remote) || (string) ($remote['id'] ?? '') !== (string) $order->uid || ! $this->groups($remote['group_ids'] ?? null)) {
++        if (! is_array($remote) || ($remote['status'] ?? null) === false
++            || (string) ($remote['id'] ?? '') !== (string) $order->uid || $this->groups($remote['group_ids'] ?? null) === null) {
+             throw new RuntimeException('گروه فعلی سرویس از پاسارگارد دریافت نشد؛ دوباره تلاش کنید.');
+         }
+ 
+@@ -180,7 +181,7 @@ public function preview(Orders $order, int $countryId, array $actor): array
+             'expected' => $this->groups($remote['group_ids']), 'target' => $option, 'actor' => $actor];
+         Cache::put('order:country:confirm:'.$token, $intent, now()->addMinutes(10));
+ 
+-        return ['token' => $token, 'from' => $from['label'] ?? 'گروه فعلی بدون کشور مشخص', 'to' => $option['label']];
++        return ['token' => $token, 'from' => $from['label'] ?? ($remote['group_ids'] === [] ? 'بدون گروه در پاسارگارد' : 'گروه فعلی بدون کشور مشخص'), 'to' => $option['label']];
+     }
+ 
+     public function confirm(string $token, array $actor): Orders
+diff --git a/app/Services/PanelCatalogSyncService.php b/app/Services/PanelCatalogSyncService.php
+index 84082d4..6f09510 100644
+--- a/app/Services/PanelCatalogSyncService.php
++++ b/app/Services/PanelCatalogSyncService.php
+@@ -49,31 +49,63 @@ public function check(Panels $panel): void
+     }
+ 
+     public function sync(Panels $panel): int
++    {
++        // Lock before fetching, so a delayed older snapshot cannot undo a newer import.
++        $lock = Cache::lock('panel:catalog:sync:'.$panel->id, 300);
++        if (! $lock->get()) {
++            throw new RuntimeException('دریافت گروه‌های این پنل در حال انجام است؛ کمی بعد دوباره تلاش کنید.');
++        }
++        try {
++            return $this->import($panel);
++        } finally {
++            $lock->release();
++        }
++    }
++
++    private function groups(PasarGuard $client): array
++    {
++        $items = [];
++        $seen = [];
++        $total = null;
++        $deadline = microtime(true) + 180;
++        do {
++            if (microtime(true) >= $deadline) {
++                throw new RuntimeException('دریافت گروه‌ها بیش از حد طول کشید؛ اطلاعات قبلی حفظ شد.');
++            }
++            $response = $client->getGroups(['offset' => count($items), 'limit' => 100]);
++            if (! is_array($response) || ($response['status'] ?? true) === false
++                || ! is_array($response['groups'] ?? null) || ! array_is_list($response['groups'])) {
++                throw new RuntimeException('دریافت گروه‌ها ناموفق بود؛ هیچ اتصالی تغییر نکرد.');
++            }
++            // PasarGuard 5.5 supplies total. Without it a partial page is not a deletion snapshot.
++            $count = $response['total'] ?? null;
++            if (! is_int($count) || $count < 0 || $count > 10000 || ($total !== null && $count !== $total)) {
++                throw new RuntimeException('تعداد کل گروه‌ها معتبر یا ثابت نیست؛ اطلاعات قبلی حفظ شد. دوباره دریافت کنید.');
++            }
++            $total = $count;
++            foreach ($response['groups'] as $item) {
++                $id = is_array($item) ? filter_var($item['id'] ?? null, FILTER_VALIDATE_INT) : false;
++                if (! $id || $id < 1 || isset($seen[$id]) || ! is_string($item['name'] ?? null)) {
++                    throw new RuntimeException('ساختار یا صفحه‌بندی فهرست گروه‌ها معتبر نیست؛ اطلاعات قبلی حفظ شد.');
++                }
++                $seen[$id] = true;
++                $items[] = $item;
++            }
++            if (count($items) > $total || (! $response['groups'] && count($items) !== $total)) {
++                throw new RuntimeException('فهرست گروه‌ها کامل نیست؛ اطلاعات قبلی حفظ شد.');
++            }
++        } while (count($items) < $total);
++
++        return $items;
++    }
++
++    private function import(Panels $panel): int
+     {
+         $login = $this->credentials($panel);
+         try {
+             if ($panel->system_type === 'pasarguard') {
+                 $client = new PasarGuard($login);
+-                $response = $client->getGroups();
+-                if (! is_array($response) || ! isset($response['groups']) || ! is_array($response['groups']) || ($response['status'] ?? true) === false) {
+-                    throw new RuntimeException('دریافت گروه‌ها ناموفق بود؛ هیچ اتصالی تغییر نکرد.');
+-                }
+-                $items = $response['groups'];
+-                $total = isset($response['total']) ? (int) $response['total'] : count($items);
+-                while (count($items) < $total && count($items) < 10000) {
+-                    $next = $client->getGroups(['offset' => count($items), 'limit' => 100]);
+-                    if (! is_array($next) || empty($next['groups']) || ! is_array($next['groups']) || ($next['status'] ?? true) === false) {
+-                        throw new RuntimeException('فهرست گروه‌ها ناقص دریافت شد؛ اطلاعات قبلی حفظ شد.');
+-                    }
+-                    if (array_intersect(array_column($items, 'id'), array_column($next['groups'], 'id'))) {
+-                        throw new RuntimeException('صفحه‌بندی پنل تکراری است؛ اطلاعات قبلی حفظ شد.');
+-                    }
+-                    $items = array_merge($items, $next['groups']);
+-                }
+-                if (count($items) !== $total) {
+-                    throw new RuntimeException('فهرست گروه‌ها کامل نیست؛ اطلاعات قبلی حفظ شد.');
+-                }
+-                $complete = isset($response['total']);
++                $items = $this->groups($client);
+             } elseif ($panel->system_type === 'sanaie') {
+                 $session = loginToSanaie($login);
+                 if (empty($session['session'])) {
+@@ -84,7 +116,6 @@ public function sync(Panels $panel): int
+                     throw new RuntimeException('دریافت اینباندها انجام نشد؛ هیچ اتصالی تغییر نکرد.');
+                 }
+                 $items = $response['inbounds'];
+-                $complete = true;
+             } else {
+                 throw new RuntimeException('سیستم پنل مشخص نیست.');
+             }
+@@ -100,7 +131,7 @@ public function sync(Panels $panel): int
+             $ids[] = (int) $item['id'];
+         }
+ 
+-        return DB::transaction(function () use ($panel, $items, $ids, $complete) {
++        return DB::transaction(function () use ($panel, $items, $ids) {
+             // Serialize imports for one panel; preserve local country assignments and sale switches.
+             Panels::whereKey($panel->id)->lockForUpdate()->first();
+             foreach ($items as $item) {
+@@ -127,14 +158,13 @@ public function sync(Panels $panel): int
+                 }
+                 $route->save();
+             }
+-            if ($complete) {
+-                foreach (Inbounds::where('panel_id', $panel->id)->whereNotIn('inbound_id', $ids)->get() as $missing) {
+-                    $setting = json_decode((string) $missing->setting, true) ?: [];
+-                    $setting['_bot_catalog_missing'] = true;
+-                    $missing->setting = json_encode($setting);
+-                    $missing->status = -1;
+-                    $missing->save();
+-                }
++            // Keep IDs and country assignments for old orders; exclude only from the live catalog.
++            foreach (Inbounds::where('panel_id', $panel->id)->whereNotIn('inbound_id', $ids)->get() as $missing) {
++                $setting = json_decode((string) $missing->setting, true) ?: [];
++                $setting['_bot_catalog_missing'] = true;
++                $missing->setting = json_encode($setting);
++                $missing->status = -1;
++                $missing->save();
+             }
+ 
+             return count($items);
+diff --git a/tests/Feature/BotAdminCatalogTest.php b/tests/Feature/BotAdminCatalogTest.php
+index 009e632..16c349c 100644
+--- a/tests/Feature/BotAdminCatalogTest.php
++++ b/tests/Feature/BotAdminCatalogTest.php
+@@ -13,9 +13,12 @@
+ use App\Models\Setting;
+ use App\Models\User;
+ use App\Services\Telegram;
++use App\Services\BotCatalogService;
++use App\Services\PanelCatalogSyncService;
+ use Carbon\Carbon;
+ use Illuminate\Database\Schema\Blueprint;
+ use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Cache;
+ use Illuminate\Support\Facades\Http;
+ use Illuminate\Support\Facades\Schema;
+ use Tests\TestCase;
+@@ -203,7 +206,7 @@ public function test_new_records_have_vip_type_and_no_service_type_selector(): v
+ 
+     public function test_country_management_reaches_connections_and_preserves_assignment_on_import(): void
+     {
+-        Http::fake(['*/api/admin/token' => Http::response(['access_token' => 'token']), '*/api/groups' => Http::response(['groups' => [['id' => 100, 'name' => 'Germany new'], ['id' => 200, 'name' => 'France']]])]);
++        Http::fake(['*/api/admin/token' => Http::response(['access_token' => 'token']), '*/api/groups*' => Http::response(['total' => 2, 'groups' => [['id' => 100, 'name' => 'Germany new'], ['id' => 200, 'name' => 'France']]])]);
+         $bot = $this->controller();
+         $bot->callback('type=adminC|e=c|a=show|id=10');
+         $this->click($bot, 'مدیریت اتصال');
+@@ -237,7 +240,7 @@ public function test_successful_connection_preserves_all_country_settings(): voi
+ 
+     public function test_failed_or_malformed_import_is_atomic(): void
+     {
+-        Http::fake(['*/api/admin/token' => Http::response(['access_token' => 'token']), '*/api/groups' => Http::response(['groups' => [['id' => 100, 'name' => 'changed'], ['id' => 0, 'name' => 'bad']]])]);
++        Http::fake(['*/api/admin/token' => Http::response(['access_token' => 'token']), '*/api/groups*' => Http::response(['total' => 2, 'groups' => [['id' => 100, 'name' => 'changed'], ['id' => 0, 'name' => 'bad']]])]);
+         $bot = $this->controller();
+         $bot->callback('type=adminGetInbounds|id=7');
+         $this->assertStringContainsString('معتبر نیست', $bot->last()['text']);
+@@ -369,7 +372,7 @@ public function test_paginated_sync_preserves_settings_and_disables_only_confirm
+             if (str_contains($request->url(), '/token')) {
+                 return Http::response(['access_token' => 'token']);
+             }
+-            if (str_contains($request->url(), 'offset=')) {
++            if ((int) $request['offset'] > 0) {
+                 return Http::response(['groups' => [['id' => 200, 'name' => 'France', 'is_disabled' => true]], 'total' => 2]);
+             }
+ 
+@@ -387,6 +390,143 @@ public function test_paginated_sync_preserves_settings_and_disables_only_confirm
+         $this->assertSame(['status' => 1, 'percent' => 70], Panels::find(7)->detail);
+     }
+ 
++    public function test_sync_fetches_every_page_and_reconciles_missing_groups_only_on_this_panel(): void
++    {
++        $groups = array_map(fn ($id) => ['id' => $id, 'name' => 'Group '.$id, 'inbound_tags' => ['vless'], 'is_disabled' => false], range(1, 205));
++        Http::fake(function ($request) use ($groups) {
++            if (str_contains($request->url(), '/token')) return Http::response(['access_token' => 'token']);
++            $this->assertSame(100, (int) $request['limit']);
++            return Http::response(['groups' => array_slice($groups, (int) $request['offset'], 100), 'total' => count($groups)]);
++        });
++        DB::table('inbounds')->insert([
++            ['id' => 21, 'panel_id' => 7, 'inbound_id' => 900, 'remark' => 'removed', 'status' => 1],
++            ['id' => 22, 'panel_id' => 8, 'inbound_id' => 901, 'remark' => 'other panel', 'status' => 1],
++        ]);
++        $this->assertSame(205, app(PanelCatalogSyncService::class)->sync(Panels::find(7)));
++        Http::assertSentCount(4); // Login and three catalog pages, never requests per order.
++        $this->assertSame(205, Inbounds::where('panel_id', 7)->catalogPresent()->count());
++        $this->assertTrue(Inbounds::find(21)->isCatalogMissing());
++        $this->assertSame('1', Inbounds::find(22)->status);
++        $this->assertSame('1', Inbounds::find(20)->status);
++        $this->assertSame(10, Inbounds::find(20)->country_id);
++        $this->assertSame('-1', Inbounds::where('panel_id', 7)->where('inbound_id', 205)->first()->status);
++    }
++
++    public function test_bad_or_incomplete_pages_do_not_archive_or_modify_any_routes(): void
++    {
++        $cases = [
++            [['groups' => [['id' => 100, 'name' => 'new']]]], // No total: completeness unknown.
++            [['groups' => [], 'total' => 'bad']],
++            [['groups' => [], 'total' => -1]],
++            [['groups' => [['id' => 100, 'name' => 'new']], 'total' => 2], ['groups' => [], 'total' => 2]],
++            [['groups' => [['id' => 100, 'name' => 'new']], 'total' => 2], ['groups' => [['id' => 200, 'name' => 'next']], 'total' => 3]],
++            [['groups' => [['id' => 100, 'name' => 'new']], 'total' => 2], ['groups' => [['id' => 100, 'name' => 'duplicate']], 'total' => 2]],
++            [['groups' => [['id' => 100, 'name' => 'new']], 'total' => 2], ['status' => false, 'message' => 'timeout']],
++            [['groups' => [['id' => 100, 'name' => 'new'], ['id' => 200, 'name' => 'extra']], 'total' => 1]],
++        ];
++        $before = Inbounds::find(20)->getAttributes();
++        Cache::put('pasarguard-token-7', 'token');
++        foreach ($cases as $pages) {
++            Http::swap(new \Illuminate\Http\Client\Factory);
++            Http::preventStrayRequests();
++            $sequence = Http::sequence();
++            foreach ($pages as $response) $sequence->push($response);
++            Http::fake(['*/api/groups*' => $sequence]);
++            try {
++                app(PanelCatalogSyncService::class)->sync(Panels::find(7));
++                $this->fail('Partial catalog must fail');
++            } catch (\RuntimeException $e) {
++                $this->assertMatchesRegularExpression('/حفظ شد|تغییر نکرد/u', $e->getMessage());
++            }
++            $this->assertSame($before, Inbounds::find(20)->getAttributes());
++            $this->assertSame(1, Inbounds::count());
++            $lock = Cache::lock('panel:catalog:sync:7', 300);
++            $this->assertTrue($lock->get());
++            $lock->release();
++        }
++    }
++
++    public function test_empty_catalog_keeps_old_orders_and_country_references_but_stops_new_sales(): void
++    {
++        DB::table('orders')->insert(['id' => 50, 'user_id' => 1, 'panel_id' => 7, 'inbound_id' => 20, 'uid' => '88',
++            'remark' => 'old customer', 'status' => 'active', 'detail' => json_encode(['country' => 'آلمان']), 'expire_at' => '2026-12-01 00:00:00']);
++        $before = Orders::find(50)->getAttributes();
++        Http::fake(['*/api/admin/token' => Http::response(['access_token' => 'token']), '*/api/groups*' => Http::response(['groups' => [], 'total' => 0])]);
++        $this->assertSame(0, app(PanelCatalogSyncService::class)->sync(Panels::find(7)));
++        $this->assertSame($before, Orders::find(50)->getAttributes());
++        $this->assertSame(10, Inbounds::find(20)->country_id);
++        $this->assertTrue(Inbounds::find(20)->isCatalogMissing());
++        $this->assertFalse(app(BotCatalogService::class)->routes(5, 10)->exists());
++        $this->assertCount(0, app(BotCatalogService::class)->allCountryPanels(5));
++        $bot = $this->controller();
++        foreach (['toggle|v=1', 'set|c=11', 'detach|ok=1'] as $action) {
++            $bot->callback('type=adminN|id=20|a='.$action);
++            $this->assertStringContainsString('آرشیوشده', $bot->last()['text']);
++            $this->assertStringContainsString('تغییر کشور', $bot->last()['text']);
++        }
++        $this->assertSame(10, Inbounds::find(20)->country_id);
++        $this->assertSame('-1', Inbounds::find(20)->status);
++    }
++
++    public function test_live_group_list_sorts_active_first_across_pages_and_separates_archive(): void
++    {
++        foreach (range(21, 44) as $id) {
++            DB::table('inbounds')->insert(['id' => $id, 'panel_id' => 7, 'inbound_id' => $id * 10, 'country_id' => 10,
++                'remark' => 'group '.$id, 'status' => $id <= 31 ? 1 : -1]);
++        }
++        DB::table('inbounds')->insert(['id' => 99, 'panel_id' => 7, 'inbound_id' => 999, 'country_id' => 10,
++            'remark' => 'REMOVED', 'status' => -1, 'setting' => json_encode(['_bot_catalog_missing' => true])]);
++        $bot = $this->controller();
++        $ids = [];
++        foreach (range(1, 3) as $page) {
++            $bot->callback('type=adminN|p=7|page='.$page);
++            foreach ($this->buttons($bot) as $button) {
++                $this->assertStringNotContainsString('REMOVED', $button['text']);
++                if (preg_match('/^type=adminN\|a=show\|id=(\d+)/', $button['callback_data'] ?? '', $match)) $ids[] = (int) $match[1];
++            }
++            $this->callbackLengths($bot);
++        }
++        $this->assertSame(array_merge(range(31, 20), range(44, 32)), $ids);
++        $this->click($bot, 'آرشیو');
++        $this->assertStringContainsString('REMOVED', json_encode($this->buttons($bot)));
++        $this->click($bot, 'REMOVED');
++        $this->assertStringNotContainsString('a=toggle', json_encode($this->buttons($bot)));
++        $bot->callback('type=adminN|a=pick|c=10');
++        $this->assertStringNotContainsString('REMOVED', json_encode($this->buttons($bot)));
++        $this->assertStringNotContainsString('a=arch', json_encode($this->buttons($bot)));
++    }
++
++    public function test_returning_group_leaves_archive_without_automatically_starting_sales(): void
++    {
++        $route = Inbounds::find(20);
++        $route->status = -1;
++        $route->setting = json_encode(['_bot_catalog_missing' => true]);
++        $route->save();
++        Http::fake(['*/api/admin/token' => Http::response(['access_token' => 'token']),
++            '*/api/groups*' => Http::response(['total' => 1, 'groups' => [['id' => 100, 'name' => 'Returned', 'inbound_tags' => ['vless']]]])]);
++        app(PanelCatalogSyncService::class)->sync(Panels::find(7));
++        $this->assertFalse($route->fresh()->isCatalogMissing());
++        $this->assertSame(10, $route->fresh()->country_id);
++        $this->assertSame('-1', $route->fresh()->status);
++        $this->assertSame(1, Inbounds::count());
++    }
++
++    public function test_overlapping_sync_is_stopped_before_sending_panel_requests(): void
++    {
++        $lock = Cache::lock('panel:catalog:sync:7', 300);
++        $lock->get();
++        try {
++            app(PanelCatalogSyncService::class)->sync(Panels::find(7));
++            $this->fail('Overlapping sync must be rejected');
++        } catch (\RuntimeException $e) {
++            $this->assertStringContainsString('در حال انجام', $e->getMessage());
++        } finally {
++            $lock->release();
++        }
++        Http::assertNothingSent();
++        $this->assertSame('1', Inbounds::find(20)->status);
++    }
++
+     public function test_receipt_details_offer_retry_for_stuck_delivery_and_no_approval_for_payment_drafts(): void
+     {
+         $pending = Payment::create(['user_id' => 1, 'type' => 4, 'price' => 100000, 'method' => 'cart-be-cart', 'status' => 0, 'detail' => []]);
+diff --git a/tests/Feature/OrderCountryManagementTest.php b/tests/Feature/OrderCountryManagementTest.php
+index 15e58e4..8a0f2ba 100644
+--- a/tests/Feature/OrderCountryManagementTest.php
++++ b/tests/Feature/OrderCountryManagementTest.php
+@@ -115,6 +115,57 @@ public function test_timed_out_write_is_reconciled_by_reading_back_instead_of_re
+         $this->assertSame(3, $this->panel->reads);
+     }
+ 
++    public function test_admin_can_reassign_an_order_left_without_groups_after_deletion(): void
++    {
++        $o = $this->order();
++        $before = $o->getAttributes();
++        DB::table('inbounds')->where('id', 10)->update(['status' => -1]);
++        $this->panel->groups = [];
++        $preview = $this->countries->preview($o, 2, $this->actor);
++        $this->assertSame('بدون گروه در پاسارگارد', $preview['from']);
++        $saved = $this->countries->confirm($preview['token'], $this->actor);
++        $this->countries->confirm($preview['token'], $this->actor);
++        $this->assertSame([['group_ids' => [200]]], $this->panel->updates);
++        $this->assertSame('🇬🇧 انگلیس', $saved->detail['current_country']['label']);
++        $this->assertSame($before['expire_at'], $saved->getAttributes()['expire_at']);
++        $this->assertSame($before['plan'], $saved->plan);
++        $this->assertSame($before['uid'], $saved->uid);
++        $this->assertSame('🇩🇪 آلمان', $saved->detail['country']);
++        $this->assertSame(10, $saved->inbound_id);
++    }
++
++    public function test_invalid_group_snapshot_cannot_be_treated_as_an_empty_group(): void
++    {
++        $o = $this->order();
++        $this->panel->groups = ['invalid'];
++        try {
++            $this->countries->preview($o, 2, $this->actor);
++            $this->fail('Malformed groups must not authorize a change');
++        } catch (\RuntimeException $e) {
++            $this->assertStringContainsString('دریافت نشد', $e->getMessage());
++        }
++        $this->assertSame([], $this->panel->updates);
++    }
++
++    public function test_order_details_still_open_when_provider_has_removed_its_only_group(): void
++    {
++        $o = $this->order();
++        DB::table('inbounds')->where('id', 10)->update(['status' => -1]);
++        DB::table('panels')->where('id', 1)->update(['url' => 'https://panel.test', 'username' => 'admin', 'password' => 'test']);
++        Http::fake([
++            '*/api/admin/token' => Http::response(['access_token' => 'token']),
++            '*/api/user/by-id/7' => Http::response(['id' => 7, 'status' => 'active', 'group_ids' => [],
++                'data_limit' => 20 * 1073741824, 'used_traffic' => 1073741824, 'expire' => $o->expire_at->toIso8601String()]),
++            '*/subscription/links' => Http::response(''),
++        ]);
++        $details = getConfigDetail($o);
++        $this->assertTrue($details['status']);
++        $this->assertSame([], $details['data']['group_ids']);
++        $this->assertEquals(19, $details['data']['left']);
++        $this->assertSame('🇩🇪 آلمان', app(OrderCountryResolver::class)->resolve([$o])[$o->id]);
++        $this->assertSame('7', $o->fresh()->uid);
++    }
++
+     public function test_failed_remote_change_never_changes_the_local_country(): void
+     {
+         $o = $this->order();

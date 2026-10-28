@@ -18,7 +18,7 @@ class OrderCountryService
 
     public function groups(mixed $value): ?array
     {
-        if (! is_array($value) || ! array_is_list($value) || ! $value || count($value) > 200) {
+        if (! is_array($value) || ! array_is_list($value) || count($value) > 200) {
             return null;
         }
         $ids = [];
@@ -160,7 +160,8 @@ class OrderCountryService
     private function read(PasarGuard $client, Orders $order): array
     {
         $remote = $client->getUserById($order->uid);
-        if (! is_array($remote) || (string) ($remote['id'] ?? '') !== (string) $order->uid || ! $this->groups($remote['group_ids'] ?? null)) {
+        if (! is_array($remote) || ($remote['status'] ?? null) === false
+            || (string) ($remote['id'] ?? '') !== (string) $order->uid || $this->groups($remote['group_ids'] ?? null) === null) {
             throw new RuntimeException('گروه فعلی سرویس از پاسارگارد دریافت نشد؛ دوباره تلاش کنید.');
         }
 
@@ -180,7 +181,7 @@ class OrderCountryService
             'expected' => $this->groups($remote['group_ids']), 'target' => $option, 'actor' => $actor];
         Cache::put('order:country:confirm:'.$token, $intent, now()->addMinutes(10));
 
-        return ['token' => $token, 'from' => $from['label'] ?? 'گروه فعلی بدون کشور مشخص', 'to' => $option['label']];
+        return ['token' => $token, 'from' => $from['label'] ?? ($remote['group_ids'] === [] ? 'بدون گروه در پاسارگارد' : 'گروه فعلی بدون کشور مشخص'), 'to' => $option['label']];
     }
 
     public function confirm(string $token, array $actor): Orders
