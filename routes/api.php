@@ -20,6 +20,7 @@ Route::prefix('wp-sync')->group(function () {
     Route::get('ping', [WpSyncController::class, 'ping']);
 
     // Account link
+    Route::post('link/connect', [WpSyncController::class, 'connectLink']);
     Route::post('link/status', [WpSyncController::class, 'linkStatus']);
     Route::post('link/disconnect', [WpSyncController::class, 'disconnectLink']);
 

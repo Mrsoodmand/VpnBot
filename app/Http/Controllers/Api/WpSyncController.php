@@ -28,7 +28,7 @@ class WpSyncController extends Controller
             'ok' => true,
             'message' => 'ip-sabet-wp-sync-ready',
             'version' => '2.1.0',
-            'capabilities' => ['wallet_reference_v2','wallet_disconnect_v1'],
+            'capabilities' => ['wallet_reference_v2','wallet_disconnect_v1','admin_link_v1'],
             'time' => now()->toDateTimeString(),
         ]);
     }
@@ -40,6 +40,22 @@ class WpSyncController extends Controller
         if ($g = $this->guard($request, $sync)) return $g;
         $result = $sync->linkStatus($request->all());
         return $this->json(['ok' => true] + $result);
+    }
+
+    public function connectLink(Request $request, WpSyncService $sync)
+    {
+        if ($g = $this->guard($request, $sync)) return $g;
+        $payload = $request->validate([
+            'code' => 'required|string|regex:/^[a-f0-9]{20}$/D',
+            'tel_id' => 'required|string|regex:/^[1-9][0-9]{0,19}$/D',
+            'phone' => 'required|string|regex:/^\+989[0-9]{9}$/D',
+            'site_user_id' => 'required|integer|min:1',
+        ]);
+        // Resolve by Telegram ID only. An unlinked bot user has no site phone yet.
+        $user = \App\Models\User::where('tel_id', $payload['tel_id'])->first();
+        if (!$user) return $this->json(['ok' => false, 'message' => 'حساب تلگرام در ربات پیدا نشد.'], 404);
+        $result = $sync->confirmWordPressLink($user, $payload['code'], ['phone' => $payload['phone'], 'site_user_id' => (int) $payload['site_user_id']]);
+        return $this->json($result);
     }
 
     public function disconnectLink(Request $request, WpSyncService $sync)

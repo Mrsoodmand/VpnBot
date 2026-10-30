@@ -64,7 +64,32 @@ class WpSyncService
      * Link handling
      * ------------------------------------------------------------------ */
 
-    public function confirmWordPressLink(User $telegramUser, string $code): array
+    public function confirmWordPressLink(User $telegramUser, string $code, array $expected = []): array
+    {
+        // Serialize admin and Telegram confirmations for the same user across workers.
+        $result = \Illuminate\Support\Facades\Cache::lock('wp-link-confirm:' . $telegramUser->id, 90)->get(function () use ($telegramUser, $code, $expected) {
+            $telegramUser = $telegramUser->fresh();
+            if (!$telegramUser || (string) $telegramUser->status !== '1') return ['ok' => false, 'message' => 'حساب تلگرام فعال نیست.'];
+            if (WalletDisconnectService::pending($telegramUser->id)) return ['ok' => false, 'message' => 'انتقال موجودی قبلی هنوز کامل نشده است.'];
+            if ($expected) {
+                if ((int) ($expected['site_user_id'] ?? 0) <= 0 || !preg_match('/^\+989[0-9]{9}$/D', (string) ($expected['phone'] ?? ''))) return ['ok' => false, 'message' => 'هویت حساب سایت معتبر نیست.'];
+                $conflicts = DB::table('wp_sync_links')->where(function ($q) use ($telegramUser, $expected) {
+                    $q->where('tel_id', (string) $telegramUser->tel_id)->orWhere('site_user_id', $expected['site_user_id'])->orWhere('phone', $expected['phone']);
+                })->get();
+                foreach ($conflicts as $link) {
+                    if ((string) $link->tel_id !== (string) $telegramUser->tel_id || (int) $link->site_user_id !== $expected['site_user_id'] || (string) $link->phone !== $expected['phone']) return ['ok' => false, 'message' => 'یکی از حساب‌ها قبلاً به حساب دیگری متصل شده است.'];
+                }
+            }
+            try {
+                return $this->confirmWordPressLinkLocked($telegramUser, $code, $expected);
+            } catch (\Illuminate\Http\Client\ConnectionException $e) {
+                return ['ok' => false, 'message' => 'پاسخ نهایی سایت دریافت نشد؛ برای تکمیل اتصال، همان کد را دوباره تأیید کنید.'];
+            }
+        });
+        return $result === false ? ['ok' => false, 'message' => 'درخواست اتصال دیگری در حال بررسی است؛ کمی بعد دوباره تلاش کنید.'] : $result;
+    }
+
+    private function confirmWordPressLinkLocked(User $telegramUser, string $code, array $expected): array
     {
         if (!preg_match('/^(?:[a-f0-9]{20}|[0-9]{6})$/D', $code)) return ['ok'=>false,'message'=>'کد اتصال معتبر نیست.'];
         $rateKey = 'wp-link:' . $telegramUser->id;
@@ -73,6 +98,7 @@ class WpSyncService
         if (parse_url($this->wpBaseUrl(), PHP_URL_SCHEME) !== 'https') return ['ok'=>false,'message'=>'اتصال امن به سایت تنظیم نشده است.'];
         $payload = [
             'code' => trim($code),
+            'expected' => $expected,
             'tel_id' => (string) $telegramUser->tel_id,
             'telegram' => [
                 'username' => $telegramUser->username,
@@ -102,6 +128,7 @@ class WpSyncService
         $phone = (string) ($data['phone'] ?? '');
         $siteUserId = (int) ($data['site_user_id'] ?? 0);
         if ($siteUserId <= 0 || !preg_match('/^\+989[0-9]{9}$/D', $phone)) return ['ok'=>false,'message'=>'پاسخ اتصال سایت معتبر نیست.'];
+        if ($expected && ($phone !== $expected['phone'] || $siteUserId !== $expected['site_user_id'])) return ['ok' => false, 'message' => 'پاسخ سایت با حساب انتخاب‌شده مطابقت ندارد.'];
         $this->upsertLink($telegramUser, $phone, $siteUserId);
         $final=Http::timeout(30)->withoutRedirecting()->acceptJson()->asJson()->withHeaders(['X-IPSABET-API-KEY'=>$this->secret()])->post($this->wpBaseUrl().'/wp-json/ipsvp/v1/sync/confirm-link',array_merge($payload,['phase'=>'finalize']));
         if(!$final->successful()||$final->json('ok')!==true)return ['ok'=>false,'message'=>'اتصال ثبت شد اما انتقال موجودی کامل نشده است؛ همان دستور را دوباره ارسال کنید.'];
