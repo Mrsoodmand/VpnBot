@@ -76,7 +76,7 @@ class TelegramBotController extends Controller
         $data = $request->all();
 
         $telData = new TelegramData();
-        $telData->data = json_encode($data);
+        $telData->data = json_encode(['update_id'=>$data['update_id']??null,'kind'=>isset($data['callback_query'])?'callback_query':'message']);
         $telData->path = 'before';
         $telData->save();
 
@@ -1901,6 +1901,7 @@ class TelegramBotController extends Controller
 
     protected function connectAccount($data = [])
     {
+        if((string)$this->chatId!==(string)$this->actorId || (int)$this->chatId<=0)return null;
         $code = $data['code'] ?? null;
         if (!$code) {
             $text = headTitle('اتصال حساب سایت به ربات');

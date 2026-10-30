@@ -66,6 +66,11 @@ class WpSyncService
 
     public function confirmWordPressLink(User $telegramUser, string $code): array
     {
+        if (!preg_match('/^(?:[a-f0-9]{20}|[0-9]{6})$/D', $code)) return ['ok'=>false,'message'=>'کد اتصال معتبر نیست.'];
+        $rateKey = 'wp-link:' . $telegramUser->id;
+        if (\Illuminate\Support\Facades\RateLimiter::tooManyAttempts($rateKey, 5)) return ['ok'=>false,'message'=>'تعداد تلاش بیش از حد مجاز است؛ ۱۵ دقیقه بعد تلاش کنید.'];
+        \Illuminate\Support\Facades\RateLimiter::hit($rateKey, 900);
+        if (parse_url($this->wpBaseUrl(), PHP_URL_SCHEME) !== 'https') return ['ok'=>false,'message'=>'اتصال امن به سایت تنظیم نشده است.'];
         $payload = [
             'code' => trim($code),
             'tel_id' => (string) $telegramUser->tel_id,
@@ -76,7 +81,7 @@ class WpSyncService
             ],
         ];
 
-        $response = Http::timeout(20)
+        $response = Http::timeout(20)->withoutRedirecting()
             ->acceptJson()
             ->asJson()
             ->withHeaders(['X-IPSABET-API-KEY' => $this->secret()])
@@ -86,7 +91,6 @@ class WpSyncService
             return [
                 'ok' => false,
                 'message' => $response->json('message') ?: ('خطای اتصال به سایت: HTTP ' . $response->status()),
-                'body' => $response->body(),
             ];
         }
 
@@ -96,7 +100,12 @@ class WpSyncService
         }
 
         $phone = (string) ($data['phone'] ?? '');
-        $this->upsertLink($telegramUser, $phone, (int) ($data['site_user_id'] ?? 0));
+        $siteUserId = (int) ($data['site_user_id'] ?? 0);
+        if ($siteUserId <= 0 || !preg_match('/^\+989[0-9]{9}$/D', $phone)) return ['ok'=>false,'message'=>'پاسخ اتصال سایت معتبر نیست.'];
+        $this->upsertLink($telegramUser, $phone, $siteUserId);
+        $final=Http::timeout(30)->withoutRedirecting()->acceptJson()->asJson()->withHeaders(['X-IPSABET-API-KEY'=>$this->secret()])->post($this->wpBaseUrl().'/wp-json/ipsvp/v1/sync/confirm-link',array_merge($payload,['phase'=>'finalize']));
+        if(!$final->successful()||$final->json('ok')!==true)return ['ok'=>false,'message'=>'اتصال ثبت شد اما انتقال موجودی کامل نشده است؛ همان دستور را دوباره ارسال کنید.'];
+
 
         if (!empty($data['orders']) && is_array($data['orders'])) {
             foreach ($data['orders'] as $order) {
@@ -111,38 +120,30 @@ class WpSyncService
 
     public function upsertLink(User $user, string $phone, int $siteUserId = 0): void
     {
-        if (!Schema::hasTable('wp_sync_links')) return;
+        if (!Schema::hasTable('wp_sync_links')) abort(503,'link_storage_unavailable');
 
-        $now = now();
-        DB::table('wp_sync_links')->updateOrInsert(
-            ['tel_id' => (string) $user->tel_id],
-            [
-                'user_id' => $user->id,
-                'phone' => $phone,
-                'site_user_id' => $siteUserId ?: null,
-                'linked_at' => $now,
-                'updated_at' => $now,
-                'created_at' => $now,
-            ]
-        );
+        DB::transaction(function () use ($user, $phone, $siteUserId) {
+            User::whereKey($user->id)->lockForUpdate()->firstOrFail();
+            if (WalletDisconnectService::pending($user->id)) abort(409, 'wallet_transfer_pending');
+            $links = DB::table('wp_sync_links')->where(function ($q) use ($user,$phone,$siteUserId) {
+                $q->where('tel_id',(string)$user->tel_id)->orWhere('phone',$phone)->orWhere('site_user_id',$siteUserId);
+            })->lockForUpdate()->get();
+            foreach ($links as $link) {
+                if ((string)$link->tel_id !== (string)$user->tel_id || (string)$link->phone !== $phone || (int)$link->site_user_id !== $siteUserId) {
+                    throw \Illuminate\Validation\ValidationException::withMessages(['link'=>'account_already_linked']);
+                }
+            }
+            DB::table('wp_sync_links')->updateOrInsert(['tel_id'=>(string)$user->tel_id], [
+                'user_id'=>$user->id,'phone'=>$phone,'site_user_id'=>$siteUserId,
+                'linked_at'=>$links->first()->linked_at ?? now(),'updated_at'=>now(),'created_at'=>$links->first()->created_at ?? now(),
+            ]);
+        });
     }
 
     public function linkStatus(array $payload): array
     {
-        $link = null;
-        if (Schema::hasTable('wp_sync_links')) {
-            if (!empty($payload['tel_id'])) {
-                $link = DB::table('wp_sync_links')->where('tel_id', (string) $payload['tel_id'])->first();
-            }
-            if (!$link && !empty($payload['phone'])) {
-                $link = DB::table('wp_sync_links')->whereIn('phone', $this->phoneCandidates((string) $payload['phone']))->first();
-            }
-            if (!$link && !empty($payload['site_user_id'])) {
-                $link = DB::table('wp_sync_links')->where('site_user_id', (int) $payload['site_user_id'])->first();
-            }
-        }
-
-        $user = $link ? User::find($link->user_id) : $this->resolveUser($payload);
+        $user=$this->resolveUser($payload);
+        $link=$user&&Schema::hasTable('wp_sync_links')?DB::table('wp_sync_links')->where('user_id',$user->id)->first():null;
         return [
             'linked' => (bool) $link,
             'link' => $link ? [
@@ -158,18 +159,7 @@ class WpSyncService
 
     public function disconnectLink(?string $telId = null, ?string $phone = null, $siteUserId = null): int
     {
-        if (!Schema::hasTable('wp_sync_links')) return 0;
-        $query = DB::table('wp_sync_links');
-        if ($telId) {
-            $query->where('tel_id', (string) $telId);
-        } elseif ($phone) {
-            $query->whereIn('phone', $this->phoneCandidates((string) $phone));
-        } elseif ($siteUserId) {
-            $query->where('site_user_id', (int) $siteUserId);
-        } else {
-            return 0;
-        }
-        return (int) $query->delete();
+        abort(409,'wallet_destination_required');
     }
 
     public function linkedUserByPhone(?string $phone): ?User
@@ -189,25 +179,33 @@ class WpSyncService
         return User::where('tel_id', (string) $telId)->first();
     }
 
+    public function hasUserScope(array $payload): bool
+    {
+        foreach (['user_id','tel_id','phone','site_user_id'] as $key) {
+            if (array_key_exists($key, $payload)) return true;
+        }
+        return false;
+    }
+
     public function resolveUser(array $payload): ?User
     {
-        if (!empty($payload['user_id'])) {
-            $user = User::find((int) $payload['user_id']);
-            if ($user) return $user;
+        $resolved = null;
+        foreach (['user_id','tel_id','phone','site_user_id'] as $key) {
+            if (!array_key_exists($key, $payload)) continue;
+            if (!is_scalar($payload[$key]) || trim((string) $payload[$key]) === '') return null;
+            $value = (string) $payload[$key];
+            $candidate = null;
+            if ($key === 'user_id' && ctype_digit($value)) $candidate = User::find((int) $value);
+            if ($key === 'tel_id' && ctype_digit($value)) $candidate = $this->linkedUserByTelId($value);
+            if ($key === 'phone') $candidate = $this->linkedUserByPhone($value);
+            if ($key === 'site_user_id' && ctype_digit($value) && Schema::hasTable('wp_sync_links')) {
+                $link = DB::table('wp_sync_links')->where('site_user_id', (int) $value)->first();
+                $candidate = $link ? User::find($link->user_id) : null;
+            }
+            if (!$candidate || ($resolved && $resolved->id !== $candidate->id)) return null;
+            $resolved = $candidate;
         }
-        if (!empty($payload['tel_id'])) {
-            $user = $this->linkedUserByTelId((string) $payload['tel_id']);
-            if ($user) return $user;
-        }
-        if (!empty($payload['phone'])) {
-            $user = $this->linkedUserByPhone((string) $payload['phone']);
-            if ($user) return $user;
-        }
-        if (!empty($payload['site_user_id']) && Schema::hasTable('wp_sync_links')) {
-            $link = DB::table('wp_sync_links')->where('site_user_id', (int) $payload['site_user_id'])->first();
-            if ($link) return User::find($link->user_id);
-        }
-        return null;
+        return $resolved;
     }
 
     public function phoneCandidates(string $phone): array
@@ -514,15 +512,24 @@ class WpSyncService
         $amount = max(0, $amount);
         if ($amount <= 0) return (int) $user->balance;
         $method = (string) ($meta['method'] ?? $meta['source'] ?? 'wordpress_wallet');
-        $refId = (string) ($meta['ref_id'] ?? $meta['external_ref'] ?? '');
-
-        if ($refId !== '') {
-            $exists = Payment::where('user_id', $user->id)->where('method', $method)->where('ref_id', $refId)->where('status', 1)->first();
-            if ($exists) return (int) $user->fresh()->balance;
-        }
+        $refId = (string) ($meta['ref_id'] ?? $meta['external_ref'] ?? (isset($meta['receipt_id']) ? 'WP-RECEIPT-' . $meta['receipt_id'] : ($meta['order_code'] ?? '')));
 
         DB::transaction(function () use ($user, $amount, $meta, $method, $refId) {
             $target = User::where('id', $user->id)->lockForUpdate()->first();
+            if (isset($meta['tel_id']) && (!DB::table('wp_sync_links')->where('user_id',$target->id)->exists() || WalletDisconnectService::pending($target->id))) abort(409,'account_not_linked');
+            if ($refId !== '') {
+                $prior = Payment::where('user_id', $target->id)->where('method', $method)->where('status', 1)->where(function($q) use($refId,$meta) {
+                    $q->where('ref_id',$refId);
+                    // Recover pre-upgrade operations whose reference was only saved in JSON.
+                    if(!empty($meta['receipt_id']))$q->orWhere('detail->receipt_id',(int)$meta['receipt_id']);
+                    if(!empty($meta['order_code']))$q->orWhere('detail->order_code',(string)$meta['order_code']);
+                })->first();
+                if ($prior) {
+                    if ((int) $prior->price !== $amount) throw \Illuminate\Validation\ValidationException::withMessages(['amount' => 'idempotency_amount_conflict']);
+                    return;
+                }
+            }
+
             $before = (int) $target->balance;
             $target->balance = $before + $amount;
             $target->save();
@@ -552,15 +559,24 @@ class WpSyncService
         $amount = max(0, $amount);
         if ($amount <= 0) return ['ok' => false, 'message' => 'amount_is_required', 'balance' => (int) $user->balance];
         $method = (string) ($meta['method'] ?? 'wallet');
-        $refId = (string) ($meta['ref_id'] ?? $meta['external_ref'] ?? '');
-
-        if ($refId !== '') {
-            $exists = Payment::where('user_id', $user->id)->where('method', $method)->where('ref_id', $refId)->where('status', 1)->first();
-            if ($exists) return ['ok' => true, 'balance' => (int) $user->fresh()->balance, 'idempotent' => true];
-        }
+        $refId = (string) ($meta['ref_id'] ?? $meta['external_ref'] ?? (isset($meta['receipt_id']) ? 'WP-RECEIPT-' . $meta['receipt_id'] : ($meta['order_code'] ?? '')));
 
         return DB::transaction(function () use ($user, $amount, $meta, $method, $refId) {
             $target = User::where('id', $user->id)->lockForUpdate()->first();
+            if (isset($meta['tel_id']) && (!DB::table('wp_sync_links')->where('user_id',$target->id)->exists() || WalletDisconnectService::pending($target->id))) abort(409,'account_not_linked');
+            if ($refId !== '') {
+                $prior = Payment::where('user_id', $target->id)->where('method', $method)->where('status', 1)->where(function($q) use($refId,$meta) {
+                    $q->where('ref_id',$refId);
+                    // Recover pre-upgrade operations whose reference was only saved in JSON.
+                    if(!empty($meta['receipt_id']))$q->orWhere('detail->receipt_id',(int)$meta['receipt_id']);
+                    if(!empty($meta['order_code']))$q->orWhere('detail->order_code',(string)$meta['order_code']);
+                })->first();
+                if ($prior) {
+                    if ((int) $prior->price !== $amount) throw \Illuminate\Validation\ValidationException::withMessages(['amount' => 'idempotency_amount_conflict']);
+                    return ['ok' => true, 'balance' => (int) $target->balance, 'idempotent' => true];
+                }
+            }
+
             if ((int) $target->balance < $amount) {
                 return ['ok' => false, 'message' => 'موجودی کیف پول کافی نیست.', 'balance' => (int) $target->balance];
             }
@@ -646,17 +662,19 @@ class WpSyncService
 
     public function importSiteOrder(array $siteOrder, ?User $fallbackUser = null): ?Orders
     {
-        if (($siteOrder['service_type'] ?? '') === 'dedicated') return null;
+        if (!in_array(($siteOrder['service_type'] ?? ''),['','shared'],true)) return null;
 
         $siteOrderId = (int) ($siteOrder['site_order_id'] ?? $siteOrder['id'] ?? 0);
         if ($siteOrderId <= 0) return null;
 
-        $user = $fallbackUser;
-        if (!$user && !empty($siteOrder['tel_id'])) $user = $this->linkedUserByTelId((string) $siteOrder['tel_id']);
-        if (!$user && !empty($siteOrder['phone'])) $user = $this->linkedUserByPhone((string) $siteOrder['phone']);
-        if (!$user) return null;
-
+        $scope=array_intersect_key($siteOrder,array_flip(['tel_id','phone']));
+        $user=$scope?$this->resolveUser($scope):$fallbackUser;
+        if(!$user || ($fallbackUser && $fallbackUser->id!==$user->id))return null;
+        return DB::transaction(function() use($siteOrder,$siteOrderId,$user) {
+        User::whereKey($user->id)->lockForUpdate()->firstOrFail();
+        if(WalletDisconnectService::pending($user->id))return null;
         $mapping = Schema::hasTable('wp_sync_site_orders') ? DB::table('wp_sync_site_orders')->where('site_order_id', $siteOrderId)->first() : null;
+        if ($mapping && (int) $mapping->user_id !== (int) $user->id) return null;
         $panel = $this->findPanelForSiteOrder($siteOrder);
         $detail = [
             'source' => 'wordpress',
@@ -680,7 +698,7 @@ class WpSyncService
 
         $payload = [
             'user_id' => $user->id,
-            'remark' => $siteOrder['pg_username'] ?: ($siteOrder['order_code'] ?? ('SITE-' . $siteOrderId)),
+            'remark' => ($siteOrder['pg_username'] ?? '') ?: ($siteOrder['order_code'] ?? ('SITE-' . $siteOrderId)),
             'uid' => (string) ($siteOrder['pg_user_id'] ?? ''),
             'sub_id' => (string) ($siteOrder['subscription_url'] ?? ''),
             'plan' => trim(($siteOrder['plan_title'] ?? '') . ' | ' . ((int) ($siteOrder['gb'] ?? 0)) . 'GB / ' . ((int) ($siteOrder['days'] ?? 0)) . ' روز'),
@@ -695,6 +713,7 @@ class WpSyncService
 
         if ($mapping && $mapping->bot_order_id) {
             $order = Orders::find($mapping->bot_order_id);
+            if ($order && (int) $order->user_id !== (int) $user->id) return null;
             if ($order) {
                 $payload['detail'] = array_replace(is_array($order->detail) ? $order->detail : [], $detail);
                 $order->fill($payload);
@@ -719,6 +738,7 @@ class WpSyncService
             );
         }
         return $order;
+        },3);
     }
 
     public function findOrder(int $id, array $payload = []): ?Orders
@@ -726,6 +746,7 @@ class WpSyncService
         if ($id <= 0) return null;
         $query = Orders::botManaged()->where('id', $id);
         $user = $this->resolveUser($payload);
+        if ($this->hasUserScope($payload) && !$user) return null;
         if ($user) $query->where('user_id', $user->id);
         return $query->first();
     }
@@ -830,14 +851,17 @@ class WpSyncService
      * Payments
      * ------------------------------------------------------------------ */
 
-    public function findPayment(int $id): ?Payment
+    public function findPayment(int $id, array $payload = []): ?Payment
     {
-        return $id > 0 ? Payment::find($id) : null;
+        if($id<=0)return null;
+        $user=$this->resolveUser($payload);
+        if($this->hasUserScope($payload)&&!$user)return null;
+        return Payment::whereKey($id)->when($user,fn($q)=>$q->where('user_id',$user->id))->first();
     }
 
     public function approvePayment(int $paymentId, array $payload = []): array
     {
-        $payment = Payment::find($paymentId);
+        $payment = $this->findPayment($paymentId,$payload);
         if (!$payment) return ['ok' => false, 'message' => 'payment_not_found'];
         if ((string) $payment->status === '1') return ['ok' => true, 'payment' => $this->formatPayment($payment, true), 'already_approved' => true];
 
@@ -858,6 +882,7 @@ class WpSyncService
                 $user = User::find($payment->user_id);
                 if ($user) {
                     $target = User::where('id', $user->id)->lockForUpdate()->first();
+            if (isset($meta['tel_id']) && (!DB::table('wp_sync_links')->where('user_id',$target->id)->exists() || WalletDisconnectService::pending($target->id))) abort(409,'account_not_linked');
                     $target->balance = (int) $target->balance + (int) $payment->price;
                     $target->save();
                 }
@@ -868,7 +893,7 @@ class WpSyncService
 
     public function rejectPayment(int $paymentId, array $payload = []): array
     {
-        $payment = Payment::find($paymentId);
+        $payment = $this->findPayment($paymentId,$payload);
         if (!$payment) return ['ok' => false, 'message' => 'payment_not_found'];
         $detail = is_array($payment->detail) ? $payment->detail : (json_decode((string) $payment->detail, true) ?: []);
         $detail['rejected_from_wp_api'] = true;

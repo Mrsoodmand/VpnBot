@@ -27,7 +27,8 @@ class WpSyncController extends Controller
         return $this->json([
             'ok' => true,
             'message' => 'ip-sabet-wp-sync-ready',
-            'version' => '2.0.0',
+            'version' => '2.1.0',
+            'capabilities' => ['wallet_reference_v2','wallet_disconnect_v1'],
             'time' => now()->toDateTimeString(),
         ]);
     }
@@ -44,8 +45,8 @@ class WpSyncController extends Controller
     public function disconnectLink(Request $request, WpSyncService $sync)
     {
         if ($g = $this->guard($request, $sync)) return $g;
-        $result = $sync->disconnectLink($request->input('tel_id'), $request->input('phone'), $request->input('site_user_id'));
-        return $this->json(['ok' => true, 'deleted' => $result]);
+        $payload=$request->validate(['id'=>'required|string|regex:/^[a-f0-9]{32}$/','tel_id'=>'required|string|regex:/^[1-9][0-9]{0,19}$/','phone'=>'required|string|max:32','site_user_id'=>'required|integer|min:1','destination'=>'required|in:site,bot','phase'=>'required|in:prepare,commit']);
+        return $this->json(app(\App\Services\WalletDisconnectService::class)->run($payload));
     }
 
     public function customerLoyaltyEvents(Request $request, WpSyncService $sync)
@@ -63,7 +64,7 @@ class WpSyncController extends Controller
     {
         if ($g = $this->guard($request, $sync)) return $g;
         $user = $sync->resolveUser($request->all());
-        if (!$user) return $this->json(['ok' => false, 'message' => 'user_not_found_or_not_linked'], 404);
+        if (!$user || !\Illuminate\Support\Facades\DB::table('wp_sync_links')->where('user_id',$user->id)->exists() || \App\Services\WalletDisconnectService::pending($user->id)) return $this->json(['ok' => false, 'message' => 'user_not_found_or_not_linked'], 404);
         return $this->json(['ok' => true, 'wallet' => $sync->walletSummary($user)]);
     }
 
@@ -71,15 +72,17 @@ class WpSyncController extends Controller
     {
         if ($g = $this->guard($request, $sync)) return $g;
         $user = $sync->resolveUser($request->all());
-        if (!$user) return $this->json(['ok' => false, 'message' => 'user_not_found_or_not_linked'], 404);
+        if (!$user || !\Illuminate\Support\Facades\DB::table('wp_sync_links')->where('user_id',$user->id)->exists() || \App\Services\WalletDisconnectService::pending($user->id)) return $this->json(['ok' => false, 'message' => 'user_not_found_or_not_linked'], 404);
         return $this->json(['ok' => true] + $sync->walletTransactions($user, (int) $request->input('page', 1), (int) $request->input('per_page', 20)));
     }
 
     public function walletCredit(Request $request, WpSyncService $sync)
     {
         if ($g = $this->guard($request, $sync)) return $g;
+        $request->validate(['amount'=>'required|integer|min:1|max:1000000000','ref_id'=>'nullable|string|max:128','external_ref'=>'nullable|string|max:128','order_code'=>'nullable|string|max:128','receipt_id'=>'nullable|integer|min:1']);
+        if (!$request->filled('ref_id') && !$request->filled('external_ref') && !$request->filled('order_code') && !$request->filled('receipt_id')) return $this->json(['ok'=>false,'message'=>'payment_reference_required'],422);
         $user = $sync->resolveUser($request->all());
-        if (!$user) return $this->json(['ok' => false, 'message' => 'user_not_found_or_not_linked'], 404);
+        if (!$user || !\Illuminate\Support\Facades\DB::table('wp_sync_links')->where('user_id',$user->id)->exists() || \App\Services\WalletDisconnectService::pending($user->id)) return $this->json(['ok' => false, 'message' => 'user_not_found_or_not_linked'], 404);
         $balance = $sync->creditWallet($user, (int) $request->input('amount', 0), $request->all());
         return $this->json(['ok' => true, 'balance' => $balance, 'wallet' => $sync->walletSummary($user->fresh())]);
     }
@@ -87,8 +90,10 @@ class WpSyncController extends Controller
     public function walletDebit(Request $request, WpSyncService $sync)
     {
         if ($g = $this->guard($request, $sync)) return $g;
+        $request->validate(['amount'=>'required|integer|min:1|max:1000000000','ref_id'=>'nullable|string|max:128','external_ref'=>'nullable|string|max:128','order_code'=>'nullable|string|max:128','receipt_id'=>'nullable|integer|min:1']);
+        if (!$request->filled('ref_id') && !$request->filled('external_ref') && !$request->filled('order_code') && !$request->filled('receipt_id')) return $this->json(['ok'=>false,'message'=>'payment_reference_required'],422);
         $user = $sync->resolveUser($request->all());
-        if (!$user) return $this->json(['ok' => false, 'message' => 'user_not_found_or_not_linked'], 404);
+        if (!$user || !\Illuminate\Support\Facades\DB::table('wp_sync_links')->where('user_id',$user->id)->exists() || \App\Services\WalletDisconnectService::pending($user->id)) return $this->json(['ok' => false, 'message' => 'user_not_found_or_not_linked'], 404);
         $result = $sync->debitWallet($user, (int) $request->input('amount', 0), $request->all());
         return $this->json($result, !empty($result['ok']) ? 200 : 422);
     }
@@ -133,6 +138,7 @@ class WpSyncController extends Controller
     {
         if ($g = $this->guard($request, $sync)) return $g;
         $user = $sync->resolveUser($request->all());
+        if ($sync->hasUserScope($request->all()) && !$user) return $this->json(['ok'=>false,'message'=>'user_not_found'],404);
         if ($user) {
             return $this->json(['ok' => true] + $sync->ordersListForUser($user, (int) $request->input('page', 1), (int) $request->input('per_page', 20), (string) $request->input('search', '')));
         }
@@ -185,6 +191,7 @@ class WpSyncController extends Controller
     {
         if ($g = $this->guard($request, $sync)) return $g;
         $user = $sync->resolveUser($request->all());
+        if ($sync->hasUserScope($request->all()) && !$user) return $this->json(['ok'=>false,'message'=>'user_not_found'],404);
         if ($user) {
             return $this->json(['ok' => true] + $sync->paymentsListForUser($user, (int) $request->input('page', 1), (int) $request->input('per_page', 20), (string) $request->input('search', '')));
         }
@@ -194,7 +201,7 @@ class WpSyncController extends Controller
     public function paymentsShow(Request $request, WpSyncService $sync)
     {
         if ($g = $this->guard($request, $sync)) return $g;
-        $payment = $sync->findPayment((int) $request->input('payment_id', $request->input('id', 0)));
+        $payment = $sync->findPayment((int) $request->input('payment_id', $request->input('id', 0)), $request->all());
         if (!$payment) return $this->json(['ok' => false, 'message' => 'payment_not_found'], 404);
         return $this->json(['ok' => true, 'payment' => $sync->formatPayment($payment, true)]);
     }

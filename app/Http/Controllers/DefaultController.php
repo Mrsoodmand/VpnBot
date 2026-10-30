@@ -284,10 +284,10 @@ class DefaultController extends Controller
     {
         $token = env('TELEGRAM_BOT_TOKEN');
         $telegram = new Telegram($token);
-        return $telegram->setWebhook([
-            'url' => "https://pseudoperipteral-latesha-unpathetically.ngrok-free.dev/api/telegram-webhook",
-            'drop_pending_updates' => true
-        ]);
+        $url=(string)config('services.telegram.webhook_url');
+        $secret=(string)config('services.telegram.webhook_secret');
+        if(parse_url($url,PHP_URL_SCHEME)!=='https'||!preg_match('/^[A-Za-z0-9_-]{32,256}$/D',$secret))abort(503,'secure_webhook_configuration_required');
+        return $telegram->setWebhook(['url'=>$url,'secret_token'=>$secret,'drop_pending_updates'=>false]);
     }
 
     public function deleteWebhook()

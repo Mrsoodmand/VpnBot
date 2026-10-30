@@ -6,13 +6,13 @@ use App\Http\Controllers\DefaultController;
 use App\Http\Controllers\Api\JobController;
 use App\Http\Controllers\Api\WpSyncController;
 
-Route::get('runDefaultValueForNewProject', [DefaultController::class, 'runDefaultValueForNewProject']);
+Route::post('runDefaultValueForNewProject', [DefaultController::class, 'runDefaultValueForNewProject']);
 Route::post('telegram-webhook', [TelegramBotController::class, 'index']);
-Route::get('setWebhook', [DefaultController::class, 'setWebhook']);
-Route::get('deleteWebhook', [DefaultController::class, 'deleteWebhook']);
-Route::get('export', [DefaultController::class, 'exportData']);
-Route::get('send-bulk-message', [JobController::class, 'sendBulkMessage']);
-Route::get('importUsers', [DefaultController::class, 'importUsers']);
+Route::post('setWebhook', [DefaultController::class, 'setWebhook']);
+Route::post('deleteWebhook', [DefaultController::class, 'deleteWebhook']);
+Route::post('export', [DefaultController::class, 'exportData']);
+Route::post('send-bulk-message', [JobController::class, 'sendBulkMessage']);
+Route::post('importUsers', [DefaultController::class, 'importUsers']);
 
 Route::prefix('wp-sync')->group(function () {
     Route::post('orders/country/{action}', [\App\Http\Controllers\Api\OrderCountryController::class, 'handle'])

@@ -14,6 +14,7 @@ return [
     |
     */
 
+    'telegram' => ['webhook_secret'=>env('TELEGRAM_WEBHOOK_SECRET',''),'webhook_url'=>env('TELEGRAM_WEBHOOK_URL',rtrim(env('APP_URL',''),'/').'/api/telegram-webhook')],
     'wp_sync' => [
         'secret' => env('WP_SYNC_SECRET', ''),
         'base_url' => env('WP_BASE_URL', 'https://ip-sabet.me'),
