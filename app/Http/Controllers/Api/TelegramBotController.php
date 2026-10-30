@@ -75,6 +75,14 @@ class TelegramBotController extends Controller
     {
         $data = $request->all();
 
+        // Telegram also delivers channel/inline/reaction updates. These do not
+        // belong to this bot's purchase flow and must be acknowledged without
+        // creating an account with a missing Telegram identity.
+        $event = $data['message'] ?? $data['callback_query']['message'] ?? $data['my_chat_member'] ?? null;
+        if (!is_array($event) || !isset($event['chat']['id'])) {
+            return;
+        }
+
         $telData = new TelegramData();
         $telData->data = json_encode(['update_id'=>$data['update_id']??null,'kind'=>isset($data['callback_query'])?'callback_query':'message']);
         $telData->path = 'before';
@@ -125,6 +133,7 @@ class TelegramBotController extends Controller
 
         $this->telData = $data;
 
+
         $this->checkUser();
         $user = $this->user;
         $this->isSeller = (int) $user->is_seller === 1;
@@ -137,6 +146,8 @@ class TelegramBotController extends Controller
     public function index()
     {
         $user = $this->user;
+        if (!$user) return response()->json(['ok' => true]);
+        if ($this->type === 'my_chat_member') return $this->checkChatMember();
         if ($user->path == 'disabled') {
             return $this->botIsNotActive();
         }
@@ -828,7 +839,7 @@ class TelegramBotController extends Controller
             $customData['oldStatus'] == 'member' &&
             $customData['newStatus'] == 'kicked'
         ) {
-            User::where('tel_id', $this->chatId)
+            User::where('tel_id', (string) $this->chatId)
                 ->update([
                     'status' => -2
                 ]);
@@ -837,7 +848,7 @@ class TelegramBotController extends Controller
             $customData['oldStatus'] == 'kicked' &&
             $customData['newStatus'] == 'member'
         ) {
-            User::where('tel_id', $this->chatId)
+            User::where('tel_id', (string) $this->chatId)
                 ->update([
                     'status' => 1
                 ]);
@@ -850,7 +861,8 @@ class TelegramBotController extends Controller
     {
         // In a group/channel callback, chat.id belongs to the conversation while
         // from.id identifies the person who actually pressed the button.
-        $telegramUserId = $this->actorId ?? $this->chatId;
+        // Bind this VARCHAR identity as text so MySQL does not coerce legacy IDs.
+        $telegramUserId = (string) ($this->actorId ?? $this->chatId);
         $user = User::where('tel_id', $telegramUserId)->first();
         if (is_null($user)) {
             $setting = Setting::where('key', 'join-bot')->first();
