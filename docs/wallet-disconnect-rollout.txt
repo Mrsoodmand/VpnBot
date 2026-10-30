@@ -1,6 +1,11 @@
 Wallet / account-link safety release — 2026-10-30
 
-NOT DEPLOYED. This release spans the bot, WordPress shop plugin and frontend bridge.
+DEPLOYED 2026-10-30. Bot, both migrations, WordPress shop plugin, frontend bridge and frontend were published together.
+Runtime bot commit: 59ab8409bb0b93f2817c4252fa41eeb8f3e1e503.
+WordPress commit: 39d9041e7d857302f07f9b786b4147c6682f4189.
+Frontend commit: cd118748f2e994c7b0b149dd09d75adaf0d6e1a8.
+Frontend release: 20261030T184915Z-coordinated.
+Database/code backups were taken before the maintenance window. Secrets stay on server, not in this document.
 Do not deploy only the frontend wallet changes or only the WordPress unlink handler.
 
 Preflight:
@@ -11,7 +16,7 @@ Preflight:
 
 Coordinated rollout (maintenance window):
 1. Quiesce account-link changes, wallet payments and bot webhook processing; let in-flight operations drain.
-2. Install bot release, run both 2026_10_30 migrations, refresh Laravel configuration cache.
+2. Install bot release, run both 2026_10_30 migrations, run config:clear. This application still reads env() outside configuration files; do not run config:cache until those reads are migrated.
 3. Register Telegram webhook with this exact secret_token and HTTPS URL via the authenticated POST setWebhook endpoint or equivalent local operator call. Do not drop pending updates. Verify Telegram deliveries before reopening ingress.
 4. Install WordPress shop plugin changes (including the new wallet-disconnect class) and frontend ips-content-api bridge together.
 5. Build/deploy frontend normally; retain production SEO configuration. Run existing SEO gates.
@@ -41,4 +46,18 @@ Verified locally:
 - Laravel full test suite; focused identity, idempotency, handoff, stale request and ingress tests.
 - WordPress isolated disconnect fault-injection tests and reseller assertions.
 - Frontend wallet helper tests, TypeScript and SEO policy gate.
-- Live MySQL concurrency and actual Telegram registration still require staging/rollout verification.
+Verified during rollout:
+- Both migrations completed; duplicate identity links and unresolved site-origin references: zero.
+- Isolated MariaDB database: 12 purchase/disconnect races, both destinations, retries, stale access, concurrent duplicate debit and credit passed. Temporary database removed; real customer funds were not modified by tests.
+- Telegram webhook secret registered without dropping pending updates; pending queue drained to zero.
+- Anonymous webhook request: HTTP 403. Authenticated empty update: HTTP 200; unsupported updates are acknowledged safely.
+- Site-to-bot authenticated ping advertises wallet_reference_v2 and wallet_disconnect_v1.
+- Affected customer's read-only loyalty profile request succeeded in 0.96 seconds.
+- All live SEO gates passed: indexability, canonical/description, robots, sitemap exclusions, real HTTP 404, permanent redirects.
+- A global Next.js loading boundary initially caused soft 404 responses. Automatic rollback protected production; loading is now scoped to known routes and the re-release passed all gates.
+- Bot full suite: 209 tests, 1720 assertions. WordPress reseller: 200 assertions; disconnect fault injection passed.
+
+Deployment guard:
+- Configure and register the webhook secret in the same maintenance window as enabling secret validation. A secret mismatch blocks legitimate Telegram deliveries.
+- Do not drop pending updates to hide webhook failures; fix ingress and verify the queue drains.
+- No admin/customer credentials or webhook tokens belong in logs or release reports.
